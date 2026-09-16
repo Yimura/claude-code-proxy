@@ -237,8 +237,11 @@ class Message(BaseModel):
 
 class Tool(BaseModel):
     name: str
+    type: Optional[str] = None
     description: Optional[str] = None
-    input_schema: Dict[str, Any]
+    input_schema: Optional[Dict[str, Any]] = None
+
+    model_config = {"extra": "allow"}
 
 
 class ThinkingConfig(BaseModel):
@@ -681,21 +684,23 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                     logger.error(f"Could not convert tool to dict: {tool}")
                     continue  # Skip this tool if conversion fails
 
-            # Clean the schema if targeting a Gemini model
-            input_schema = tool_dict.get("input_schema", {})
+            input_schema = tool_dict.get("input_schema")
+            if input_schema is None:
+                logger.debug(f"Skipping built-in tool without input_schema: {tool_dict.get('name', tool_dict.get('type'))}")
+                continue
+
             if is_gemini_model:
                 logger.debug(
                     f"Cleaning schema for Gemini tool: {tool_dict.get('name')}"
                 )
                 input_schema = clean_gemini_schema(input_schema)
 
-            # Create OpenAI-compatible function tool
             openai_tool = {
                 "type": "function",
                 "function": {
                     "name": tool_dict["name"],
                     "description": tool_dict.get("description", ""),
-                    "parameters": input_schema,  # Use potentially cleaned schema
+                    "parameters": input_schema,
                 },
             }
             openai_tools.append(openai_tool)
