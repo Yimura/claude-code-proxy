@@ -4,7 +4,7 @@ services:
     restart: unless-stopped
     env_file: .env
     ports:
-      - 8082:8082
+      - "127.0.0.1:8082:8082"
     volumes:
       - ${OPENCODE_DATA_DIR:-~/.local/share/opencode}:/opencode-auth:ro
     configs:

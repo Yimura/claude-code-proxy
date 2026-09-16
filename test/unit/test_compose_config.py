@@ -32,3 +32,9 @@ def test_compose_uses_repository_model_mapping_as_application_config(monkeypatch
     loaded = load_model_mapping(MAPPING_PATH)
     assert loaded.tiers
     assert loaded.mappings
+
+
+def test_compose_publishes_proxy_only_on_ipv4_loopback():
+    compose = yaml.safe_load(COMPOSE_PATH.read_text())
+
+    assert compose["services"]["proxy"]["ports"] == ["127.0.0.1:8082:8082"]
