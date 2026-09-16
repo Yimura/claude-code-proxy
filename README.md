@@ -47,10 +47,9 @@ docker compose up --build -d --force-recreate
 
 ### Connect Claude Code
 
-Install Claude Code, then point it at the proxy:
+Point your existing [Claude Code installation](https://code.claude.com/docs/en/setup) at the proxy:
 
 ```bash
-npm install -g @anthropic-ai/claude-code
 ANTHROPIC_BASE_URL=http://localhost:8082 claude
 ```
 
