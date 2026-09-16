@@ -39,6 +39,8 @@ cp .env.example .env
 docker compose up --build -d
 ```
 
+The default Compose configuration publishes the proxy only on `127.0.0.1:8082`. Do not bind it to an external interface without adding authentication and network access controls; the proxy does not authenticate inbound requests.
+
 Compose supplies repository `model_mapping.json` as a read-only application config at `/claude-code-proxy/model_mapping.json`. Edit the local file, then recreate the service to apply changes:
 
 ```bash
