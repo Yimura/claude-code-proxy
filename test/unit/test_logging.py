@@ -41,10 +41,10 @@ def test_palette_index_is_stable_and_bounded():
     assert 0 <= first < 5
 
 
-def test_session_label_is_plain_for_non_tty():
+def test_session_label_is_colored_for_non_tty_log_pipe():
     identity = SessionTracker(Stream(False), environ={}).observe("abcdef123456")
-    assert identity.rendered == "[session abcdef12]"
-    assert "\033[" not in identity.rendered
+    assert identity.rendered.startswith("[session \033[")
+    assert identity.rendered.endswith("abcdef12\033[0m]")
 
 
 def test_session_label_is_colored_for_tty():
@@ -53,8 +53,8 @@ def test_session_label_is_colored_for_tty():
     assert identity.rendered.endswith("abcdef12\033[0m]")
 
 
-def test_no_color_disables_tty_color():
-    identity = SessionTracker(Stream(True), environ={"NO_COLOR": "1"}).observe(
+def test_no_color_disables_color_for_non_tty_log_pipe():
+    identity = SessionTracker(Stream(False), environ={"NO_COLOR": "1"}).observe(
         "abcdef123456"
     )
     assert identity.rendered == "[session abcdef12]"

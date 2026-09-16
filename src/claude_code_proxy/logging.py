@@ -104,7 +104,7 @@ class SessionTracker:
         return SessionIdentity(label, f"[session {rendered_label}]", is_new)
 
     def _color_enabled(self) -> bool:
-        return self._stream.isatty() and "NO_COLOR" not in self._environ
+        return "NO_COLOR" not in self._environ
 
 
 def effective_effort(policy: ReasoningPolicy) -> str:
