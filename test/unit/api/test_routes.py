@@ -14,7 +14,7 @@ from claude_code_proxy.domain.models import (
     TextDelta,
     TokenUsage,
 )
-from claude_code_proxy.logging import SessionTracker
+from claude_code_proxy.logging import SessionTracker, request_logging_middleware
 from claude_code_proxy.model_mapping import ModelResolver
 from claude_code_proxy.providers.base import ProviderError
 from claude_code_proxy.service import ProxyService
@@ -68,14 +68,17 @@ class Provider:
         return 7
 
 
-def client(provider=None, *, tracker=None):
+def client(provider=None, *, tracker=None, with_middleware=False):
     provider = provider or Provider()
     service = ProxyService(ModelResolver(ModelConfig({}, {})), "litellm", provider, provider)
     app = FastAPI()
+    tracker = tracker or SessionTracker(PlainStream(), environ={})
+    if with_middleware:
+        app.middleware("http")(request_logging_middleware(tracker))
     app.include_router(
         build_router(
             service,
-            tracker or SessionTracker(PlainStream(), environ={}),
+            tracker,
         )
     )
     return TestClient(app)
@@ -197,3 +200,67 @@ def test_unexpected_provider_exception_logs_once_and_propagates(caplog):
     assert caplog.text.count("unexpected request failure") == 1
     assert "error=RuntimeError" in caplog.text
     assert "secret response body" not in caplog.text
+
+
+def test_stream_error_logs_once_and_preserves_sse(caplog):
+    provider = Provider(stream_events=[TextDelta("hello"), StreamError("secret body")])
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
+        response = client(provider).post(
+            "/v1/messages",
+            headers={"x-claude-code-session-id": "abcdef123456"},
+            json=messages_payload(stream=True, messages=[]),
+        )
+    assert response.status_code == 200
+    assert caplog.text.count("provider stream failed") == 1
+    assert "secret body" not in caplog.text
+    assert '"type": "text_delta", "text": "secret body"' in response.text
+
+
+def test_successful_stream_has_no_completion_log(caplog):
+    with caplog.at_level(logging.INFO, logger="claude_code_proxy.logging"):
+        response = client().post(
+            "/v1/messages",
+            json=messages_payload(stream=True, messages=[]),
+        )
+    assert response.status_code == 200
+    assert "completed" not in caplog.text
+    assert "200 OK" not in caplog.text
+
+
+def test_stream_iterator_exception_logs_once_and_propagates(caplog):
+    provider = Provider(stream_error=RuntimeError("secret body"))
+    with caplog.at_level(logging.ERROR, logger="claude_code_proxy.logging"):
+        with pytest.raises(RuntimeError, match="secret body"):
+            client(provider, with_middleware=True).post(
+                "/v1/messages",
+                headers={"x-claude-code-session-id": "abcdef123456"},
+                json=messages_payload(stream=True, messages=[]),
+            )
+    assert caplog.text.count("unexpected request failure") == 1
+    assert "secret body" not in caplog.text
+
+
+def test_validation_failure_logs_one_http_warning(caplog):
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
+        response = client(with_middleware=True).post(
+            "/v1/messages",
+            headers={"x-claude-code-session-id": "abcdef123456"},
+            json={"model": "model"},
+        )
+    assert response.status_code == 422
+    assert caplog.text.count("HTTP request failed") == 1
+    assert "status=422" in caplog.text
+    assert "[session abcdef12]" in caplog.text
+
+
+def test_middleware_does_not_duplicate_route_provider_warning(caplog):
+    provider = Provider(ProviderError("busy", provider="fake", status_code=429))
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
+        response = client(provider, with_middleware=True).post(
+            "/v1/messages",
+            headers={"x-claude-code-session-id": "abcdef123456"},
+            json=messages_payload(messages=[]),
+        )
+    assert response.status_code == 429
+    assert caplog.text.count("provider request failed") == 1
+    assert "HTTP request failed" not in caplog.text

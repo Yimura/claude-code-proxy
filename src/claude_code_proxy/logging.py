@@ -10,10 +10,12 @@ import threading
 import uuid
 
 from .domain.models import StreamError, StreamEvent
+from .providers.base import ProviderError
 from .reasoning import ReasoningPolicy
 
 SESSION_HEADER = "x-claude-code-session-id"
 FAILURE_LOGGED = "failure_logged"
+REQUEST_LOG_CONTEXT = "request_log_context"
 SESSION_COLORS = (
     "\033[96m",
     "\033[94m",
@@ -179,6 +181,74 @@ def log_unexpected_failure(context: RequestLogContext, error_type: str) -> None:
     )
 
 
+def log_http_failure(request, session_tracker: SessionTracker, status_code: int) -> None:
+    context = getattr(request.state, REQUEST_LOG_CONTEXT, None)
+    if context is not None:
+        logger.warning(
+            "%s %s %s HTTP request failed status=%s model=%s upstream=%s "
+            "provider=%s effort=%s",
+            context.session.rendered,
+            context.method,
+            context.endpoint,
+            status_code,
+            context.original_model,
+            context.upstream_model,
+            context.provider,
+            context.effort,
+        )
+        return
+
+    session = session_tracker.observe(request.headers.get(SESSION_HEADER))
+    logger.warning(
+        "%s %s %s HTTP request failed status=%s",
+        session.rendered,
+        request.method,
+        request.url.path,
+        status_code,
+    )
+
+
+def log_middleware_exception(
+    request, session_tracker: SessionTracker, error_type: str
+) -> None:
+    context = getattr(request.state, REQUEST_LOG_CONTEXT, None)
+    if context is not None:
+        log_unexpected_failure(context, error_type)
+        return
+
+    session = session_tracker.observe(request.headers.get(SESSION_HEADER))
+    logger.error(
+        "%s %s %s unexpected HTTP failure error=%s",
+        session.rendered,
+        request.method,
+        request.url.path,
+        error_type,
+    )
+
+
+def request_logging_middleware(session_tracker: SessionTracker):
+    async def middleware(request, call_next):
+        try:
+            response = await call_next(request)
+        except Exception as error:
+            if not getattr(request.state, FAILURE_LOGGED, False):
+                log_middleware_exception(
+                    request, session_tracker, type(error).__name__
+                )
+                setattr(request.state, FAILURE_LOGGED, True)
+            raise
+
+        if (
+            response.status_code >= 300
+            and not getattr(request.state, FAILURE_LOGGED, False)
+        ):
+            log_http_failure(request, session_tracker, response.status_code)
+            setattr(request.state, FAILURE_LOGGED, True)
+        return response
+
+    return middleware
+
+
 async def observe_stream(
     events: AsyncIterator[StreamEvent], context: RequestLogContext
 ) -> AsyncIterator[StreamEvent]:
@@ -187,6 +257,9 @@ async def observe_stream(
             if isinstance(event, StreamError):
                 log_stream_failure(context)
             yield event
+    except ProviderError as error:
+        log_provider_failure(context, error.status_code)
+        raise
     except Exception as error:
         log_unexpected_failure(context, type(error).__name__)
         raise

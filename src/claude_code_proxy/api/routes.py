@@ -5,6 +5,7 @@ from fastapi.responses import StreamingResponse
 
 from ..logging import (
     FAILURE_LOGGED,
+    REQUEST_LOG_CONTEXT,
     SESSION_HEADER,
     RequestLogContext,
     SessionTracker,
@@ -12,14 +13,12 @@ from ..logging import (
     log_provider_failure,
     log_session_started,
     log_unexpected_failure,
+    observe_stream,
 )
 from ..providers.base import ProviderError
 from ..service import ProxyService
 from .schemas import MessagesRequest, TokenCountRequest, TokenCountResponse
 from .translation import normalize_request, serialize_stream, to_api_response
-
-
-REQUEST_LOG_CONTEXT = "request_log_context"
 
 
 def build_router(
@@ -36,7 +35,10 @@ def build_router(
         _record_context(raw_request, context)
         if request.stream:
             return StreamingResponse(
-                serialize_stream(prepared, service.stream_prepared(prepared)),
+                serialize_stream(
+                    prepared,
+                    observe_stream(service.stream_prepared(prepared), context),
+                ),
                 media_type="text/event-stream",
             )
         try:
