@@ -46,8 +46,8 @@ A proxy server that lets you use Anthropic clients with Gemini, OpenAI, or Anthr
    *   `VERTEX_PROJECT` (Optional): Your Google Cloud Project ID (Required if `PREFERRED_PROVIDER=google` and `USE_VERTEX_AUTH=true`).
    *   `VERTEX_LOCATION` (Optional): The Google Cloud region for Vertex AI (e.g., `us-central1`) (Required if `PREFERRED_PROVIDER=google` and `USE_VERTEX_AUTH=true`).
    *   `PREFERRED_PROVIDER` (Optional): Set to `openai` (default), `google`, or `anthropic`. This determines the primary backend for mapping `haiku`/`sonnet`.
-   *   `BIG_MODEL` (Optional): The model to map `sonnet` requests to. Defaults to `gpt-4.1` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.5-pro-preview-03-25`. Ignored when `PREFERRED_PROVIDER=anthropic`.
-   *   `SMALL_MODEL` (Optional): The model to map `haiku` requests to. Defaults to `gpt-4.1-mini` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.0-flash`. Ignored when `PREFERRED_PROVIDER=anthropic`.
+   *   `BIG_MODEL` (Optional): The model to map `sonnet` requests to. Defaults to `gpt-5.6-sol` for OpenAI/Codex mappings. Ignored when `PREFERRED_PROVIDER=anthropic`.
+   *   `SMALL_MODEL` (Optional): The model to map `haiku` requests to. Defaults to `gpt-5.6-terra` for OpenAI/Codex mappings. Ignored when `PREFERRED_PROVIDER=anthropic`.
 
    **Mapping Logic:**
    - If `PREFERRED_PROVIDER=openai` (default), `haiku`/`sonnet` map to `SMALL_MODEL`/`BIG_MODEL` prefixed with `openai/`.
@@ -101,29 +101,45 @@ docker run -d --env-file .env -p 8082:8082 ghcr.io/1rgs/claude-code-proxy:latest
 
 ## Model Mapping 🗺️
 
-The proxy automatically maps Claude models to either OpenAI or Gemini models based on the configured model:
+Claude model names are matched against patterns in `model_mapping.json`. Each mapping selects a target model and can set default reasoning effort:
 
-| Claude Model | Default Mapping | When BIG_MODEL/SMALL_MODEL is a Gemini model |
-|--------------|--------------|---------------------------|
-| haiku | openai/gpt-4o-mini | gemini/[model-name] |
-| sonnet | openai/gpt-4o | gemini/[model-name] |
+```json
+{
+  "mappings": {
+    "haiku": {"tier": "small", "effort": "medium"},
+    "sonnet": {"tier": "big", "effort": "medium"},
+    "opus": {"tier": "big", "effort": "high"},
+    "fable": {"model": "gpt-daybreak-blue-latest", "effort": "high"}
+  }
+}
+```
+
+Structured mappings use exactly one target selector:
+
+- `"tier": "small"` resolves through `SMALL_MODEL`.
+- `"tier": "big"` resolves through `BIG_MODEL`.
+- `"model": "..."` selects an exact model and ignores tier environment variables.
+
+Explicit `openai/`, `gemini/`, and `anthropic/` prefixes are preserved. Unprefixed exact models default to OpenAI. Legacy entries such as `"haiku": "small"` remain supported.
+
+Valid mapping efforts are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`. Incoming Claude reasoning controls override mapping defaults in this order:
+
+1. `output_config.effort`
+2. `thinking` enabled/adaptive/disabled state
+3. Mapping `effort`
+4. Provider default
+
+Anthropic request effort `max` maps to OpenAI `high` for broad compatibility. Enabled/adaptive thinking without configured effort uses `medium`. Disabled thinking omits upstream reasoning configuration.
 
 ### Supported Models
 
 #### OpenAI Models
-The following OpenAI models are supported with automatic `openai/` prefix handling:
-- o3-mini
-- o1
-- o1-mini
-- o1-pro
-- gpt-4.5-preview
-- gpt-4o
-- gpt-4o-audio-preview
-- chatgpt-4o-latest
-- gpt-4o-mini
-- gpt-4o-mini-audio-preview
-- gpt-4.1
-- gpt-4.1-mini
+Current OpenAI text/reasoning models recognized for automatic `openai/` prefix handling:
+- `gpt-6-astra` — strongest frontier reasoning and coding model; availability may depend on account rollout
+- `gpt-5.6-sol` — flagship model and default big tier
+- `gpt-5.6` — alias for `gpt-5.6-sol`
+- `gpt-5.6-terra` — balanced model and default small tier
+- `gpt-5.6-luna` — lower-cost model for high-volume workloads
 
 #### Gemini Models
 The following Gemini models are supported with automatic `gemini/` prefix handling:
@@ -137,8 +153,8 @@ The proxy automatically adds the appropriate prefix to model names:
 - The BIG_MODEL and SMALL_MODEL will get the appropriate prefix based on whether they're in the OpenAI or Gemini model lists
 
 For example:
-- `gpt-4o` becomes `openai/gpt-4o`
-- `gemini-2.5-pro-preview-03-25` becomes `gemini/gemini-2.5-pro-preview-03-25`
+- `gpt-5.6-terra` becomes `openai/gpt-5.6-terra`
+- `gemini-2.5-pro` becomes `gemini/gemini-2.5-pro`
 - When BIG_MODEL is set to a Gemini model, Claude Sonnet will map to `gemini/[model-name]`
 
 ### Customizing Model Mapping
@@ -151,8 +167,8 @@ No changes needed in `.env` beyond API keys, or ensure:
 OPENAI_API_KEY="your-openai-key"
 GEMINI_API_KEY="your-google-key" # Needed if PREFERRED_PROVIDER=google
 # PREFERRED_PROVIDER="openai" # Optional, it's the default
-# BIG_MODEL="gpt-4.1" # Optional, it's the default
-# SMALL_MODEL="gpt-4.1-mini" # Optional, it's the default
+# BIG_MODEL="gpt-5.6-sol" # Optional, it's the default
+# SMALL_MODEL="gpt-5.6-terra" # Optional, it's the default
 ```
 
 **Example 2a: Prefer Google (using GEMINI_API_KEY)**
@@ -190,8 +206,8 @@ PREFERRED_PROVIDER="anthropic"
 OPENAI_API_KEY="your-openai-key"
 GEMINI_API_KEY="your-google-key"
 PREFERRED_PROVIDER="openai"
-BIG_MODEL="gpt-4o" # Example specific model
-SMALL_MODEL="gpt-4o-mini" # Example specific model
+BIG_MODEL="gpt-6-astra" # Maximum-capability example
+SMALL_MODEL="gpt-5.6-luna" # Lower-cost example
 ```
 
 ## How It Works 🧩

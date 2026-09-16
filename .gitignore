@@ -36,3 +36,9 @@ ENV/
 .vscode/
 *.swp
 *.swo
+
+# Local Superpowers specs and plans
+docs/superpowers/
+
+# Generated agent worktrees
+.claude/worktrees/

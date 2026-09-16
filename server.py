@@ -2,7 +2,7 @@ from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 import logging
 import json
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Dict, Any, Optional, Union, Literal
 import httpx
 import os
@@ -14,6 +14,14 @@ from dotenv import load_dotenv
 import re
 from datetime import datetime
 import sys
+
+from reasoning import (
+    MappingEntry,
+    OutputConfig,
+    ThinkingConfig,
+    parse_model_mappings,
+    resolve_reasoning_policy,
+)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -105,8 +113,8 @@ PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
 
 # Get model mapping configuration from environment
 # Default to latest OpenAI models if not set
-BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
-SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
+BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-5.6-sol")
+SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-5.6-terra")
 
 # Codex subscription settings
 OPENCODE_DATA_DIR = os.environ.get(
@@ -115,47 +123,71 @@ OPENCODE_DATA_DIR = os.environ.get(
 )
 
 # Load model mapping from JSON config
+DEFAULT_MODEL_MAPPING = parse_model_mappings(
+    {
+        "haiku": {"tier": "small", "effort": "medium"},
+        "sonnet": {"tier": "big", "effort": "medium"},
+        "opus": {"tier": "big", "effort": "high"},
+        "fable": {"model": "gpt-daybreak-blue-latest", "effort": "high"},
+    }
+)
 MODEL_MAPPING_PATH = os.environ.get("MODEL_MAPPING_PATH", "model_mapping.json")
 
-def _load_model_mapping() -> dict[str, str]:
+
+def _parse_model_mapping_config(data: object) -> dict[str, MappingEntry]:
+    if not isinstance(data, dict) or "mappings" not in data:
+        raise ValueError("configuration requires a top-level 'mappings' object")
+    return parse_model_mappings(data["mappings"])
+
+
+def _load_model_mapping() -> dict[str, MappingEntry]:
     try:
-        with open(MODEL_MAPPING_PATH) as f:
-            data = json.load(f)
-        return data.get("mappings", {})
+        with open(MODEL_MAPPING_PATH) as mapping_file:
+            data = json.load(mapping_file)
     except FileNotFoundError:
-        logger.warning(f"Model mapping file not found at {MODEL_MAPPING_PATH}, using defaults")
-        return {"haiku": "small", "sonnet": "big", "opus": "big", "fable": "big"}
+        logger.warning(
+            f"Model mapping file not found at {MODEL_MAPPING_PATH}, using defaults"
+        )
+        return DEFAULT_MODEL_MAPPING.copy()
+
+    try:
+        return _parse_model_mapping_config(data)
+    except ValueError as error:
+        raise ValueError(
+            f"Invalid model mapping configuration at {MODEL_MAPPING_PATH}: {error}"
+        ) from error
+
 
 MODEL_MAPPING = _load_model_mapping()
 
 
-def resolve_mapped_model(clean_name: str) -> tuple[str, bool]:
-    """Match clean model name against MODEL_MAPPING, return (prefixed_model, matched)."""
-    lower = clean_name.lower()
-    for pattern, tier in MODEL_MAPPING.items():
-        if pattern in lower:
-            target = SMALL_MODEL if tier == "small" else BIG_MODEL
+def resolve_mapped_model(clean_name: str) -> tuple[str, bool, Optional[str]]:
+    """Resolve a clean model name to its configured target and effort."""
+    lower_name = clean_name.lower()
+    for pattern, entry in MODEL_MAPPING.items():
+        if pattern.lower() not in lower_name:
+            continue
+
+        if entry.model is not None:
+            target = entry.model
+            if not target.startswith(("openai/", "gemini/", "anthropic/")):
+                target = f"openai/{target}"
+        else:
+            target = SMALL_MODEL if entry.tier == "small" else BIG_MODEL
             if PREFERRED_PROVIDER == "google" and target in GEMINI_MODELS:
-                return f"gemini/{target}", True
-            return f"openai/{target}", True
-    return clean_name, False
+                target = f"gemini/{target}"
+            else:
+                target = f"openai/{target}"
+        return target, True, entry.effort
+
+    return clean_name, False, None
 
 # List of OpenAI models
 OPENAI_MODELS = [
-    "o3-mini",
-    "o1",
-    "o1-mini",
-    "o1-pro",
-    "gpt-4.5-preview",
-    "gpt-4o",
-    "gpt-4o-audio-preview",
-    "chatgpt-4o-latest",
-    "gpt-4o-mini",
-    "gpt-4o-mini-audio-preview",
-    "gpt-4.1",
-    "gpt-4.1-mini",
-    "gpt-4.1-nano",
+    "gpt-5.6",
     "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
     "gpt-6-astra",
 ]
 
@@ -244,8 +276,24 @@ class Tool(BaseModel):
     model_config = {"extra": "allow"}
 
 
-class ThinkingConfig(BaseModel):
-    enabled: bool = True
+def _map_request_model(model: str) -> tuple[str, bool, Optional[str]]:
+    clean_name = model
+    for prefix in ("anthropic/", "openai/", "gemini/"):
+        if clean_name.startswith(prefix):
+            clean_name = clean_name[len(prefix) :]
+            break
+
+    if PREFERRED_PROVIDER == "anthropic":
+        return f"anthropic/{clean_name}", True, None
+
+    mapped_model, mapped, mapped_effort = resolve_mapped_model(clean_name)
+    if mapped:
+        return mapped_model, True, mapped_effort
+    if clean_name in GEMINI_MODELS and not model.startswith("gemini/"):
+        return f"gemini/{clean_name}", True, None
+    if clean_name in OPENAI_MODELS and not model.startswith("openai/"):
+        return f"openai/{clean_name}", True, None
+    return model, False, None
 
 
 class MessagesRequest(BaseModel):
@@ -262,59 +310,34 @@ class MessagesRequest(BaseModel):
     tools: Optional[List[Tool]] = None
     tool_choice: Optional[Dict[str, Any]] = None
     thinking: Optional[ThinkingConfig] = None
-    original_model: Optional[str] = None  # Will store the original model name
+    output_config: Optional[OutputConfig] = None
+    original_model: Optional[str] = Field(default=None, exclude=True)
+    mapped_effort: Optional[str] = Field(default=None, exclude=True)
 
-    @field_validator("model")
-    def validate_model_field(cls, v, info):  # Renamed to avoid conflict
-        original_model = v
-        new_model = v  # Default to original value
+    @model_validator(mode="before")
+    @classmethod
+    def map_model_and_effort(cls, values):
+        if not isinstance(values, dict):
+            return values
+        original_model = values.get("model")
+        if not isinstance(original_model, str):
+            return values
 
-        logger.debug(
-            f"📋 MODEL VALIDATION: Original='{original_model}', Preferred='{PREFERRED_PROVIDER}', BIG='{BIG_MODEL}', SMALL='{SMALL_MODEL}'"
-        )
-
-        # Remove provider prefixes for easier matching
-        clean_v = v
-        if clean_v.startswith("anthropic/"):
-            clean_v = clean_v[10:]
-        elif clean_v.startswith("openai/"):
-            clean_v = clean_v[7:]
-        elif clean_v.startswith("gemini/"):
-            clean_v = clean_v[7:]
-
-        # --- Mapping Logic --- START ---
-        mapped = False
-        if PREFERRED_PROVIDER == "anthropic":
-            new_model = f"anthropic/{clean_v}"
-            mapped = True
-        else:
-            new_model, mapped = resolve_mapped_model(clean_v)
-
-        if not mapped:
-            if clean_v in GEMINI_MODELS and not v.startswith("gemini/"):
-                new_model = f"gemini/{clean_v}"
-                mapped = True
-            elif clean_v in OPENAI_MODELS and not v.startswith("openai/"):
-                new_model = f"openai/{clean_v}"
-                mapped = True
-        # --- Mapping Logic --- END ---
-
+        mapped_model, mapped, mapped_effort = _map_request_model(original_model)
         if mapped:
-            logger.debug(f"📌 MODEL MAPPING: '{original_model}' ➡️ '{new_model}'")
-        else:
-            # If no mapping occurred and no prefix exists, log warning or decide default
-            if not v.startswith(("openai/", "gemini/", "anthropic/")):
-                logger.warning(
-                    f"⚠️ No prefix or mapping rule for model: '{original_model}'. Using as is."
-                )
-            new_model = v  # Ensure we return the original if no rule applied
+            logger.debug(
+                f"📌 MODEL MAPPING: '{original_model}' ➡️ '{mapped_model}'"
+            )
+        elif not original_model.startswith(("openai/", "gemini/", "anthropic/")):
+            logger.warning(
+                f"⚠️ No prefix or mapping rule for model: '{original_model}'. Using as is."
+            )
 
-        # Store the original model in the values dictionary
-        values = info.data
-        if isinstance(values, dict):
-            values["original_model"] = original_model
-
-        return new_model
+        updated = dict(values)
+        updated["original_model"] = original_model
+        updated["mapped_effort"] = mapped_effort
+        updated["model"] = mapped_model
+        return updated
 
 
 class TokenCountRequest(BaseModel):
@@ -348,7 +371,7 @@ class TokenCountRequest(BaseModel):
             clean_v = clean_v[7:]
 
         # --- Mapping Logic --- START ---
-        new_model, mapped = resolve_mapped_model(clean_v)
+        new_model, mapped, _mapped_effort = resolve_mapped_model(clean_v)
 
         if not mapped:
             if clean_v in GEMINI_MODELS and not v.startswith("gemini/"):
@@ -653,9 +676,24 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
         "stream": anthropic_request.stream,
     }
 
-    # Only include thinking field for Anthropic models
-    if anthropic_request.thinking and anthropic_request.model.startswith("anthropic/"):
-        litellm_request["thinking"] = anthropic_request.thinking
+    is_anthropic_model = anthropic_request.model.startswith("anthropic/")
+    if is_anthropic_model:
+        if anthropic_request.thinking is not None:
+            litellm_request["thinking"] = anthropic_request.thinking.model_dump(
+                exclude_none=True
+            )
+        if anthropic_request.output_config is not None:
+            litellm_request["output_config"] = (
+                anthropic_request.output_config.model_dump(exclude_none=True)
+            )
+    else:
+        policy = resolve_reasoning_policy(
+            thinking=anthropic_request.thinking,
+            output_config=anthropic_request.output_config,
+            mapping_effort=anthropic_request.mapped_effort,
+        )
+        if policy.enabled and policy.effort:
+            litellm_request["reasoning_effort"] = policy.effort
 
     # Add optional parameters if present
     if anthropic_request.stop_sequences:
@@ -1617,6 +1655,7 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
                 tools=request.tools,
                 tool_choice=request.tool_choice,
                 thinking=request.thinking,
+                output_config=None,
             )
         )
 

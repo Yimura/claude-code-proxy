@@ -1,8 +1,8 @@
 {
   "mappings": {
-    "haiku": "small",
-    "sonnet": "big",
-    "opus": "big",
-    "fable": "big"
+    "haiku": {"tier": "small", "effort": "medium"},
+    "sonnet": {"tier": "big", "effort": "medium"},
+    "opus": {"tier": "big", "effort": "high"},
+    "fable": {"model": "gpt-daybreak-blue-latest", "effort": "high"}
   }
 }

@@ -15,6 +15,8 @@ from typing import Dict, Any, List, Optional, Union
 
 import httpx
 
+from reasoning import resolve_reasoning_policy
+
 logger = logging.getLogger(__name__)
 
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -268,6 +270,14 @@ def build_request(request) -> Dict[str, Any]:
         "store": False,
         "stream": True,
     }
+
+    policy = resolve_reasoning_policy(
+        thinking=request.thinking,
+        output_config=request.output_config,
+        mapping_effort=request.mapped_effort,
+    )
+    if policy.enabled and policy.effort:
+        body["reasoning"] = {"effort": policy.effort}
 
     instructions = _extract_system(request.system)
     if instructions:
