@@ -1,7 +1,7 @@
 """Anthropic-compatible HTTP routes."""
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from ..logging import (
     FAILURE_LOGGED,
@@ -65,6 +65,10 @@ def build_router(
         except Exception as error:
             _log_unexpected_error(raw_request, context, error)
             raise
+
+    @router.head("/api/hello")
+    async def hello():
+        return Response()
 
     @router.get("/")
     async def root():
