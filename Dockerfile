@@ -2,15 +2,13 @@ FROM python:latest
 
 WORKDIR /claude-code-proxy
 
-# Copy package specifications
+# Install dependencies separately so application-only changes reuse this layer.
 COPY pyproject.toml uv.lock ./
+RUN pip install --upgrade uv && uv sync --locked --no-install-project --no-dev
 
-# Install uv and project dependencies
-RUN pip install --upgrade uv && uv sync --locked
+COPY src ./src
+COPY README.md model_mapping.json ./
+RUN uv sync --locked --no-dev
 
-# Copy project code to current directory
-COPY . .
-
-# Start the proxy
 EXPOSE 8082
-CMD uv run uvicorn server:app --host 0.0.0.0 --port 8082 --reload
+CMD ["uv", "run", "--no-dev", "--no-sync", "uvicorn", "claude_code_proxy.app:app", "--app-dir", "src", "--host", "0.0.0.0", "--port", "8082"]

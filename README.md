@@ -56,7 +56,7 @@ A proxy server that lets you use Anthropic clients with Gemini, OpenAI, or Anthr
 
 4. **Run the server**:
    ```bash
-   uv run uvicorn server:app --host 0.0.0.0 --port 8082 --reload
+   uv run uvicorn claude_code_proxy.app:app --app-dir src --host 0.0.0.0 --port 8082 --reload
    ```
    *(`--reload` is optional, for development)*
 
@@ -221,6 +221,18 @@ This proxy works by:
 5. **Returning** the formatted response to the client ✅
 
 The proxy handles both streaming and non-streaming responses, maintaining compatibility with all Claude clients. 🌊
+
+## Development
+
+Application code lives in `src/claude_code_proxy/`; unit tests live in `test/unit/`.
+
+```bash
+uv sync --dev
+uv run pytest
+uv run uvicorn claude_code_proxy.app:app --app-dir src --reload --port 8082
+```
+
+LiteLLM and Codex subscription access implement one internal provider contract. FastAPI routes translate Anthropic-compatible traffic into normalized domain models before selecting either adapter.
 
 ## Contributing 🤝
 
