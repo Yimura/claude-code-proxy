@@ -1,0 +1,12 @@
+services:
+  proxy:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - 8082:8082
+    volumes:
+      - ${OPENCODE_DATA_DIR:-~/.local/share/opencode}:/opencode-auth:ro
+      - ./model_mapping.json:/claude-code-proxy/model_mapping.json:ro
+    environment:
+      - OPENCODE_DATA_DIR=/opencode-auth

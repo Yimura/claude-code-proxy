@@ -87,3 +87,7 @@ venv/
 
 # VS Code
 .vscode/
+
+.pytest_cache/
+test/
+docs/superpowers/
