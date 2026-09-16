@@ -108,6 +108,12 @@ PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
 BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
 SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
 
+# Codex subscription settings
+OPENCODE_DATA_DIR = os.environ.get(
+    "OPENCODE_DATA_DIR",
+    os.path.expanduser("~/.local/share/opencode"),
+)
+
 # List of OpenAI models
 OPENAI_MODELS = [
     "o3-mini",
@@ -120,8 +126,11 @@ OPENAI_MODELS = [
     "chatgpt-4o-latest",
     "gpt-4o-mini",
     "gpt-4o-mini-audio-preview",
-    "gpt-4.1",  # Added default big model
-    "gpt-4.1-mini",  # Added default small model
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+    "gpt-5.6-sol",
+    "gpt-6-astra",
 ]
 
 # List of Gemini models
@@ -631,14 +640,15 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
 
                 messages.append({"role": msg.role, "content": processed_content})
 
-    # Cap max_tokens for OpenAI models to their limit of 16384
+    # Cap max_tokens for OpenAI/Gemini models (codex subscription has higher limits)
     max_tokens = anthropic_request.max_tokens
     if anthropic_request.model.startswith(
         "openai/"
     ) or anthropic_request.model.startswith("gemini/"):
-        max_tokens = min(max_tokens, 16384)
+        cap = 128_000 if PREFERRED_PROVIDER == "codex" else 16384
+        max_tokens = min(max_tokens, cap)
         logger.debug(
-            f"Capping max_tokens to 16384 for OpenAI/Gemini model (original value: {anthropic_request.max_tokens})"
+            f"Capping max_tokens to {cap} for model (original value: {anthropic_request.max_tokens})"
         )
 
     # Create LiteLLM request dict
@@ -1237,13 +1247,29 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             f"📊 PROCESSING REQUEST: Model={request.model}, Stream={request.stream}"
         )
 
+        # Codex subscription: bypass LiteLLM entirely, use Responses API
+        if PREFERRED_PROVIDER == "codex" and request.model.startswith("openai/"):
+            import codex_provider
+
+            num_tools = len(request.tools) if request.tools else 0
+            log_request_beautifully(
+                "POST", raw_request.url.path, display_model,
+                request.model, len(request.messages), num_tools, 200,
+            )
+            if request.stream:
+                return StreamingResponse(
+                    codex_provider.stream_completion(request, OPENCODE_DATA_DIR),
+                    media_type="text/event-stream",
+                )
+            else:
+                return await codex_provider.complete(request, OPENCODE_DATA_DIR)
+
         # Convert Anthropic request to LiteLLM format
         litellm_request = convert_anthropic_to_litellm(request)
 
-        # Determine which API key to use based on the model
+        # Determine which API key/auth to use based on the model and provider
         if request.model.startswith("openai/"):
             litellm_request["api_key"] = OPENAI_API_KEY
-            # Use custom OpenAI base URL if configured
             if OPENAI_BASE_URL:
                 litellm_request["api_base"] = OPENAI_BASE_URL
                 logger.debug(
