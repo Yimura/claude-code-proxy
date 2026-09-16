@@ -1,0 +1,8 @@
+{
+  "mappings": {
+    "haiku": "small",
+    "sonnet": "big",
+    "opus": "big",
+    "fable": "big"
+  }
+}

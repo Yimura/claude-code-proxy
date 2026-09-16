@@ -114,6 +114,32 @@ OPENCODE_DATA_DIR = os.environ.get(
     os.path.expanduser("~/.local/share/opencode"),
 )
 
+# Load model mapping from JSON config
+MODEL_MAPPING_PATH = os.environ.get("MODEL_MAPPING_PATH", "model_mapping.json")
+
+def _load_model_mapping() -> dict[str, str]:
+    try:
+        with open(MODEL_MAPPING_PATH) as f:
+            data = json.load(f)
+        return data.get("mappings", {})
+    except FileNotFoundError:
+        logger.warning(f"Model mapping file not found at {MODEL_MAPPING_PATH}, using defaults")
+        return {"haiku": "small", "sonnet": "big", "opus": "big", "fable": "big"}
+
+MODEL_MAPPING = _load_model_mapping()
+
+
+def resolve_mapped_model(clean_name: str) -> tuple[str, bool]:
+    """Match clean model name against MODEL_MAPPING, return (prefixed_model, matched)."""
+    lower = clean_name.lower()
+    for pattern, tier in MODEL_MAPPING.items():
+        if pattern in lower:
+            target = SMALL_MODEL if tier == "small" else BIG_MODEL
+            if PREFERRED_PROVIDER == "google" and target in GEMINI_MODELS:
+                return f"gemini/{target}", True
+            return f"openai/{target}", True
+    return clean_name, False
+
 # List of OpenAI models
 OPENAI_MODELS = [
     "o3-mini",
@@ -256,36 +282,18 @@ class MessagesRequest(BaseModel):
         # --- Mapping Logic --- START ---
         mapped = False
         if PREFERRED_PROVIDER == "anthropic":
-            # Don't remap to big/small models, just add the prefix
             new_model = f"anthropic/{clean_v}"
             mapped = True
+        else:
+            new_model, mapped = resolve_mapped_model(clean_v)
 
-        # Map Haiku to SMALL_MODEL based on provider preference
-        elif "haiku" in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
-                new_model = f"gemini/{SMALL_MODEL}"
-                mapped = True
-            else:
-                new_model = f"openai/{SMALL_MODEL}"
-                mapped = True
-
-        # Map Sonnet to BIG_MODEL based on provider preference
-        elif "sonnet" in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
-                new_model = f"gemini/{BIG_MODEL}"
-                mapped = True
-            else:
-                new_model = f"openai/{BIG_MODEL}"
-                mapped = True
-
-        # Add prefixes to non-mapped models if they match known lists
-        elif not mapped:
+        if not mapped:
             if clean_v in GEMINI_MODELS and not v.startswith("gemini/"):
                 new_model = f"gemini/{clean_v}"
-                mapped = True  # Technically mapped to add prefix
+                mapped = True
             elif clean_v in OPENAI_MODELS and not v.startswith("openai/"):
                 new_model = f"openai/{clean_v}"
-                mapped = True  # Technically mapped to add prefix
+                mapped = True
         # --- Mapping Logic --- END ---
 
         if mapped:
@@ -337,33 +345,15 @@ class TokenCountRequest(BaseModel):
             clean_v = clean_v[7:]
 
         # --- Mapping Logic --- START ---
-        mapped = False
-        # Map Haiku to SMALL_MODEL based on provider preference
-        if "haiku" in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
-                new_model = f"gemini/{SMALL_MODEL}"
-                mapped = True
-            else:
-                new_model = f"openai/{SMALL_MODEL}"
-                mapped = True
+        new_model, mapped = resolve_mapped_model(clean_v)
 
-        # Map Sonnet to BIG_MODEL based on provider preference
-        elif "sonnet" in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
-                new_model = f"gemini/{BIG_MODEL}"
-                mapped = True
-            else:
-                new_model = f"openai/{BIG_MODEL}"
-                mapped = True
-
-        # Add prefixes to non-mapped models if they match known lists
-        elif not mapped:
+        if not mapped:
             if clean_v in GEMINI_MODELS and not v.startswith("gemini/"):
                 new_model = f"gemini/{clean_v}"
-                mapped = True  # Technically mapped to add prefix
+                mapped = True
             elif clean_v in OPENAI_MODELS and not v.startswith("openai/"):
                 new_model = f"openai/{clean_v}"
-                mapped = True  # Technically mapped to add prefix
+                mapped = True
         # --- Mapping Logic --- END ---
 
         if mapped:
