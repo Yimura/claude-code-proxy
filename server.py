@@ -721,10 +721,14 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
         elif choice_type == "any":
             litellm_request["tool_choice"] = "any"
         elif choice_type == "tool" and "name" in tool_choice_dict:
-            litellm_request["tool_choice"] = {
-                "type": "function",
-                "function": {"name": tool_choice_dict["name"]},
-            }
+            tool_names = {t["function"]["name"] for t in openai_tools}
+            if tool_choice_dict["name"] in tool_names:
+                litellm_request["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": tool_choice_dict["name"]},
+                }
+            else:
+                litellm_request["tool_choice"] = "auto"
         else:
             # Default to auto if we can't determine
             litellm_request["tool_choice"] = "auto"
