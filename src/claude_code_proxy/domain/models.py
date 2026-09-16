@@ -126,7 +126,12 @@ class StreamComplete:
 
 @dataclass(frozen=True)
 class StreamError:
-    message: str
+    error_type: str = "api_error"
+    message: str = "Internal server error"
+    status_code: int | None = None
+    retryable: bool = True
+    provider: str | None = None
+    diagnostic: str | None = None
 
 
 StreamEvent: TypeAlias = (

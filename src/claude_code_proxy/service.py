@@ -1,9 +1,17 @@
 """Provider-neutral request orchestration."""
 
+from collections.abc import AsyncIterator
 from dataclasses import replace
-from .domain.models import CompletionRequest, CompletionResponse
+
+from .domain.models import (
+    CompletionRequest,
+    CompletionResponse,
+    StreamComplete,
+    StreamError,
+    StreamEvent,
+)
 from .model_mapping import ModelResolver
-from .providers.base import Provider
+from .providers.base import Provider, ProviderError, protocol_error, stream_error_from_exception
 from .reasoning import resolve_reasoning_policy
 
 
@@ -33,10 +41,38 @@ class ProxyService:
         return self.stream_prepared(self.prepare(request))
 
     def stream_prepared(self, request: CompletionRequest):
-        return self.provider_for(request).stream(request)
+        provider = self.provider_for(request)
+        return _validated_stream(provider.stream(request), provider.name)
 
     async def count_tokens(self, request: CompletionRequest) -> int:
         return await self.count_tokens_prepared(self.prepare(request))
 
     async def count_tokens_prepared(self, request: CompletionRequest) -> int:
         return await self.provider_for(request).count_tokens(request)
+
+
+async def _validated_stream(
+    events: AsyncIterator[StreamEvent], provider: str
+) -> AsyncIterator[StreamEvent]:
+    iterator = aiter(events)
+    try:
+        async for event in iterator:
+            yield event
+            if isinstance(event, (StreamComplete, StreamError)):
+                return
+    except ProviderError as error:
+        yield stream_error_from_exception(
+            error, provider=provider, expose_message=True
+        )
+        return
+    except Exception as error:
+        yield stream_error_from_exception(error, provider=provider)
+        return
+    finally:
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            await close()
+
+    yield protocol_error(
+        "provider stream ended without terminal outcome", provider=provider
+    )

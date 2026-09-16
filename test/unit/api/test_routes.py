@@ -209,8 +209,15 @@ def test_unexpected_provider_exception_logs_once_and_propagates(caplog):
     assert "secret response body" not in caplog.text
 
 
-def test_stream_error_logs_once_and_preserves_sse(caplog):
-    provider = Provider(stream_events=[TextDelta("hello"), StreamError("secret body")])
+def test_stream_error_logs_once_and_returns_safe_sse(caplog):
+    error = StreamError(
+        error_type="api_error",
+        message="Internal server error",
+        retryable=True,
+        provider="fake",
+        diagnostic="secret body",
+    )
+    provider = Provider(stream_events=[TextDelta("hello"), error])
     with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
         response = client(provider).post(
             "/v1/messages",
@@ -219,8 +226,13 @@ def test_stream_error_logs_once_and_preserves_sse(caplog):
         )
     assert response.status_code == 200
     assert caplog.text.count("provider stream failed") == 1
+    assert "error=api_error" in caplog.text
+    assert "retryable=True" in caplog.text
     assert "secret body" not in caplog.text
-    assert '"type": "text_delta", "text": "secret body"' in response.text
+    assert 'event: error' in response.text
+    assert '"message": "Internal server error"' in response.text
+    assert "message_stop" not in response.text
+    assert "[DONE]" not in response.text
 
 
 def test_successful_stream_has_no_completion_log(caplog):
@@ -234,17 +246,20 @@ def test_successful_stream_has_no_completion_log(caplog):
     assert "200 OK" not in caplog.text
 
 
-def test_stream_iterator_exception_logs_once_and_propagates(caplog):
+def test_stream_iterator_exception_becomes_safe_terminal_error(caplog):
     provider = Provider(stream_error=RuntimeError("secret body"))
-    with caplog.at_level(logging.ERROR, logger="claude_code_proxy.logging"):
-        with pytest.raises(RuntimeError, match="secret body"):
-            client(provider, with_middleware=True).post(
-                "/v1/messages",
-                headers={"x-claude-code-session-id": "abcdef123456"},
-                json=messages_payload(stream=True, messages=[]),
-            )
-    assert caplog.text.count("unexpected request failure") == 1
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
+        response = client(provider, with_middleware=True).post(
+            "/v1/messages",
+            headers={"x-claude-code-session-id": "abcdef123456"},
+            json=messages_payload(stream=True, messages=[]),
+        )
+
+    assert response.status_code == 200
+    assert caplog.text.count("provider stream failed") == 1
     assert "secret body" not in caplog.text
+    assert 'event: error' in response.text
+    assert '"message": "Internal server error"' in response.text
 
 
 def test_hello_probe_does_not_log_warning(caplog):

@@ -9,6 +9,7 @@ from ...domain.models import (
     CompletionRequest,
     CompletionResponse,
     StreamComplete,
+    StreamError,
     StreamEvent,
     TextBlock,
     TextDelta,
@@ -102,6 +103,7 @@ class CodexEventTranslator:
     input_tokens: int = 0
     output_tokens: int = 0
     stop_reason: str = "end_turn"
+    completed: bool = False
 
     def feed(self, event_type: str, data: dict[str, Any]) -> tuple[StreamEvent, ...]:
         if event_type == "response.output_text.delta":
@@ -117,8 +119,21 @@ class CodexEventTranslator:
             return self._tool_delta(data)
         if event_type == "response.function_call_arguments.done":
             return self._tool_end(data)
-        if event_type == "response.completed":
+        if event_type in {"response.completed", "response.incomplete"}:
             self._record_completion(data)
+            return ()
+        if event_type == "response.failed":
+            response = data.get("response", data)
+            error = response.get("error") or {}
+            message = error.get("message") or "Codex request failed"
+            code = error.get("code") or "unknown_error"
+            return (
+                StreamError(
+                    message=message,
+                    provider="codex",
+                    diagnostic=f"{code}: {message}",
+                ),
+            )
         return ()
 
     def finish(self) -> StreamComplete:
@@ -159,6 +174,7 @@ class CodexEventTranslator:
         return tuple(events)
 
     def _record_completion(self, data):
+        self.completed = True
         response = data if "usage" in data else data.get("response", data)
         usage = response.get("usage", {})
         self.input_tokens = usage.get("input_tokens", 0)

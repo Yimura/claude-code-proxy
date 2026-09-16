@@ -158,11 +158,22 @@ def log_provider_failure(context: RequestLogContext, status_code: int) -> None:
     )
 
 
-def log_stream_failure(context: RequestLogContext) -> None:
+def log_stream_failure(
+    context: RequestLogContext, error: StreamError
+) -> None:
     logger.warning(
-        "%s %s %s provider stream failed model=%s upstream=%s provider=%s "
-        "effort=%s",
-        *_request_fields(context),
+        "%s %s %s provider stream failed error=%s status=%s retryable=%s "
+        "model=%s upstream=%s provider=%s effort=%s",
+        context.session.rendered,
+        context.method,
+        context.endpoint,
+        error.error_type,
+        error.status_code,
+        error.retryable,
+        context.original_model,
+        context.upstream_model,
+        error.provider or context.provider,
+        context.effort,
     )
 
 
@@ -252,10 +263,11 @@ def request_logging_middleware(session_tracker: SessionTracker):
 async def observe_stream(
     events: AsyncIterator[StreamEvent], context: RequestLogContext
 ) -> AsyncIterator[StreamEvent]:
+    iterator = aiter(events)
     try:
-        async for event in events:
+        async for event in iterator:
             if isinstance(event, StreamError):
-                log_stream_failure(context)
+                log_stream_failure(context, event)
             yield event
     except ProviderError as error:
         log_provider_failure(context, error.status_code)
@@ -263,3 +275,7 @@ async def observe_stream(
     except Exception as error:
         log_unexpected_failure(context, type(error).__name__)
         raise
+    finally:
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            await close()

@@ -104,11 +104,44 @@ async def iter_events(events):
 
 @pytest.mark.asyncio
 async def test_observe_stream_logs_semantic_error_and_preserves_events(caplog):
-    events = [TextDelta("hello"), StreamError("upstream failed")]
+    error = StreamError(
+        error_type="api_error",
+        message="Internal server error",
+        retryable=True,
+        diagnostic="upstream failed",
+    )
+    events = [TextDelta("hello"), error]
     with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
         observed = [
             event async for event in observe_stream(iter_events(events), make_context())
         ]
     assert observed == events
     assert caplog.text.count("provider stream failed") == 1
+    assert "error=api_error" in caplog.text
+    assert "retryable=True" in caplog.text
     assert "upstream failed" not in caplog.text
+
+
+class ClosableEvents:
+    def __init__(self):
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return TextDelta("pending")
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_closing_observer_closes_wrapped_iterator():
+    events = ClosableEvents()
+    observed = observe_stream(events, make_context())
+
+    await anext(observed)
+    await observed.aclose()
+
+    assert events.closed is True

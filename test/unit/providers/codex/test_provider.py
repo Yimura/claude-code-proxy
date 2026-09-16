@@ -1,6 +1,7 @@
 import json
 import pytest
 from claude_code_proxy.domain.models import CompletionRequest, Message, StreamComplete, StreamError, StreamStart, TextBlock, TextDelta, TokenUsage
+from claude_code_proxy.providers.base import ProviderError
 from claude_code_proxy.providers.codex.provider import CODEX_RESPONSES_URL, CodexProvider
 from claude_code_proxy.reasoning import ReasoningPolicy
 
@@ -45,11 +46,68 @@ async def test_stream_posts_headers_and_returns_semantic_events():
 
 @pytest.mark.asyncio
 async def test_non_200_stream_returns_safe_error_event():
-    Client.response = Response(status=429, text=["busy"])
+    Client.response = Response(status=429, text=["quota resets in 30 seconds"])
     events = [event async for event in CodexProvider(Auth(), Client).stream(request())]
+
+    assert events == [
+        StreamStart(),
+        StreamError(
+            error_type="rate_limit_error",
+            message="Codex API error 429: quota resets in 30 seconds",
+            status_code=429,
+            retryable=True,
+            provider="codex",
+            diagnostic="Codex API error 429: quota resets in 30 seconds",
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_forwards_explicit_provider_failure_message():
+    Client.response = Response(lines=[
+        "event: response.failed",
+        'data: {"response":{"error":{"code":"server_error","message":"Model backend unavailable"}}}',
+        "data: [DONE]",
+    ])
+
+    events = [event async for event in CodexProvider(Auth(), Client).stream(request())]
+
+    assert events == [
+        StreamStart(),
+        StreamError(
+            error_type="api_error",
+            message="Model backend unavailable",
+            retryable=True,
+            provider="codex",
+            diagnostic="server_error: Model backend unavailable",
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_requires_explicit_completed_event():
+    Client.response = Response(lines=[
+        "event: response.output_text.delta",
+        'data: {"delta":"partial"}',
+        "data: [DONE]",
+    ])
+
+    events = [event async for event in CodexProvider(Auth(), Client).stream(request())]
+
+    assert events[:2] == [StreamStart(), TextDelta("partial")]
     assert isinstance(events[-1], StreamError)
-    assert "429" in events[-1].message
-    assert "secret-access" not in events[-1].message
+    assert events[-1].message == "Internal server error"
+
+
+@pytest.mark.asyncio
+async def test_complete_preserves_stream_error_status():
+    Client.response = Response(status=429, text=["quota exceeded"])
+
+    with pytest.raises(ProviderError) as caught:
+        await CodexProvider(Auth(), Client).complete(request())
+
+    assert caught.value.status_code == 429
+    assert str(caught.value) == "Codex API error 429: quota exceeded"
 
 
 @pytest.mark.asyncio

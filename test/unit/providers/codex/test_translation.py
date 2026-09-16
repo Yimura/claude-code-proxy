@@ -58,7 +58,9 @@ def test_arguments_done_supplies_json_when_no_deltas_arrive():
 
 def test_incomplete_response_maps_max_tokens():
     translator = CodexEventTranslator()
-    translator.feed("response.completed", {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}, "usage": {}})
+    translator.feed("response.incomplete", {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}, "usage": {}})
+
+    assert translator.completed is True
     assert translator.finish().stop_reason == "max_tokens"
 
 
