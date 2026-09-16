@@ -1,8 +1,12 @@
 {
+  "tiers": {
+    "small": "openai/gpt-5.6-terra",
+    "big": "openai/gpt-5.6-sol"
+  },
   "mappings": {
     "haiku": {"tier": "small", "effort": "medium"},
     "sonnet": {"tier": "big", "effort": "medium"},
     "opus": {"tier": "big", "effort": "high"},
-    "fable": {"model": "gpt-daybreak-blue-latest", "effort": "high"}
+    "fable": {"model": "openai/gpt-daybreak-blue-latest", "effort": "high"}
   }
 }

@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from claude_code_proxy.api.routes import build_router
 from claude_code_proxy.config import Settings
+from claude_code_proxy.config import ModelConfig
 from claude_code_proxy.domain.models import CompletionResponse, StreamComplete, TextBlock, TextDelta, TokenUsage
 from claude_code_proxy.model_mapping import ModelResolver
 from claude_code_proxy.providers.base import ProviderError
@@ -25,7 +26,7 @@ class Provider:
 
 def client(provider=None):
     provider = provider or Provider()
-    service = ProxyService(ModelResolver({}, "openai", "big", "small"), "openai", provider, provider)
+    service = ProxyService(ModelResolver(ModelConfig({}, {})), "litellm", provider, provider)
     app = FastAPI()
     app.include_router(build_router(service))
     return TestClient(app)

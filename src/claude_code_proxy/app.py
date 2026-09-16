@@ -13,12 +13,7 @@ from .service import ProxyService
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_environment()
-    resolver = ModelResolver(
-        load_model_mapping(settings.model_mapping_path),
-        settings.preferred_provider,
-        settings.big_model,
-        settings.small_model,
-    )
+    resolver = ModelResolver(load_model_mapping(settings.model_mapping_path))
     litellm_provider = LiteLLMProvider(settings)
     codex_provider = CodexProvider(
         CodexAuth(settings.opencode_data_dir),
@@ -26,7 +21,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     service = ProxyService(
         resolver,
-        settings.preferred_provider,
+        settings.openai_transport,
         litellm_provider,
         codex_provider,
     )

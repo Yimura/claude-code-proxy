@@ -67,8 +67,7 @@ class LiteLLMProvider:
 
         max_tokens = request.max_tokens
         if request.model.startswith(("openai/", "gemini/")):
-            cap = 128_000 if self._settings.preferred_provider == "codex" else 16_384
-            max_tokens = min(max_tokens, cap)
+            max_tokens = min(max_tokens, 16_384)
         payload: dict[str, Any] = {
             "model": request.model,
             "messages": messages,

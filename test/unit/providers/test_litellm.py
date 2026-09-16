@@ -27,7 +27,18 @@ from claude_code_proxy.reasoning import OutputConfig, ReasoningPolicy, ThinkingC
 
 @pytest.fixture
 def settings():
-    return Settings("anthropic-key", "openai-key", "gemini-key", "project", "region", False, None, "openai", "big", "small", Path("/auth"), Path("mapping.json"))
+    return Settings(
+        anthropic_api_key="anthropic-key",
+        openai_api_key="openai-key",
+        gemini_api_key="gemini-key",
+        vertex_project="project",
+        vertex_location="region",
+        use_vertex_auth=False,
+        openai_base_url=None,
+        openai_transport="litellm",
+        opencode_data_dir=Path("/auth"),
+        model_mapping_path=Path("mapping.json"),
+    )
 
 
 def request(model="openai/gpt-5.6-sol", **changes):
@@ -52,6 +63,16 @@ def test_build_request_preserves_tools_reasoning_and_auth(settings):
     assert payload["tool_choice"] == {"type": "function", "function": {"name": "lookup"}}
     assert payload["api_key"] == "openai-key"
 
+
+
+def test_openai_token_cap_does_not_depend_on_transport(settings):
+    codex_settings = replace(settings, openai_transport="codex")
+
+    payload = LiteLLMProvider(codex_settings, object()).build_request(
+        request(max_tokens=128_000), stream=False
+    )
+
+    assert payload["max_completion_tokens"] == 16_384
 
 def test_missing_selected_tool_falls_back_to_auto(settings):
     payload = LiteLLMProvider(settings, object()).build_request(request(
