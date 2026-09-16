@@ -8,9 +8,9 @@ from .reasoning import resolve_reasoning_policy
 
 
 class ProxyService:
-    def __init__(self, resolver: ModelResolver, preferred_provider: str, litellm_provider: Provider, codex_provider: Provider) -> None:
+    def __init__(self, resolver: ModelResolver, openai_transport: str, litellm_provider: Provider, codex_provider: Provider) -> None:
         self._resolver = resolver
-        self._preferred_provider = preferred_provider
+        self._openai_transport = openai_transport
         self._litellm_provider = litellm_provider
         self._codex_provider = codex_provider
 
@@ -19,7 +19,7 @@ class ProxyService:
         return replace(request, model=resolved.model, reasoning=resolve_reasoning_policy(output_config=request.output_config, thinking=request.thinking, mapping_effort=resolved.effort))
 
     def provider_for(self, request: CompletionRequest) -> Provider:
-        if self._preferred_provider == "codex" and request.model.startswith("openai/"):
+        if self._openai_transport == "codex" and request.model.startswith("openai/"):
             return self._codex_provider
         return self._litellm_provider
 

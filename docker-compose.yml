@@ -7,6 +7,12 @@ services:
       - 8082:8082
     volumes:
       - ${OPENCODE_DATA_DIR:-~/.local/share/opencode}:/opencode-auth:ro
-      - ./model_mapping.json:/claude-code-proxy/model_mapping.json:ro
+    configs:
+      - source: model_mapping
+        target: /claude-code-proxy/model_mapping.json
     environment:
       - OPENCODE_DATA_DIR=/opencode-auth
+
+configs:
+  model_mapping:
+    file: ./model_mapping.json

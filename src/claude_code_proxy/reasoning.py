@@ -8,14 +8,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 RequestEffort = Literal["low", "medium", "high", "max"]
 ProviderEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
 MappingEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
-Tier = Literal["small", "big"]
 ThinkingType = Literal["enabled", "adaptive", "disabled"]
 
 
 class MappingEntry(BaseModel):
     """Validated target and default effort for a model-name pattern."""
 
-    tier: Optional[Tier] = None
+    tier: Optional[str] = None
     model: Optional[str] = None
     effort: Optional[MappingEffort] = None
 
@@ -23,22 +22,21 @@ class MappingEntry(BaseModel):
     def validate_selector(self) -> "MappingEntry":
         if (self.tier is None) == (self.model is None):
             raise ValueError("exactly one of tier or model is required")
+        target = self.tier if self.tier is not None else self.model
+        if not target or not target.strip():
+            raise ValueError("target selector must not be empty")
         return self
 
 
 def parse_model_mappings(raw: object) -> dict[str, MappingEntry]:
-    """Parse legacy tier strings and structured model mapping entries."""
+    """Parse structured model mapping entries."""
     if not isinstance(raw, dict):
         raise ValueError(f"model mappings must be an object, got {raw!r}")
 
     mappings: dict[str, MappingEntry] = {}
     for pattern, value in raw.items():
         try:
-            mappings[pattern] = (
-                MappingEntry(tier=value)
-                if isinstance(value, str)
-                else MappingEntry.model_validate(value)
-            )
+            mappings[pattern] = MappingEntry.model_validate(value)
         except (TypeError, ValueError) as error:
             raise ValueError(
                 f"invalid model mapping for pattern {pattern!r}: {value!r}"

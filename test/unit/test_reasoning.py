@@ -144,11 +144,9 @@ def test_reasoning_policy_is_frozen():
         policy.enabled = False
 
 
-def test_legacy_mapping_strings_are_tiers():
-    assert parse_model_mappings({"haiku": "small", "opus": "big"}) == {
-        "haiku": MappingEntry(tier="small"),
-        "opus": MappingEntry(tier="big"),
-    }
+def test_mapping_rejects_legacy_tier_strings():
+    with pytest.raises(ValueError, match="haiku"):
+        parse_model_mappings({"haiku": "small"})
 
 
 def test_structured_mapping_supports_tier_and_exact_model():
@@ -175,7 +173,6 @@ def test_mapping_rejects_both_or_neither_selector(value):
 @pytest.mark.parametrize(
     ("pattern", "value"),
     [
-        ("sonnet", {"tier": "large", "effort": "medium"}),
         ("opus", {"tier": "big", "effort": "max"}),
     ],
 )
