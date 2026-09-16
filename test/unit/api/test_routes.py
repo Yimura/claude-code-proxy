@@ -98,6 +98,13 @@ def test_root_response_is_preserved():
     assert client().get("/").json() == {"message": "Anthropic Proxy for LiteLLM"}
 
 
+def test_hello_probe_returns_empty_success():
+    response = client().head("/api/hello")
+
+    assert response.status_code == 200
+    assert response.content == b""
+
+
 def test_non_streaming_messages_return_anthropic_json():
     response = client().post("/v1/messages", json=messages_payload())
     assert response.status_code == 200
@@ -238,6 +245,23 @@ def test_stream_iterator_exception_logs_once_and_propagates(caplog):
             )
     assert caplog.text.count("unexpected request failure") == 1
     assert "secret body" not in caplog.text
+
+
+def test_hello_probe_does_not_log_warning(caplog):
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
+        response = client(with_middleware=True).head("/api/hello")
+
+    assert response.status_code == 200
+    assert "HTTP request failed" not in caplog.text
+
+
+def test_unknown_route_logs_one_http_warning(caplog):
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
+        response = client(with_middleware=True).get("/unknown")
+
+    assert response.status_code == 404
+    assert caplog.text.count("HTTP request failed") == 1
+    assert "status=404" in caplog.text
 
 
 def test_validation_failure_logs_one_http_warning(caplog):
