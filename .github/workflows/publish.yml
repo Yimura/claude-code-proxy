@@ -1,42 +1,60 @@
 name: publish
+
 on:
+  workflow_dispatch:
   push:
-    branches:
-      - main
+    tags:
+      - "**"
+
+permissions: {}
 
 jobs:
   publish:
+    name: publish-container
     runs-on: ubuntu-latest
     permissions:
-      packages: write
       contents: read
+      packages: write
 
     steps:
-      - uses: actions/checkout@main
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@master
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: all
+
       - name: Set up Docker Buildx
-        id: buildx
-        uses: docker/setup-buildx-action@master
+        uses: docker/setup-buildx-action@v4
 
-      - name: Log in to Github's container registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $ --password-stdin
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
 
-      # Docker images have to have lowercase names, and Github Actions doesn't
-      # have template functions
       - name: Collect image metadata
         id: meta
-        uses: docker/metadata-action@master
+        uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' || github.ref == 'refs/heads/main' }}
 
-      - name: Build
-        uses: docker/build-push-action@master
+      - name: Build and publish container image
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
