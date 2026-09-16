@@ -15,7 +15,7 @@ from ..domain.models import (
     StreamStart, TextBlock, TextDelta, TokenUsage, ToolInputDelta, ToolResultBlock,
     ToolUseBlock, ToolUseEnd, ToolUseStart,
 )
-from .base import ProviderError
+from .base import ProviderError, protocol_error, stream_error_from_exception
 
 logger = logging.getLogger(__name__)
 
@@ -216,35 +216,51 @@ class LiteLLMProvider:
     async def stream(self, request: CompletionRequest):
         input_tokens = output_tokens = 0
         stop_reason = "end_turn"
+        finish_seen = False
         slots = set()
         try:
             upstream = await self._client.acompletion(**self.build_request(request, stream=True))
             yield StreamStart()
-            async for chunk in upstream:
-                data = chunk if isinstance(chunk, dict) else chunk.model_dump()
-                usage = data.get("usage") or {}
-                input_tokens = usage.get("prompt_tokens", input_tokens)
-                output_tokens = usage.get("completion_tokens", output_tokens)
-                for choice in data.get("choices", []):
-                    delta = choice.get("delta") or {}
-                    if delta.get("content"):
-                        yield TextDelta(delta["content"])
-                    for index, call in enumerate(delta.get("tool_calls") or []):
-                        slot = str(call.get("index", index))
-                        function = call.get("function") or {}
-                        if slot not in slots:
-                            slots.add(slot)
-                            yield ToolUseStart(slot, call.get("id") or f"toolu_{uuid.uuid4().hex[:24]}", function.get("name", ""))
-                        if function.get("arguments"):
-                            yield ToolInputDelta(slot, function["arguments"])
-                    finish = choice.get("finish_reason")
-                    if finish:
-                        stop_reason = {"length": "max_tokens", "tool_calls": "tool_use"}.get(finish, "end_turn")
+            iterator = aiter(upstream)
+            try:
+                async for chunk in iterator:
+                    data = chunk if isinstance(chunk, dict) else chunk.model_dump()
+                    usage = data.get("usage") or {}
+                    input_tokens = usage.get("prompt_tokens", input_tokens)
+                    output_tokens = usage.get("completion_tokens", output_tokens)
+                    for choice in data.get("choices", []):
+                        delta = choice.get("delta") or {}
+                        if delta.get("content"):
+                            yield TextDelta(delta["content"])
+                        for index, call in enumerate(delta.get("tool_calls") or []):
+                            slot = str(call.get("index", index))
+                            function = call.get("function") or {}
+                            if slot not in slots:
+                                slots.add(slot)
+                                yield ToolUseStart(slot, call.get("id") or f"toolu_{uuid.uuid4().hex[:24]}", function.get("name", ""))
+                            if function.get("arguments"):
+                                yield ToolInputDelta(slot, function["arguments"])
+                        finish = choice.get("finish_reason")
+                        if finish:
+                            finish_seen = True
+                            stop_reason = {"length": "max_tokens", "tool_calls": "tool_use"}.get(finish, "end_turn")
+            finally:
+                close = getattr(iterator, "aclose", None)
+                if close is not None:
+                    await close()
+            if not finish_seen:
+                yield protocol_error(
+                    "LiteLLM stream ended without finish_reason", provider="litellm"
+                )
+                return
             for slot in sorted(slots):
                 yield ToolUseEnd(slot)
             yield StreamComplete(stop_reason, TokenUsage(input_tokens, output_tokens))
         except Exception as error:
-            yield StreamError(str(error))
+            provider_error = self._provider_error(error)
+            yield stream_error_from_exception(
+                provider_error, provider="litellm", expose_message=True
+            )
 
     async def count_tokens(self, request: CompletionRequest) -> int:
         payload = self.build_request(request, stream=False)

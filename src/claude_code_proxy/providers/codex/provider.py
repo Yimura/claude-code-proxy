@@ -5,7 +5,7 @@ import uuid
 import httpx
 
 from ...domain.models import CompletionRequest, StreamError, StreamStart
-from ..base import ProviderError
+from ..base import ProviderError, protocol_error, stream_error_from_exception
 from .auth import CodexAuth
 from .translation import CodexEventTranslator, build_request, response_from_events
 
@@ -26,7 +26,11 @@ class CodexProvider:
         events = [event async for event in self.stream(request)]
         error = next((event for event in events if isinstance(event, StreamError)), None)
         if error:
-            raise ProviderError(error.message, provider=self.name)
+            raise ProviderError(
+                error.message,
+                provider=self.name,
+                status_code=error.status_code or 500,
+            )
         return response_from_events(request, events)
 
     async def stream(self, request: CompletionRequest):
@@ -43,11 +47,20 @@ class CodexProvider:
                     async for event_type, data in self._response_events(response):
                         for event in translator.feed(event_type, data):
                             yield event
+                            if isinstance(event, StreamError):
+                                return
+            if not translator.completed:
+                yield protocol_error(
+                    "Codex stream ended without response.completed", provider=self.name
+                )
+                return
             yield translator.finish()
         except ProviderError as error:
-            yield StreamError(str(error))
+            yield stream_error_from_exception(
+                error, provider=self.name, expose_message=True
+            )
         except Exception as error:
-            yield StreamError(str(error))
+            yield stream_error_from_exception(error, provider=self.name)
 
     async def count_tokens(self, request: CompletionRequest) -> int:
         if self._token_counter is None:

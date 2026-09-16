@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import replace
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from claude_code_proxy.domain.models import (
     ImageBlock,
     Message,
     StreamComplete,
+    StreamError,
     StreamStart,
     TextBlock,
     TextDelta,
@@ -171,6 +173,117 @@ async def test_stream_returns_semantic_tool_events(settings):
     ])
     events = [event async for event in LiteLLMProvider(settings, client).stream(request())]
     assert events == [StreamStart(), ToolUseStart("0", "call-1", "lookup"), ToolInputDelta("0", '{"q":'), ToolInputDelta("0", '"x"}'), ToolUseEnd("0"), StreamComplete("tool_use", TokenUsage(0, 0))]
+
+
+@pytest.mark.asyncio
+async def test_stream_requires_upstream_finish_reason(settings):
+    client = FakeClient(chunks=[
+        {"choices": [{"delta": {"content": "partial"}, "finish_reason": None}]},
+    ])
+
+    events = [event async for event in LiteLLMProvider(settings, client).stream(request())]
+
+    assert events[:2] == [StreamStart(), TextDelta("partial")]
+    assert isinstance(events[-1], StreamError)
+    assert events[-1].message == "Internal server error"
+
+
+class PlainUpstream:
+    def __init__(self):
+        self.events = iter([
+            {
+                "choices": [
+                    {"delta": {"content": "done"}, "finish_reason": "stop"}
+                ]
+            }
+        ])
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self.events)
+        except StopIteration as error:
+            raise StopAsyncIteration from error
+
+
+@pytest.mark.asyncio
+async def test_stream_accepts_upstream_without_aclose(settings):
+    events = [
+        event
+        async for event in LiteLLMProvider(
+            settings, ClosableClient(PlainUpstream())
+        ).stream(request())
+    ]
+
+    assert events == [
+        StreamStart(),
+        TextDelta("done"),
+        StreamComplete("end_turn", TokenUsage(0, 0)),
+    ]
+
+
+class ClosableUpstream:
+    def __init__(self):
+        self.sent = False
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.sent:
+            self.sent = True
+            return {"choices": [{"delta": {"content": "partial"}}]}
+        await asyncio.Event().wait()
+        raise StopAsyncIteration
+
+    async def aclose(self):
+        self.closed = True
+
+
+class ClosableClient(FakeClient):
+    def __init__(self, upstream):
+        super().__init__()
+        self.upstream = upstream
+
+    async def acompletion(self, **kwargs):
+        return self.upstream
+
+
+@pytest.mark.asyncio
+async def test_closing_provider_stream_closes_upstream_iterator(settings):
+    upstream = ClosableUpstream()
+    stream = LiteLLMProvider(settings, ClosableClient(upstream)).stream(request())
+
+    assert await anext(stream) == StreamStart()
+    assert await anext(stream) == TextDelta("partial")
+
+    await stream.aclose()
+
+    assert upstream.closed is True
+
+
+class FailingClient(FakeClient):
+    async def acompletion(self, **kwargs):
+        raise RuntimeError("requested model is unavailable")
+
+
+@pytest.mark.asyncio
+async def test_stream_exception_preserves_useful_provider_message(settings):
+    events = [event async for event in LiteLLMProvider(settings, FailingClient()).stream(request())]
+
+    assert events == [
+        StreamError(
+            error_type="api_error",
+            message="requested model is unavailable",
+            status_code=500,
+            retryable=True,
+            provider="litellm",
+            diagnostic="requested model is unavailable",
+        )
+    ]
 
 
 @pytest.mark.asyncio

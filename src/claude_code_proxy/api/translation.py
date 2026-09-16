@@ -130,13 +130,22 @@ async def serialize_stream(
                 event = completed_event.result()
             except StopAsyncIteration:
                 break
-            for frame in state.consume(event):
+            try:
+                frames = state.consume(event)
+            except ValueError as error:
+                frames = state.error(StreamError(diagnostic=str(error)))
+                for frame in frames:
+                    yield frame
+                return
+            for frame in frames:
                 yield frame
             if isinstance(event, (StreamComplete, StreamError)):
                 return
             pending_event = asyncio.ensure_future(anext(iterator))
 
-        for frame in state.finish(StreamComplete("end_turn", TokenUsage(0, 0))):
+        for frame in state.error(
+            StreamError(diagnostic="stream ended without terminal outcome")
+        ):
             yield frame
     finally:
         try:
@@ -208,7 +217,7 @@ class _AnthropicStreamState:
 
     def _text_delta(self, event: TextDelta) -> list[str]:
         if not self.text_open:
-            return []
+            raise ValueError("text delta received after text block closed")
         return [
             _sse(
                 "content_block_delta",
@@ -221,6 +230,8 @@ class _AnthropicStreamState:
         ]
 
     def _tool_start(self, event: ToolUseStart) -> list[str]:
+        if event.slot in self.tool_indices:
+            raise ValueError(f"duplicate tool start for slot {event.slot}")
         frames = self._close_text()
         index = self.next_index
         self.next_index += 1
@@ -244,6 +255,8 @@ class _AnthropicStreamState:
         return frames
 
     def _tool_delta(self, event: ToolInputDelta) -> list[str]:
+        if event.slot not in self.open_tools:
+            raise ValueError(f"tool delta received for closed slot {event.slot}")
         index = self.tool_indices[event.slot]
         return [
             _sse(
@@ -261,12 +274,14 @@ class _AnthropicStreamState:
 
     def _tool_end(self, event: ToolUseEnd) -> list[str]:
         if event.slot not in self.open_tools:
-            return []
+            raise ValueError(f"tool end received for closed slot {event.slot}")
         self.open_tools.remove(event.slot)
         return [self._block_stop(self.tool_indices[event.slot])]
 
     def finish(self, event: StreamComplete) -> list[str]:
-        frames = self._close_all_blocks()
+        if self.open_tools:
+            raise ValueError("stream completed with open tool blocks")
+        frames = self._close_text()
         frames.extend(
             [
                 _sse(
@@ -287,20 +302,18 @@ class _AnthropicStreamState:
         return frames
 
     def error(self, event: StreamError) -> list[str]:
-        frames = []
-        if self.text_open:
-            frames.extend(self._text_delta(TextDelta(event.message)))
-        frames.extend(
-            self.finish(StreamComplete("end_turn", TokenUsage(0, 0)))
-        )
-        return frames
-
-    def _close_all_blocks(self) -> list[str]:
-        frames = self._close_text()
-        for slot in list(self.open_tools):
-            self.open_tools.remove(slot)
-            frames.append(self._block_stop(self.tool_indices[slot]))
-        return frames
+        return [
+            _sse(
+                "error",
+                {
+                    "type": "error",
+                    "error": {
+                        "type": event.error_type,
+                        "message": event.message,
+                    },
+                },
+            )
+        ]
 
     def _close_text(self) -> list[str]:
         if not self.text_open:

@@ -1,13 +1,17 @@
+import asyncio
 from dataclasses import replace
+
 import pytest
 from claude_code_proxy.config import ModelConfig
-from claude_code_proxy.domain.models import CompletionRequest, CompletionResponse, Message, StreamComplete, TextBlock, TokenUsage
+from claude_code_proxy.domain.models import CompletionRequest, CompletionResponse, Message, StreamComplete, StreamError, TextBlock, TextDelta, TokenUsage
 from claude_code_proxy.model_mapping import ModelResolver
 from claude_code_proxy.reasoning import MappingEntry, ReasoningPolicy
 from claude_code_proxy.service import ProxyService
 
 
 class FakeProvider:
+    name = "fake"
+
     def __init__(self): self.last_request = None
     async def complete(self, request):
         self.last_request = request
@@ -59,3 +63,81 @@ async def test_stream_uses_same_selection():
     service = ProxyService(ModelResolver(ModelConfig({}, {})), "litellm", lite, codex)
     assert [event async for event in service.stream(make_request())]
     assert lite.last_request is not None
+
+
+class EventProvider(FakeProvider):
+    def __init__(self, events=(), error=None):
+        super().__init__()
+        self.events = events
+        self.error = error
+
+    async def stream(self, request):
+        self.last_request = request
+        if self.error is not None:
+            raise self.error
+        for event in self.events:
+            yield event
+
+
+async def service_events(provider):
+    service = ProxyService(
+        ModelResolver(ModelConfig({}, {})), "litellm", provider, provider
+    )
+    return [event async for event in service.stream(make_request())]
+
+
+@pytest.mark.asyncio
+async def test_stream_converts_eof_without_terminal_to_protocol_error():
+    events = await service_events(EventProvider([TextDelta("partial")]))
+
+    assert events[0] == TextDelta("partial")
+    assert isinstance(events[-1], StreamError)
+    assert events[-1].error_type == "api_error"
+
+
+@pytest.mark.asyncio
+async def test_stream_converts_raised_exception_to_safe_error():
+    events = await service_events(EventProvider(error=RuntimeError("secret body")))
+
+    assert events == [
+        StreamError(
+            error_type="api_error",
+            message="Internal server error",
+            retryable=True,
+            provider="fake",
+            diagnostic="secret body",
+        )
+    ]
+
+
+class TerminalThenBlocksProvider(FakeProvider):
+    def __init__(self):
+        super().__init__()
+        self.closed = False
+        self.waiting = asyncio.Event()
+
+    async def stream(self, request):
+        try:
+            yield StreamComplete("end_turn", TokenUsage(1, 1))
+            self.waiting.set()
+            await asyncio.Event().wait()
+        finally:
+            self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_stream_forwards_terminal_without_waiting_for_provider_eof():
+    provider = TerminalThenBlocksProvider()
+    service = ProxyService(
+        ModelResolver(ModelConfig({}, {})), "litellm", provider, provider
+    )
+    stream = service.stream(make_request())
+
+    event = await asyncio.wait_for(anext(stream), timeout=0.1)
+
+    assert event == StreamComplete("end_turn", TokenUsage(1, 1))
+    assert provider.waiting.is_set() is False
+
+    await stream.aclose()
+
+    assert provider.closed is True

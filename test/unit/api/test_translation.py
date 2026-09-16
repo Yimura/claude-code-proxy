@@ -3,6 +3,11 @@ from pydantic import ValidationError
 from claude_code_proxy.api.schemas import MessagesRequest
 from claude_code_proxy.api.translation import normalize_request
 from claude_code_proxy.domain.models import TextBlock, ToolResultBlock, ToolUseBlock
+from claude_code_proxy.logging import (
+    RequestLogContext,
+    SessionIdentity,
+    observe_stream,
+)
 from claude_code_proxy.reasoning import ReasoningPolicy
 
 
@@ -117,12 +122,87 @@ async def test_tool_stream_maps_slots_to_stable_indices():
 
 
 @pytest.mark.asyncio
-async def test_stream_error_closes_message_and_does_not_leak_structure():
+async def test_stream_error_emits_terminal_anthropic_error_only():
     normalized = normalize_request(MessagesRequest(model="model", max_tokens=10, messages=[]))
-    frames = [frame async for frame in serialize_stream(normalized, event_source(StreamError("upstream failed")))]
-    assert "upstream failed" in "".join(frames)
-    assert frames[-1] == "data: [DONE]\n\n"
-    assert event_names(frames)[-1] == "message_stop"
+    error = StreamError(
+        error_type="api_error",
+        message="Internal server error",
+        diagnostic="upstream failed",
+    )
+
+    frames = [frame async for frame in serialize_stream(normalized, event_source(error))]
+
+    assert event_names(frames)[-1] == "error"
+    assert json.loads(frames[-1].split("data: ", 1)[1]) == {
+        "type": "error",
+        "error": {"type": "api_error", "message": "Internal server error"},
+    }
+    assert "upstream failed" not in "".join(frames)
+    assert "message_stop" not in event_names(frames)
+    assert "data: [DONE]\n\n" not in frames
+
+
+@pytest.mark.asyncio
+async def test_stream_error_does_not_close_partial_tool_block_as_success():
+    normalized = normalize_request(MessagesRequest(model="model", max_tokens=10, messages=[]))
+    events = event_source(
+        ToolUseStart("0", "call-1", "lookup"),
+        ToolInputDelta("0", '{"q":'),
+        StreamError(error_type="api_error", message="Internal server error"),
+    )
+
+    frames = [frame async for frame in serialize_stream(normalized, events)]
+
+    assert event_names(frames)[-1] == "error"
+    assert event_names(frames).count("content_block_stop") == 1
+    assert "message_delta" not in event_names(frames)
+    assert "message_stop" not in event_names(frames)
+
+
+@pytest.mark.asyncio
+async def test_unexpected_eof_emits_protocol_error():
+    normalized = normalize_request(MessagesRequest(model="model", max_tokens=10, messages=[]))
+
+    frames = [frame async for frame in serialize_stream(normalized, event_source())]
+
+    assert event_names(frames)[-1] == "error"
+    assert '"type": "api_error"' in frames[-1]
+    assert "message_stop" not in event_names(frames)
+    assert "data: [DONE]\n\n" not in frames
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "events",
+    [
+        (ToolInputDelta("missing", "{}"),),
+        (ToolUseEnd("missing"),),
+        (
+            ToolUseStart("0", "call-1", "lookup"),
+            ToolUseStart("0", "call-2", "lookup"),
+        ),
+        (
+            ToolUseStart("0", "call-1", "lookup"),
+            ToolUseEnd("0"),
+            ToolUseEnd("0"),
+        ),
+        (
+            ToolUseStart("0", "call-1", "lookup"),
+            TextDelta("late text"),
+        ),
+        (
+            ToolUseStart("0", "call-1", "lookup"),
+            StreamComplete("tool_use", TokenUsage(1, 1)),
+        ),
+    ],
+)
+async def test_invalid_content_transition_emits_protocol_error(events):
+    normalized = normalize_request(MessagesRequest(model="model", max_tokens=10, messages=[]))
+
+    frames = [frame async for frame in serialize_stream(normalized, event_source(*events))]
+
+    assert event_names(frames)[-1] == "error"
+    assert "message_stop" not in event_names(frames)
 
 
 @pytest.mark.asyncio
@@ -197,6 +277,36 @@ async def test_closing_stream_cancels_and_closes_upstream_iterator():
     stream = serialize_stream(
         normalized,
         events,
+        heartbeat_interval=0.005,
+    )
+
+    frames = [await anext(stream) for _ in range(4)]
+    assert event_names(frames)[-1] == "ping"
+
+    await stream.aclose()
+
+    assert events.cancelled.is_set()
+    assert events.closed is True
+
+
+@pytest.mark.asyncio
+async def test_closing_stream_closes_production_logging_wrapper():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    events = BlockingEvents()
+    context = RequestLogContext(
+        session=SessionIdentity("session", "[session session]", False),
+        method="POST",
+        endpoint="/v1/messages",
+        original_model="model",
+        upstream_model="model",
+        provider="fake",
+        effort="default",
+    )
+    stream = serialize_stream(
+        normalized,
+        observe_stream(events, context),
         heartbeat_interval=0.005,
     )
 
