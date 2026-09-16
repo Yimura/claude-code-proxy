@@ -43,6 +43,7 @@ def test_schema_rejects_invalid_effort():
         MessagesRequest(model="model", max_tokens=100, messages=[], output_config={"effort": "extreme"})
 
 
+import asyncio
 import json
 
 from claude_code_proxy.api.translation import serialize_stream, to_api_response
@@ -122,3 +123,221 @@ async def test_stream_error_closes_message_and_does_not_leak_structure():
     assert "upstream failed" in "".join(frames)
     assert frames[-1] == "data: [DONE]\n\n"
     assert event_names(frames)[-1] == "message_stop"
+
+
+@pytest.mark.asyncio
+async def test_stream_emits_pings_while_waiting_for_upstream_event():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    release = asyncio.Event()
+
+    async def delayed_events():
+        yield StreamStart()
+        await release.wait()
+        yield TextDelta("hello")
+        yield StreamComplete("end_turn", TokenUsage(1, 1))
+
+    stream = serialize_stream(
+        normalized,
+        delayed_events(),
+        heartbeat_interval=0.001,
+    )
+    idle_frames = [await anext(stream) for _ in range(6)]
+    release.set()
+    remaining_frames = [frame async for frame in stream]
+
+    assert event_names(idle_frames) == [
+        "message_start",
+        "content_block_start",
+        "ping",
+        "ping",
+        "ping",
+        "ping",
+    ]
+    assert event_names(remaining_frames) == [
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+
+
+class BlockingEvents:
+    def __init__(self):
+        self.started = False
+        self.cancelled = asyncio.Event()
+        self.closed = False
+        self._never = asyncio.Event()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.started:
+            self.started = True
+            return StreamStart()
+        try:
+            await self._never.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        raise StopAsyncIteration
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_closing_stream_cancels_and_closes_upstream_iterator():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    events = BlockingEvents()
+    stream = serialize_stream(
+        normalized,
+        events,
+        heartbeat_interval=0.005,
+    )
+
+    frames = [await anext(stream) for _ in range(4)]
+    assert event_names(frames)[-1] == "ping"
+
+    await stream.aclose()
+
+    assert events.cancelled.is_set()
+    assert events.closed is True
+
+
+class FailingEvents:
+    def __init__(self):
+        self.started = False
+        self.release = asyncio.Event()
+        self.failed = asyncio.Event()
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.started:
+            self.started = True
+            return StreamStart()
+        await self.release.wait()
+        self.failed.set()
+        raise RuntimeError("upstream failed")
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_closing_stream_propagates_completed_upstream_failure():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    events = FailingEvents()
+    stream = serialize_stream(
+        normalized,
+        events,
+        heartbeat_interval=0.001,
+    )
+
+    frames = [await anext(stream) for _ in range(4)]
+    assert event_names(frames)[-1] == "ping"
+    events.release.set()
+    await events.failed.wait()
+
+    with pytest.raises(RuntimeError, match="upstream failed"):
+        await stream.aclose()
+
+    assert events.closed is True
+
+
+class FiniteEvents:
+    def __init__(self):
+        self.started = False
+        self.release = asyncio.Event()
+        self.exhausted = asyncio.Event()
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.started:
+            self.started = True
+            return StreamStart()
+        await self.release.wait()
+        self.exhausted.set()
+        raise StopAsyncIteration
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_closing_stream_ignores_completed_upstream_exhaustion():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    events = FiniteEvents()
+    stream = serialize_stream(
+        normalized,
+        events,
+        heartbeat_interval=0.001,
+    )
+
+    frames = [await anext(stream) for _ in range(4)]
+    assert event_names(frames)[-1] == "ping"
+    events.release.set()
+    await events.exhausted.wait()
+
+    await stream.aclose()
+
+    assert events.closed is True
+
+
+class FutureEvents:
+    def __init__(self):
+        self.events = iter(
+            [
+                StreamStart(),
+                StreamComplete("end_turn", TokenUsage(1, 1)),
+            ]
+        )
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    def __anext__(self):
+        future = asyncio.get_running_loop().create_future()
+        try:
+            future.set_result(next(self.events))
+        except StopIteration:
+            future.set_exception(StopAsyncIteration())
+        return future
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_stream_accepts_future_backed_async_iterator():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    events = FutureEvents()
+
+    frames = [frame async for frame in serialize_stream(normalized, events)]
+
+    assert event_names(frames) == [
+        "message_start",
+        "content_block_start",
+        "ping",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    assert events.closed is True

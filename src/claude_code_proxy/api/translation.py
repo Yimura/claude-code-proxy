@@ -1,5 +1,6 @@
 """Translation between external Anthropic schemas and domain models."""
 
+from contextlib import suppress
 from copy import deepcopy
 from typing import Any
 from ..domain.models import CompletionRequest, ImageBlock, Message, TextBlock, ToolChoice, ToolDefinition, ToolResultBlock, ToolUseBlock
@@ -59,6 +60,7 @@ def _normalize_tool_choice(choice: dict[str, Any] | None) -> ToolChoice | None:
     return ToolChoice(type=choice.get("type", "auto"), name=choice.get("name"), disable_parallel_tool_use=choice.get("disable_parallel_tool_use"))
 
 
+import asyncio
 import json
 import uuid
 
@@ -104,17 +106,49 @@ def to_api_response(response: CompletionResponse) -> MessagesResponse:
     )
 
 
-async def serialize_stream(request: CompletionRequest, events):
+async def serialize_stream(
+    request: CompletionRequest, events, *, heartbeat_interval: float = 15.0
+):
     state = _AnthropicStreamState(request)
     for frame in state.start():
         yield frame
-    async for event in events:
-        for frame in state.consume(event):
+
+    iterator = aiter(events)
+    pending_event = None
+    try:
+        pending_event = asyncio.ensure_future(anext(iterator))
+        while True:
+            done, _ = await asyncio.wait(
+                {pending_event}, timeout=heartbeat_interval
+            )
+            if not done:
+                yield _sse("ping", {"type": "ping"})
+                continue
+            completed_event = pending_event
+            pending_event = None
+            try:
+                event = completed_event.result()
+            except StopAsyncIteration:
+                break
+            for frame in state.consume(event):
+                yield frame
+            if isinstance(event, (StreamComplete, StreamError)):
+                return
+            pending_event = asyncio.ensure_future(anext(iterator))
+
+        for frame in state.finish(StreamComplete("end_turn", TokenUsage(0, 0))):
             yield frame
-        if isinstance(event, (StreamComplete, StreamError)):
-            return
-    for frame in state.finish(StreamComplete("end_turn", TokenUsage(0, 0))):
-        yield frame
+    finally:
+        try:
+            if pending_event is not None:
+                if not pending_event.done():
+                    pending_event.cancel()
+                with suppress(asyncio.CancelledError, StopAsyncIteration):
+                    await pending_event
+        finally:
+            close = getattr(iterator, "aclose", None)
+            if close is not None:
+                await close()
 
 
 class _AnthropicStreamState:
