@@ -2,41 +2,69 @@
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from ..logging import log_request_summary
+
+from ..logging import (
+    FAILURE_LOGGED,
+    REQUEST_LOG_CONTEXT,
+    SESSION_HEADER,
+    RequestLogContext,
+    SessionTracker,
+    effective_effort,
+    log_provider_failure,
+    log_session_started,
+    log_unexpected_failure,
+    observe_stream,
+)
 from ..providers.base import ProviderError
 from ..service import ProxyService
 from .schemas import MessagesRequest, TokenCountRequest, TokenCountResponse
 from .translation import normalize_request, serialize_stream, to_api_response
 
 
-def build_router(service: ProxyService) -> APIRouter:
+def build_router(
+    service: ProxyService, session_tracker: SessionTracker | None = None
+) -> APIRouter:
     router = APIRouter()
+    tracker = session_tracker or SessionTracker()
 
     @router.post("/v1/messages")
     async def create_message(request: MessagesRequest, raw_request: Request):
         normalized = normalize_request(request)
         prepared = service.prepare(normalized)
-        _log_request(raw_request, normalized, prepared.model)
+        context = _request_context(raw_request, prepared, service, tracker)
+        _record_context(raw_request, context)
         if request.stream:
             return StreamingResponse(
-                serialize_stream(prepared, service.stream_prepared(prepared)),
+                serialize_stream(
+                    prepared,
+                    observe_stream(service.stream_prepared(prepared), context),
+                ),
                 media_type="text/event-stream",
             )
         try:
             return to_api_response(await service.complete_prepared(prepared))
         except ProviderError as error:
+            _log_provider_error(raw_request, context, error)
             raise _http_error(error) from error
+        except Exception as error:
+            _log_unexpected_error(raw_request, context, error)
+            raise
 
     @router.post("/v1/messages/count_tokens")
     async def count_tokens(request: TokenCountRequest, raw_request: Request):
         normalized = normalize_request(_as_messages_request(request))
         prepared = service.prepare(normalized)
-        _log_request(raw_request, normalized, prepared.model)
+        context = _request_context(raw_request, prepared, service, tracker)
+        _record_context(raw_request, context)
         try:
             count = await service.count_tokens_prepared(prepared)
             return TokenCountResponse(input_tokens=count)
         except ProviderError as error:
+            _log_provider_error(raw_request, context, error)
             raise _http_error(error) from error
+        except Exception as error:
+            _log_unexpected_error(raw_request, context, error)
+            raise
 
     @router.get("/")
     async def root():
@@ -57,16 +85,37 @@ def _as_messages_request(request: TokenCountRequest) -> MessagesRequest:
     )
 
 
-def _log_request(raw_request, normalized, upstream_model):
-    log_request_summary(
-        "POST",
-        raw_request.url.path,
-        normalized.original_model.rsplit("/", 1)[-1],
-        upstream_model,
-        len(normalized.messages),
-        len(normalized.tools),
-        200,
+def _request_context(raw_request, prepared, service, tracker):
+    provider = service.provider_for(prepared)
+    return RequestLogContext(
+        session=tracker.observe(raw_request.headers.get(SESSION_HEADER)),
+        method=raw_request.method,
+        endpoint=raw_request.url.path,
+        original_model=prepared.original_model,
+        upstream_model=prepared.model,
+        provider=provider.name,
+        effort=effective_effort(prepared.reasoning),
     )
+
+
+def _record_context(raw_request: Request, context: RequestLogContext) -> None:
+    setattr(raw_request.state, REQUEST_LOG_CONTEXT, context)
+    if context.session.is_new:
+        log_session_started(context)
+
+
+def _log_provider_error(
+    raw_request: Request, context: RequestLogContext, error: ProviderError
+) -> None:
+    log_provider_failure(context, error.status_code)
+    setattr(raw_request.state, FAILURE_LOGGED, True)
+
+
+def _log_unexpected_error(
+    raw_request: Request, context: RequestLogContext, error: Exception
+) -> None:
+    log_unexpected_failure(context, type(error).__name__)
+    setattr(raw_request.state, FAILURE_LOGGED, True)
 
 
 def _http_error(error: ProviderError) -> HTTPException:

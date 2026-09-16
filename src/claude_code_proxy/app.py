@@ -3,7 +3,7 @@
 from fastapi import FastAPI
 from .api.routes import build_router
 from .config import Settings, load_model_mapping
-from .logging import configure_logging, log_requests
+from .logging import SessionTracker, configure_logging, request_logging_middleware
 from .model_mapping import ModelResolver
 from .providers.codex.auth import CodexAuth
 from .providers.codex.provider import CodexProvider
@@ -25,9 +25,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         litellm_provider,
         codex_provider,
     )
+    session_tracker = SessionTracker()
     application = FastAPI()
-    application.middleware("http")(log_requests)
-    application.include_router(build_router(service))
+    application.middleware("http")(request_logging_middleware(session_tracker))
+    application.include_router(build_router(service, session_tracker))
     return application
 
 
