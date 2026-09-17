@@ -1,7 +1,7 @@
 """Anthropic-compatible external request and response schemas."""
 
 from typing import Any, Literal
-from pydantic import BaseModel
+from pydantic import BaseModel, model_serializer
 from ..reasoning import OutputConfig, ThinkingConfig
 
 
@@ -87,11 +87,23 @@ class TokenCountResponse(BaseModel):
     input_tokens: int
 
 
+class OutputTokensDetails(BaseModel):
+    thinking_tokens: int
+
+
 class Usage(BaseModel):
     input_tokens: int
     output_tokens: int
     cache_creation_input_tokens: int = 0
     cache_read_input_tokens: int = 0
+    output_tokens_details: OutputTokensDetails | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler):
+        data = handler(self)
+        if self.output_tokens_details is None:
+            data.pop("output_tokens_details", None)
+        return data
 
 
 class MessagesResponse(BaseModel):

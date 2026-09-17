@@ -87,6 +87,7 @@ class TokenUsage:
     output_tokens: int
     cache_creation_input_tokens: int = 0
     cache_read_input_tokens: int = 0
+    thinking_tokens: int | None = None
 
 
 @dataclass(frozen=True)

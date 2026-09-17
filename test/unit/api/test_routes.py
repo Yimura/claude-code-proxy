@@ -111,6 +111,7 @@ def test_non_streaming_messages_return_anthropic_json():
     response = client().post("/v1/messages", json=messages_payload())
     assert response.status_code == 200
     assert response.json()["content"] == [{"type": "text", "text": "hello"}]
+    assert "output_tokens_details" not in response.json()["usage"]
 
 
 def test_session_header_reaches_provider_unchanged():

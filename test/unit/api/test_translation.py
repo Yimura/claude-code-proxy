@@ -592,3 +592,38 @@ async def test_stream_accepts_future_backed_async_iterator():
         "message_stop",
     ]
     assert events.closed is True
+
+
+def test_to_api_response_serializes_thinking_token_details():
+    response = CompletionResponse(
+        "msg-thinking",
+        "model",
+        (TextBlock("ok"),),
+        "end_turn",
+        TokenUsage(4, 10, 1, 3, thinking_tokens=6),
+    )
+
+    assert to_api_response(response).usage.model_dump() == {
+        "input_tokens": 4,
+        "output_tokens": 10,
+        "cache_creation_input_tokens": 1,
+        "cache_read_input_tokens": 3,
+        "output_tokens_details": {"thinking_tokens": 6},
+    }
+
+
+def test_to_api_response_omits_unreported_thinking_details():
+    response = CompletionResponse(
+        "msg-no-thinking",
+        "model",
+        (TextBlock("ok"),),
+        "end_turn",
+        TokenUsage(4, 10),
+    )
+
+    assert to_api_response(response).usage.model_dump(exclude_none=True) == {
+        "input_tokens": 4,
+        "output_tokens": 10,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
