@@ -1,5 +1,8 @@
-from claude_code_proxy.domain.models import TextBlock
-from claude_code_proxy.prompt_identity import reconcile_system_identity
+from claude_code_proxy.domain.models import Message, TextBlock
+from claude_code_proxy.prompt_identity import (
+    reconcile_message_identities,
+    reconcile_system_identity,
+)
 
 HARNESS_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
 MODEL_IDENTITY = (
@@ -116,3 +119,60 @@ def test_model_identity_split_across_blocks_is_unchanged():
     )
 
     assert reconcile("openai/gpt-5.6-sol", system=system) is system
+
+
+def test_message_identity_rewrites_system_role_only():
+    identity = TextBlock(MODEL_IDENTITY)
+    messages = (
+        Message("user", (identity,)),
+        Message("assistant", (identity,)),
+        Message("system", (identity,)),
+    )
+
+    result = reconcile_message_identities(
+        messages, "claude-opus-5", "openai/gpt-5.6-sol", True
+    )
+
+    assert result[0] is messages[0]
+    assert result[1] is messages[1]
+    assert result[2] == Message(
+        "system",
+        (
+            TextBlock(
+                "The model generating this response is openai/gpt-5.6-sol, "
+                "not an Anthropic Claude model."
+            ),
+        ),
+    )
+
+
+def test_mismatched_system_message_identity_is_unchanged():
+    messages = (
+        Message(
+            "system",
+            (
+                TextBlock(
+                    "You are powered by the model named Sonnet 5. "
+                    "The exact model ID is claude-sonnet-5."
+                ),
+            ),
+        ),
+    )
+
+    assert (
+        reconcile_message_identities(
+            messages, "claude-opus-5", "openai/gpt-5.6-sol", True
+        )
+        is messages
+    )
+
+
+def test_unmapped_system_message_identity_is_unchanged():
+    messages = (Message("system", (TextBlock(MODEL_IDENTITY),)),)
+
+    assert (
+        reconcile_message_identities(
+            messages, "claude-opus-5", "claude-opus-5", False
+        )
+        is messages
+    )

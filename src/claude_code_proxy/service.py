@@ -11,7 +11,7 @@ from .domain.models import (
     StreamEvent,
 )
 from .model_mapping import ModelResolver
-from .prompt_identity import reconcile_system_identity
+from .prompt_identity import reconcile_message_identities, reconcile_system_identity
 from .providers.base import Provider, ProviderError, protocol_error, stream_error_from_exception
 from .reasoning import resolve_reasoning_policy
 
@@ -31,9 +31,16 @@ class ProxyService:
             resolved.model,
             resolved.mapped,
         )
+        messages = reconcile_message_identities(
+            request.messages,
+            request.original_model,
+            resolved.model,
+            resolved.mapped,
+        )
         return replace(
             request,
             model=resolved.model,
+            messages=messages,
             system=system,
             reasoning=resolve_reasoning_policy(
                 output_config=request.output_config,

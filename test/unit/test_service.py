@@ -210,3 +210,41 @@ async def test_count_tokens_dispatches_reconciled_identity():
     assert await service.count_tokens(identity_request()) == 7
 
     assert codex.last_request.system == EXPECTED_MAPPED_IDENTITY
+
+
+def test_prepare_reconciles_identity_in_system_role_message():
+    service, _, _ = mapped_service()
+    request = make_request(
+        "claude-opus-5",
+        messages=(
+            Message("user", (TextBlock("Who are you?"),)),
+            Message("system", (IDENTITY_SYSTEM[1],)),
+        ),
+    )
+
+    prepared = service.prepare(request)
+
+    assert prepared.messages == (
+        request.messages[0],
+        Message("system", (EXPECTED_MAPPED_IDENTITY[1],)),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["complete", "stream", "count_tokens"])
+async def test_dispatches_reconciled_system_role_identity(operation):
+    service, _, codex = mapped_service()
+    request = make_request(
+        "claude-opus-5",
+        messages=(Message("system", (IDENTITY_SYSTEM[1],)),),
+    )
+
+    result = getattr(service, operation)(request)
+    if operation == "stream":
+        assert [event async for event in result]
+    else:
+        await result
+
+    assert codex.last_request.messages == (
+        Message("system", (EXPECTED_MAPPED_IDENTITY[1],)),
+    )
