@@ -2,7 +2,7 @@
 
 import re
 
-from .domain.models import TextBlock
+from .domain.models import Message, TextBlock
 
 CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
 CLAUDE_CODE_HARNESS = (
@@ -31,6 +31,33 @@ def reconcile_system_identity(
         _reconcile_block(block, original_model, model_identity) for block in system
     )
     return system if reconciled == system else reconciled
+
+
+def reconcile_message_identities(
+    messages: tuple[Message, ...],
+    original_model: str,
+    resolved_model: str,
+    mapped: bool,
+) -> tuple[Message, ...]:
+    """Correct recognized model metadata in system-role messages."""
+    if not mapped or not messages:
+        return messages
+    text_blocks = tuple(
+        block
+        for message in messages
+        if message.role == "system"
+        for block in message.content
+        if isinstance(block, TextBlock)
+    )
+    if not _contains_original_identity(text_blocks, original_model):
+        return messages
+
+    model_identity = _resolved_identity(resolved_model)
+    reconciled = tuple(
+        _reconcile_message(message, original_model, model_identity)
+        for message in messages
+    )
+    return messages if reconciled == messages else reconciled
 
 
 def _contains_original_identity(
@@ -62,3 +89,17 @@ def _reconcile_block(
 
     text = MODEL_IDENTITY.sub(replace_identity, text)
     return block if text == block.text else TextBlock(text)
+
+
+def _reconcile_message(
+    message: Message, original_model: str, model_identity: str
+) -> Message:
+    if message.role != "system":
+        return message
+    content = tuple(
+        _reconcile_block(block, original_model, model_identity)
+        if isinstance(block, TextBlock)
+        else block
+        for block in message.content
+    )
+    return message if content == message.content else Message(message.role, content)
