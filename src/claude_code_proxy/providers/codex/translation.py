@@ -62,6 +62,7 @@ def build_request(request: CompletionRequest) -> dict[str, Any]:
             "type": "function",
             "name": tool.name,
             "description": tool.description,
+            "strict": False,
             "parameters": tool.input_schema,
         }
         for tool in request.tools

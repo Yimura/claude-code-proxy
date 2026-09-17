@@ -37,8 +37,26 @@ def test_build_request_maps_tools_messages_and_reasoning():
     assert body["instructions"] == "system"
     assert body["tool_choice"] == {"type": "function", "name": "lookup"}
     assert [tool["name"] for tool in body["tools"]] == ["lookup"]
+    assert all(tool["strict"] is False for tool in body["tools"])
     assert body["input"][1]["type"] == "function_call"
     assert body["input"][2] == {"type": "function_call_output", "call_id": "call-1", "output": "done"}
+
+
+def test_build_request_preserves_optional_tool_schema():
+    monitor_schema = {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string"},
+            "ws": {"type": "object"},
+        },
+    }
+
+    body = build_request(request(tools=(
+        ToolDefinition("Monitor", input_schema=monitor_schema),
+    )))
+
+    assert body["tools"][0]["strict"] is False
+    assert body["tools"][0]["parameters"] is monitor_schema
 
 
 def test_reasoning_enabled_request_asks_for_encrypted_content():
@@ -370,3 +388,47 @@ def test_response_from_events_buffers_text_and_tool_json():
     response = response_from_events(request(), [TextDelta("hi"), ToolUseStart("0", "call", "lookup"), ToolInputDelta("0", '{"q":"x"}'), ToolUseEnd("0"), StreamComplete("tool_use", TokenUsage(2, 3))])
     assert response.content == (TextBlock("hi"), ToolUseBlock("call", "lookup", {"q": "x"}))
     assert response.usage == TokenUsage(2, 3)
+
+
+def _monitor_response(arguments):
+    return response_from_events(
+        request(),
+        [
+            ToolUseStart("0", "call-monitor", "Monitor"),
+            ToolInputDelta("0", arguments),
+            ToolUseEnd("0"),
+            StreamComplete("tool_use", TokenUsage(2, 3)),
+        ],
+    )
+
+
+def test_monitor_command_arguments_preserve_omitted_websocket():
+    response = _monitor_response(
+        '{"description":"job","timeout_ms":1000,"command":"tail -F run.log"}'
+    )
+
+    tool = response.content[0]
+    assert tool.input == {
+        "description": "job",
+        "timeout_ms": 1000,
+        "command": "tail -F run.log",
+    }
+    assert "ws" not in tool.input
+
+
+def test_monitor_websocket_arguments_preserve_omitted_command():
+    response = _monitor_response(
+        '{"description":"events","timeout_ms":1000,'
+        '"ws":{"url":"wss://events.example.com","protocols":[]}}'
+    )
+
+    tool = response.content[0]
+    assert tool.input == {
+        "description": "events",
+        "timeout_ms": 1000,
+        "ws": {
+            "url": "wss://events.example.com",
+            "protocols": [],
+        },
+    }
+    assert "command" not in tool.input
