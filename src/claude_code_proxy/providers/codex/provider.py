@@ -35,7 +35,7 @@ class CodexProvider:
 
     async def stream(self, request: CompletionRequest):
         try:
-            access_token, account_id = self._auth.get_auth()
+            access_token, account_id = await self._auth.get_auth()
             headers = self._build_headers(access_token, account_id)
             translator = CodexEventTranslator()
             yield StreamStart()

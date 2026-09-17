@@ -7,7 +7,8 @@ from claude_code_proxy.reasoning import ReasoningPolicy
 
 
 class Auth:
-    def get_auth(self): return "secret-access", "account"
+    async def get_auth(self):
+        return "secret-access", "account"
 
 
 class Response:
