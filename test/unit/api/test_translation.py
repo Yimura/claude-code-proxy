@@ -1,8 +1,15 @@
 import pytest
 from pydantic import ValidationError
 from claude_code_proxy.api.schemas import MessagesRequest
-from claude_code_proxy.api.translation import normalize_request
-from claude_code_proxy.domain.models import TextBlock, ToolResultBlock, ToolUseBlock
+from claude_code_proxy.api.translation import normalize_request, to_api_response
+from claude_code_proxy.domain.models import (
+    CompletionResponse,
+    RedactedThinkingBlock,
+    TextBlock,
+    TokenUsage,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 from claude_code_proxy.logging import (
     RequestLogContext,
     SessionIdentity,
@@ -32,6 +39,41 @@ def test_normalize_request_preserves_ordered_content_and_options():
     assert normalized.tool_choice.name == "lookup"
 
 
+def test_normalize_request_preserves_redacted_thinking():
+    request = MessagesRequest(
+        model="model",
+        max_tokens=100,
+        messages=[{
+            "role": "assistant",
+            "content": [{
+                "type": "redacted_thinking",
+                "data": "codex-reasoning-v1:data",
+            }],
+        }],
+    )
+
+    normalized = normalize_request(request)
+
+    assert normalized.messages[0].content == (
+        RedactedThinkingBlock("codex-reasoning-v1:data"),
+    )
+
+
+def test_to_api_response_serializes_redacted_thinking():
+    response = CompletionResponse(
+        "msg-1",
+        "model",
+        (RedactedThinkingBlock("codex-reasoning-v1:data"),),
+        "end_turn",
+        TokenUsage(1, 1),
+    )
+
+    assert to_api_response(response).content[0].model_dump() == {
+        "type": "redacted_thinking",
+        "data": "codex-reasoning-v1:data",
+    }
+
+
 def test_schema_keeps_submitted_model_until_service_mapping():
     request = MessagesRequest(model="claude-sonnet", max_tokens=100, messages=[{"role": "user", "content": "hello"}])
     assert request.model == "claude-sonnet"
@@ -54,6 +96,7 @@ import json
 from claude_code_proxy.api.translation import serialize_stream, to_api_response
 from claude_code_proxy.domain.models import (
     CompletionResponse,
+    RedactedThinking,
     StreamComplete,
     StreamError,
     StreamStart,
@@ -102,7 +145,7 @@ def test_to_api_response_serializes_text_tools_and_usage():
 async def test_text_stream_has_anthropic_lifecycle_order():
     normalized = normalize_request(MessagesRequest(model="model", max_tokens=10, messages=[]))
     frames = [frame async for frame in serialize_stream(normalized, event_source(StreamStart(3), TextDelta("hello"), StreamComplete("end_turn", TokenUsage(3, 1))))]
-    assert event_names(frames) == ["message_start", "content_block_start", "ping", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]
+    assert event_names(frames) == ["message_start", "ping", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]
     assert frames[-1] == "data: [DONE]\n\n"
 
 
@@ -118,7 +161,104 @@ async def test_tool_stream_maps_slots_to_stable_indices():
         StreamComplete("tool_use", TokenUsage(0, 0)),
     ))]
     payloads = [json.loads(frame.split("data: ", 1)[1]) for frame in frames if frame.startswith("event: content_block_start")]
-    assert [(item["index"], item["content_block"]["type"]) for item in payloads] == [(0, "text"), (1, "tool_use"), (2, "tool_use")]
+    assert [(item["index"], item["content_block"]["type"]) for item in payloads] == [(0, "tool_use"), (1, "tool_use")]
+
+
+def content_starts(frames):
+    return [
+        json.loads(frame.split("data: ", 1)[1])
+        for frame in frames
+        if frame.startswith("event: content_block_start")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_then_tool_uses_exact_content_order():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    frames = [frame async for frame in serialize_stream(
+        normalized,
+        event_source(
+            RedactedThinking("codex-reasoning-v1:data"),
+            ToolUseStart("0", "call-1", "lookup"),
+            ToolUseEnd("0"),
+            StreamComplete("tool_use", TokenUsage(1, 1)),
+        ),
+    )]
+
+    assert [
+        (item["index"], item["content_block"]["type"])
+        for item in content_starts(frames)
+    ] == [(0, "redacted_thinking"), (1, "tool_use")]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_then_text_preserves_content_order():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    frames = [frame async for frame in serialize_stream(
+        normalized,
+        event_source(
+            RedactedThinking("codex-reasoning-v1:data"),
+            TextDelta("answer"),
+            StreamComplete("end_turn", TokenUsage(1, 1)),
+        ),
+    )]
+
+    assert [
+        (item["index"], item["content_block"]["type"])
+        for item in content_starts(frames)
+    ] == [(0, "redacted_thinking"), (1, "text")]
+    assert event_names(frames)[-2:] == ["message_delta", "message_stop"]
+
+
+@pytest.mark.asyncio
+async def test_text_reasoning_tool_preserves_content_order():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    frames = [frame async for frame in serialize_stream(
+        normalized,
+        event_source(
+            TextDelta("before"),
+            RedactedThinking("codex-reasoning-v1:data"),
+            ToolUseStart("0", "call-1", "lookup"),
+            ToolUseEnd("0"),
+            StreamComplete("tool_use", TokenUsage(1, 1)),
+        ),
+    )]
+
+    assert [
+        (item["index"], item["content_block"]["type"])
+        for item in content_starts(frames)
+    ] == [(0, "text"), (1, "redacted_thinking"), (2, "tool_use")]
+
+
+@pytest.mark.asyncio
+async def test_empty_success_emits_compatible_empty_text_block():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+
+    frames = [frame async for frame in serialize_stream(
+        normalized,
+        event_source(StreamComplete("end_turn", TokenUsage(0, 0))),
+    )]
+
+    assert [
+        (item["index"], item["content_block"]["type"])
+        for item in content_starts(frames)
+    ] == [(0, "text")]
+    assert event_names(frames) == [
+        "message_start",
+        "ping",
+        "content_block_start",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
 
 
 @pytest.mark.asyncio
@@ -154,7 +294,7 @@ async def test_stream_error_does_not_close_partial_tool_block_as_success():
     frames = [frame async for frame in serialize_stream(normalized, events)]
 
     assert event_names(frames)[-1] == "error"
-    assert event_names(frames).count("content_block_stop") == 1
+    assert "content_block_stop" not in event_names(frames)
     assert "message_delta" not in event_names(frames)
     assert "message_stop" not in event_names(frames)
 
@@ -229,13 +369,14 @@ async def test_stream_emits_pings_while_waiting_for_upstream_event():
 
     assert event_names(idle_frames) == [
         "message_start",
-        "content_block_start",
+        "ping",
         "ping",
         "ping",
         "ping",
         "ping",
     ]
     assert event_names(remaining_frames) == [
+        "content_block_start",
         "content_block_delta",
         "content_block_stop",
         "message_delta",
@@ -444,8 +585,8 @@ async def test_stream_accepts_future_backed_async_iterator():
 
     assert event_names(frames) == [
         "message_start",
-        "content_block_start",
         "ping",
+        "content_block_start",
         "content_block_stop",
         "message_delta",
         "message_stop",
