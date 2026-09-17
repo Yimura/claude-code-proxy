@@ -201,6 +201,25 @@ def test_response_from_events_preserves_reasoning_before_tool():
     )
 
 
+def test_response_from_events_keeps_text_segment_before_reasoning():
+    carrier = encode_reasoning("encrypted-state", [])
+
+    response = response_from_events(request(), [
+        TextDelta("before"),
+        RedactedThinking(carrier),
+        ToolUseStart("0", "call", "lookup"),
+        ToolInputDelta("0", '{}'),
+        ToolUseEnd("0"),
+        StreamComplete("tool_use", TokenUsage(2, 3)),
+    ])
+
+    assert response.content == (
+        TextBlock("before"),
+        RedactedThinkingBlock(carrier),
+        ToolUseBlock("call", "lookup", {}),
+    )
+
+
 def test_reasoning_carrier_round_trips_through_anthropic_history():
     translator = CodexEventTranslator()
     reasoning = translator.feed(
