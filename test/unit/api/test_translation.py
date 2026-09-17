@@ -194,6 +194,27 @@ async def test_reasoning_then_tool_uses_exact_content_order():
 
 
 @pytest.mark.asyncio
+async def test_reasoning_then_text_preserves_content_order():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    frames = [frame async for frame in serialize_stream(
+        normalized,
+        event_source(
+            RedactedThinking("codex-reasoning-v1:data"),
+            TextDelta("answer"),
+            StreamComplete("end_turn", TokenUsage(1, 1)),
+        ),
+    )]
+
+    assert [
+        (item["index"], item["content_block"]["type"])
+        for item in content_starts(frames)
+    ] == [(0, "redacted_thinking"), (1, "text")]
+    assert event_names(frames)[-2:] == ["message_delta", "message_stop"]
+
+
+@pytest.mark.asyncio
 async def test_text_reasoning_tool_preserves_content_order():
     normalized = normalize_request(
         MessagesRequest(model="model", max_tokens=10, messages=[])

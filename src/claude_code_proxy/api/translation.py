@@ -179,7 +179,7 @@ class _AnthropicStreamState:
         self.message_id = f"msg_{uuid.uuid4().hex[:24]}"
         self.text_index: int | None = None
         self.text_open = False
-        self.non_text_started = False
+        self.tool_started = False
         self.tool_indices: dict[str, int] = {}
         self.open_tools: set[str] = set()
         self.next_index = 0
@@ -225,8 +225,8 @@ class _AnthropicStreamState:
         raise TypeError(f"Unsupported stream event: {type(event).__name__}")
 
     def _text_delta(self, event: TextDelta) -> list[str]:
-        if self.non_text_started:
-            raise ValueError("text delta received after non-text content")
+        if self.tool_started:
+            raise ValueError("text delta received after tool content")
         frames = []
         if not self.text_open:
             self.text_index = self._allocate_index()
@@ -250,7 +250,6 @@ class _AnthropicStreamState:
 
     def _redacted_thinking(self, event: RedactedThinking) -> list[str]:
         frames = self._close_text()
-        self.non_text_started = True
         index = self._allocate_index()
         frames.extend(
             [
@@ -267,7 +266,7 @@ class _AnthropicStreamState:
         if event.slot in self.tool_indices:
             raise ValueError(f"duplicate tool start for slot {event.slot}")
         frames = self._close_text()
-        self.non_text_started = True
+        self.tool_started = True
         index = self._allocate_index()
         self.tool_indices[event.slot] = index
         self.open_tools.add(event.slot)

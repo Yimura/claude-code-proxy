@@ -201,6 +201,23 @@ def test_response_from_events_preserves_reasoning_before_tool():
     )
 
 
+def test_response_from_events_preserves_text_segments_around_reasoning():
+    carrier = encode_reasoning("encrypted-state", [])
+
+    response = response_from_events(request(), [
+        TextDelta("before"),
+        RedactedThinking(carrier),
+        TextDelta("after"),
+        StreamComplete("end_turn", TokenUsage(2, 3)),
+    ])
+
+    assert response.content == (
+        TextBlock("before"),
+        RedactedThinkingBlock(carrier),
+        TextBlock("after"),
+    )
+
+
 def test_response_from_events_keeps_text_segment_before_reasoning():
     carrier = encode_reasoning("encrypted-state", [])
 

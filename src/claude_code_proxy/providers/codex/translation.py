@@ -215,15 +215,16 @@ class CodexEventTranslator:
 
 
 def response_from_events(request: CompletionRequest, events: list[StreamEvent]) -> CompletionResponse:
-    text = []
+    text_segments: list[list[str]] = []
     tools: dict[str, dict[str, Any]] = {}
-    order: list[tuple[str, str | RedactedThinkingBlock]] = []
+    order: list[tuple[str, int | str | RedactedThinkingBlock]] = []
     complete = StreamComplete("end_turn", TokenUsage(0, 0))
     for event in events:
         if isinstance(event, TextDelta):
-            if not order or order[-1] != ("text", ""):
-                order.append(("text", ""))
-            text.append(event.text)
+            if not order or order[-1][0] != "text":
+                text_segments.append([])
+                order.append(("text", len(text_segments) - 1))
+            text_segments[int(order[-1][1])].append(event.text)
         elif isinstance(event, RedactedThinking):
             order.append(
                 ("redacted_thinking", RedactedThinkingBlock(event.data))
@@ -242,10 +243,9 @@ def response_from_events(request: CompletionRequest, events: list[StreamEvent]) 
         elif isinstance(event, StreamComplete):
             complete = event
     blocks = []
-    text_value = "".join(text)
     for kind, value in order:
         if kind == "text":
-            blocks.append(TextBlock(text_value))
+            blocks.append(TextBlock("".join(text_segments[int(value)])))
         elif kind == "redacted_thinking":
             blocks.append(value)
         elif kind == "tool":
