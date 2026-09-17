@@ -1,10 +1,11 @@
 from dataclasses import replace
 
 from claude_code_proxy.domain.models import (
-    CompletionRequest, Message, StreamComplete, TextBlock, TextDelta, TokenUsage,
+    CompletionRequest, Message, RedactedThinkingBlock, StreamComplete, TextBlock, TextDelta, TokenUsage,
     ToolChoice, ToolDefinition, ToolInputDelta, ToolResultBlock, ToolUseBlock,
     ToolUseEnd, ToolUseStart,
 )
+from claude_code_proxy.providers.codex.reasoning import encode_reasoning
 from claude_code_proxy.providers.codex.translation import CodexEventTranslator, build_request, response_from_events
 from claude_code_proxy.reasoning import ReasoningPolicy
 
@@ -28,6 +29,98 @@ def test_build_request_maps_tools_messages_and_reasoning():
     assert [tool["name"] for tool in body["tools"]] == ["lookup"]
     assert body["input"][1]["type"] == "function_call"
     assert body["input"][2] == {"type": "function_call_output", "call_id": "call-1", "output": "done"}
+
+
+def test_reasoning_enabled_request_asks_for_encrypted_content():
+    body = build_request(request())
+
+    assert body["include"] == ["reasoning.encrypted_content"]
+
+
+def test_reasoning_disabled_request_omits_encrypted_include():
+    body = build_request(request(reasoning=ReasoningPolicy(False, None)))
+
+    assert "include" not in body
+
+
+def test_replays_valid_reasoning_before_tool_call_and_output():
+    carrier = encode_reasoning("encrypted-state", [])
+    prepared = request(messages=(
+        Message("assistant", (
+            RedactedThinkingBlock(carrier),
+            ToolUseBlock("call-1", "lookup", {"q": "x"}),
+        )),
+        Message("user", (ToolResultBlock("call-1", "done"),)),
+    ))
+
+    assert build_request(prepared)["input"] == [
+        {
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "encrypted-state",
+        },
+        {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "lookup",
+            "arguments": '{"q": "x"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "done",
+        },
+    ]
+
+
+def test_omits_foreign_and_malformed_reasoning_carriers():
+    prepared = request(messages=(Message("assistant", (
+        RedactedThinkingBlock("anthropic-ciphertext"),
+        RedactedThinkingBlock("codex-reasoning-v1:not-base64!"),
+        ToolUseBlock("call-1", "lookup", {}),
+    )),))
+
+    assert [item["type"] for item in build_request(prepared)["input"]] == [
+        "function_call"
+    ]
+
+
+def test_replays_one_reasoning_item_before_parallel_tool_calls():
+    carrier = encode_reasoning("encrypted-state", [])
+    prepared = request(messages=(Message("assistant", (
+        RedactedThinkingBlock(carrier),
+        ToolUseBlock("call-1", "first", {}),
+        ToolUseBlock("call-2", "second", {}),
+    )),))
+
+    assert [item["type"] for item in build_request(prepared)["input"]] == [
+        "reasoning",
+        "function_call",
+        "function_call",
+    ]
+
+
+def test_preserves_multiple_reasoning_tool_groups():
+    first = encode_reasoning("encrypted-1", [])
+    second = encode_reasoning("encrypted-2", [])
+    prepared = request(messages=(Message("assistant", (
+        RedactedThinkingBlock(first),
+        ToolUseBlock("call-1", "first", {}),
+        RedactedThinkingBlock(second),
+        ToolUseBlock("call-2", "second", {}),
+    )),))
+
+    items = build_request(prepared)["input"]
+
+    assert [item["type"] for item in items] == [
+        "reasoning",
+        "function_call",
+        "reasoning",
+        "function_call",
+    ]
+    assert [
+        item["encrypted_content"] for item in items if item["type"] == "reasoning"
+    ] == ["encrypted-1", "encrypted-2"]
 
 
 def test_missing_selected_tool_falls_back_to_auto():

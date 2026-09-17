@@ -8,6 +8,7 @@ from typing import Any
 from ...domain.models import (
     CompletionRequest,
     CompletionResponse,
+    RedactedThinkingBlock,
     StreamComplete,
     StreamError,
     StreamEvent,
@@ -20,6 +21,7 @@ from ...domain.models import (
     ToolUseEnd,
     ToolUseStart,
 )
+from .reasoning import decode_reasoning
 
 
 def content_to_text(content: Any) -> str:
@@ -49,6 +51,8 @@ def build_request(request: CompletionRequest) -> dict[str, Any]:
     }
     if request.reasoning.enabled and request.reasoning.effort:
         body["reasoning"] = {"effort": request.reasoning.effort}
+    if request.reasoning.enabled:
+        body["include"] = ["reasoning.encrypted_content"]
     if request.system:
         body["instructions"] = "\n\n".join(block.text for block in request.system)
     tools = [
@@ -79,7 +83,11 @@ def _convert_messages(request: CompletionRequest) -> list[dict[str, Any]]:
             if text_parts:
                 items.append({"role": message.role, "content": "\n".join(text_parts)})
                 text_parts = []
-            if isinstance(block, ToolUseBlock):
+            if isinstance(block, RedactedThinkingBlock):
+                reasoning = decode_reasoning(block.data)
+                if reasoning is not None:
+                    items.append(reasoning)
+            elif isinstance(block, ToolUseBlock):
                 items.append({"type": "function_call", "call_id": block.id, "name": block.name, "arguments": json.dumps(block.input)})
             elif isinstance(block, ToolResultBlock):
                 items.append({"type": "function_call_output", "call_id": block.tool_use_id, "output": content_to_text(block.content)})
