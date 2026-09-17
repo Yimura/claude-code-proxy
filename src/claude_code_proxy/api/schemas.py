@@ -15,6 +15,11 @@ class ContentBlockImage(BaseModel):
     source: dict[str, Any]
 
 
+class ContentBlockRedactedThinking(BaseModel):
+    type: Literal["redacted_thinking"]
+    data: str
+
+
 class ContentBlockToolUse(BaseModel):
     type: Literal["tool_use"]
     id: str
@@ -35,7 +40,13 @@ class SystemContent(BaseModel):
 
 class Message(BaseModel):
     role: Literal["user", "assistant", "system"]
-    content: str | list[ContentBlockText | ContentBlockImage | ContentBlockToolUse | ContentBlockToolResult]
+    content: str | list[
+        ContentBlockText
+        | ContentBlockImage
+        | ContentBlockRedactedThinking
+        | ContentBlockToolUse
+        | ContentBlockToolResult
+    ]
 
 
 class Tool(BaseModel):
@@ -87,7 +98,9 @@ class MessagesResponse(BaseModel):
     id: str
     model: str
     role: Literal["assistant"] = "assistant"
-    content: list[ContentBlockText | ContentBlockToolUse]
+    content: list[
+        ContentBlockText | ContentBlockRedactedThinking | ContentBlockToolUse
+    ]
     type: Literal["message"] = "message"
     stop_reason: Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"] | None = None
     stop_sequence: str | None = None

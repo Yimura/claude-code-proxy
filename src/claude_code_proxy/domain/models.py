@@ -17,6 +17,11 @@ class ImageBlock:
 
 
 @dataclass(frozen=True)
+class RedactedThinkingBlock:
+    data: str
+
+
+@dataclass(frozen=True)
 class ToolUseBlock:
     id: str
     name: str
@@ -29,8 +34,10 @@ class ToolResultBlock:
     content: Any
 
 
-ContentBlock: TypeAlias = TextBlock | ImageBlock | ToolUseBlock | ToolResultBlock
-ResponseBlock: TypeAlias = TextBlock | ToolUseBlock
+ContentBlock: TypeAlias = (
+    TextBlock | ImageBlock | RedactedThinkingBlock | ToolUseBlock | ToolResultBlock
+)
+ResponseBlock: TypeAlias = TextBlock | RedactedThinkingBlock | ToolUseBlock
 
 
 @dataclass(frozen=True)
@@ -102,6 +109,11 @@ class TextDelta:
 
 
 @dataclass(frozen=True)
+class RedactedThinking:
+    data: str
+
+
+@dataclass(frozen=True)
 class ToolUseStart:
     slot: str
     id: str
@@ -138,6 +150,7 @@ class StreamError:
 StreamEvent: TypeAlias = (
     StreamStart
     | TextDelta
+    | RedactedThinking
     | ToolUseStart
     | ToolInputDelta
     | ToolUseEnd

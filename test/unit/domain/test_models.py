@@ -1,6 +1,12 @@
 from dataclasses import FrozenInstanceError
 import pytest
-from claude_code_proxy.domain.models import CompletionRequest, Message, TextBlock, TokenUsage
+from claude_code_proxy.domain.models import (
+    CompletionRequest,
+    Message,
+    RedactedThinkingBlock,
+    TextBlock,
+    TokenUsage,
+)
 from claude_code_proxy.reasoning import ReasoningPolicy
 
 
@@ -22,3 +28,10 @@ def test_token_usage_defaults_cache_counts_to_zero():
     usage = TokenUsage(input_tokens=4, output_tokens=2)
     assert usage.cache_creation_input_tokens == 0
     assert usage.cache_read_input_tokens == 0
+
+
+def test_redacted_thinking_block_is_immutable():
+    block = RedactedThinkingBlock("codex-reasoning-v1:data")
+    assert block.data == "codex-reasoning-v1:data"
+    with pytest.raises(FrozenInstanceError):
+        block.data = "changed"

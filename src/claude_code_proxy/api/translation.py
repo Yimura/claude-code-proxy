@@ -3,9 +3,9 @@
 from contextlib import suppress
 from copy import deepcopy
 from typing import Any
-from ..domain.models import CompletionRequest, ImageBlock, Message, TextBlock, ToolChoice, ToolDefinition, ToolResultBlock, ToolUseBlock
+from ..domain.models import CompletionRequest, ImageBlock, Message, RedactedThinkingBlock, TextBlock, ToolChoice, ToolDefinition, ToolResultBlock, ToolUseBlock
 from ..reasoning import ReasoningPolicy
-from .schemas import ContentBlockImage, ContentBlockText, ContentBlockToolResult, ContentBlockToolUse, MessagesRequest
+from .schemas import ContentBlockImage, ContentBlockRedactedThinking, ContentBlockText, ContentBlockToolResult, ContentBlockToolUse, MessagesRequest
 
 
 def normalize_request(
@@ -40,6 +40,8 @@ def _normalize_content(content: str | list[Any]):
             blocks.append(TextBlock(block.text))
         elif isinstance(block, ContentBlockImage):
             blocks.append(ImageBlock(deepcopy(block.source)))
+        elif isinstance(block, ContentBlockRedactedThinking):
+            blocks.append(RedactedThinkingBlock(block.data))
         elif isinstance(block, ContentBlockToolUse):
             blocks.append(ToolUseBlock(block.id, block.name, deepcopy(block.input)))
         elif isinstance(block, ContentBlockToolResult):
@@ -79,6 +81,7 @@ from ..domain.models import (
     ToolUseStart,
 )
 from .schemas import (
+    ContentBlockRedactedThinking as ApiRedactedThinkingBlock,
     ContentBlockText as ApiTextBlock,
     ContentBlockToolUse as ApiToolUseBlock,
     MessagesResponse,
@@ -91,6 +94,12 @@ def to_api_response(response: CompletionResponse) -> MessagesResponse:
     for block in response.content:
         if isinstance(block, TextBlock):
             content.append(ApiTextBlock(type="text", text=block.text))
+        elif isinstance(block, RedactedThinkingBlock):
+            content.append(
+                ApiRedactedThinkingBlock(
+                    type="redacted_thinking", data=block.data
+                )
+            )
         elif isinstance(block, ToolUseBlock):
             content.append(
                 ApiToolUseBlock(

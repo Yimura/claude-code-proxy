@@ -1,8 +1,15 @@
 import pytest
 from pydantic import ValidationError
 from claude_code_proxy.api.schemas import MessagesRequest
-from claude_code_proxy.api.translation import normalize_request
-from claude_code_proxy.domain.models import TextBlock, ToolResultBlock, ToolUseBlock
+from claude_code_proxy.api.translation import normalize_request, to_api_response
+from claude_code_proxy.domain.models import (
+    CompletionResponse,
+    RedactedThinkingBlock,
+    TextBlock,
+    TokenUsage,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 from claude_code_proxy.logging import (
     RequestLogContext,
     SessionIdentity,
@@ -30,6 +37,41 @@ def test_normalize_request_preserves_ordered_content_and_options():
     assert normalized.messages[1].content == (ToolResultBlock("call-1", "done"),)
     assert normalized.reasoning == ReasoningPolicy(None, None)
     assert normalized.tool_choice.name == "lookup"
+
+
+def test_normalize_request_preserves_redacted_thinking():
+    request = MessagesRequest(
+        model="model",
+        max_tokens=100,
+        messages=[{
+            "role": "assistant",
+            "content": [{
+                "type": "redacted_thinking",
+                "data": "codex-reasoning-v1:data",
+            }],
+        }],
+    )
+
+    normalized = normalize_request(request)
+
+    assert normalized.messages[0].content == (
+        RedactedThinkingBlock("codex-reasoning-v1:data"),
+    )
+
+
+def test_to_api_response_serializes_redacted_thinking():
+    response = CompletionResponse(
+        "msg-1",
+        "model",
+        (RedactedThinkingBlock("codex-reasoning-v1:data"),),
+        "end_turn",
+        TokenUsage(1, 1),
+    )
+
+    assert to_api_response(response).content[0].model_dump() == {
+        "type": "redacted_thinking",
+        "data": "codex-reasoning-v1:data",
+    }
 
 
 def test_schema_keeps_submitted_model_until_service_mapping():
