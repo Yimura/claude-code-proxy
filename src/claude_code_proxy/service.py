@@ -41,6 +41,7 @@ class ProxyService:
             request,
             model=resolved.model,
             response_model=resolved.response_model,
+            context_window=resolved.context_window,
             messages=messages,
             system=system,
             reasoning=resolve_reasoning_policy(

@@ -74,6 +74,10 @@ class Settings:
     openai_transport: OpenAITransport
     opencode_data_dir: Path
     model_mapping_path: Path
+    proxy_host: str = "0.0.0.0"
+    proxy_port: int = 8082
+    control_socket_path: Path | None = None
+    session_retention_limit: int = 1000
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -95,7 +99,45 @@ class Settings:
             openai_transport=transport,
             opencode_data_dir=Path(os.environ.get("OPENCODE_DATA_DIR", "~/.local/share/opencode")).expanduser(),
             model_mapping_path=Path(os.environ.get("MODEL_MAPPING_PATH", "model_mapping.json")),
+            proxy_host=os.environ.get("PROXY_HOST", "0.0.0.0"),
+            proxy_port=_proxy_port_from_environment(),
+            control_socket_path=_control_socket_path_from_environment(),
+            session_retention_limit=_session_retention_limit_from_environment(),
         )
+
+
+def _proxy_port_from_environment() -> int:
+    raw = os.environ.get("PROXY_PORT", "8082")
+    try:
+        port = int(raw)
+    except ValueError as error:
+        raise ValueError("PROXY_PORT must be an integer") from error
+    if not 1 <= port <= 65535:
+        raise ValueError("PROXY_PORT must be between 1 and 65535")
+    return port
+
+
+def _control_socket_path_from_environment() -> Path | None:
+    raw = os.environ.get("CONTROL_SOCKET_PATH")
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value:
+        raise ValueError("CONTROL_SOCKET_PATH must not be empty")
+    return Path(value).expanduser()
+
+
+def _session_retention_limit_from_environment() -> int:
+    raw = os.environ.get("SESSION_RETENTION_LIMIT", "1000")
+    try:
+        limit = int(raw)
+    except ValueError as error:
+        raise ValueError(
+            "SESSION_RETENTION_LIMIT must be a non-negative integer"
+        ) from error
+    if limit < 0:
+        raise ValueError("SESSION_RETENTION_LIMIT must be a non-negative integer")
+    return limit
 
 
 def parse_model_mapping_config(data: object) -> ModelConfig:

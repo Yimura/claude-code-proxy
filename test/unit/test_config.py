@@ -37,6 +37,80 @@ def test_settings_rejects_invalid_openai_transport(monkeypatch):
         Settings.from_environment()
 
 
+def test_settings_uses_runtime_defaults(monkeypatch):
+    for name in (
+        "PROXY_HOST",
+        "PROXY_PORT",
+        "CONTROL_SOCKET_PATH",
+        "SESSION_RETENTION_LIMIT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = Settings.from_environment()
+
+    assert settings.proxy_host == "0.0.0.0"
+    assert settings.proxy_port == 8082
+    assert settings.control_socket_path is None
+    assert settings.session_retention_limit == 1000
+
+
+def test_settings_reads_runtime_overrides(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PROXY_HOST", "127.0.0.1")
+    monkeypatch.setenv("PROXY_PORT", "9000")
+    monkeypatch.setenv("CONTROL_SOCKET_PATH", "~/proxy.sock")
+    monkeypatch.setenv("SESSION_RETENTION_LIMIT", "0")
+
+    settings = Settings.from_environment()
+
+    assert settings.proxy_host == "127.0.0.1"
+    assert settings.proxy_port == 9000
+    assert settings.control_socket_path == tmp_path / "proxy.sock"
+    assert settings.session_retention_limit == 0
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("not-an-integer", "PROXY_PORT must be an integer"),
+        ("0", "PROXY_PORT must be between 1 and 65535"),
+    ],
+)
+def test_settings_rejects_invalid_proxy_port(monkeypatch, value, message):
+    monkeypatch.setenv("PROXY_PORT", value)
+
+    with pytest.raises(ValueError, match=message):
+        Settings.from_environment()
+
+
+@pytest.mark.parametrize("value", ["not-an-integer", "-1"])
+def test_settings_rejects_invalid_session_retention_limit(monkeypatch, value):
+    monkeypatch.setenv("SESSION_RETENTION_LIMIT", value)
+
+    with pytest.raises(
+        ValueError,
+        match="SESSION_RETENTION_LIMIT must be a non-negative integer",
+    ):
+        Settings.from_environment()
+
+
+def test_settings_strips_control_socket_path_before_expansion(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CONTROL_SOCKET_PATH", "  ~/proxy.sock  ")
+
+    settings = Settings.from_environment()
+
+    assert settings.control_socket_path == tmp_path / "proxy.sock"
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_settings_rejects_empty_control_socket_path(monkeypatch, value):
+    monkeypatch.setenv("CONTROL_SOCKET_PATH", value)
+
+    with pytest.raises(ValueError, match="CONTROL_SOCKET_PATH must not be empty"):
+        Settings.from_environment()
+
+
 def test_loads_tiers_and_mappings(tmp_path):
     path = tmp_path / "mapping.json"
     path.write_text(json.dumps({

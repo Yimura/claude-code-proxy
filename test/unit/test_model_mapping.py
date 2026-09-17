@@ -27,6 +27,7 @@ def test_tier_uses_model_definition_target_and_capability():
     assert result.response_model == "claude-sonnet[1m]"
     assert result.mapped is True
     assert result.effort == "high"
+    assert result.context_window == 1_000_000
 
 
 def test_unprefixed_definition_target_defaults_to_openai():
@@ -108,6 +109,7 @@ def test_known_direct_models_infer_or_preserve_prefix(submitted, expected):
 
     assert result.model == expected
     assert result.response_model == expected
+    assert result.context_window is None
 
 
 def test_unknown_model_is_unchanged():
@@ -118,3 +120,4 @@ def test_unknown_model_is_unchanged():
     assert result.response_model == "unknown"
     assert result.mapped is False
     assert result.effort is None
+    assert result.context_window is None

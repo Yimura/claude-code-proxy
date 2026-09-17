@@ -19,6 +19,7 @@ class ResolvedModel:
     response_model: str
     mapped: bool
     effort: MappingEffort | None
+    context_window: int | None
 
 
 class ModelResolver:
@@ -35,11 +36,32 @@ class ModelResolver:
 
         if clean_name in GEMINI_MODELS and not model.startswith("gemini/"):
             resolved = f"gemini/{clean_name}"
-            return ResolvedModel(model, resolved, resolved, True, None)
+            return ResolvedModel(
+                original=model,
+                model=resolved,
+                response_model=resolved,
+                mapped=True,
+                effort=None,
+                context_window=None,
+            )
         if clean_name in OPENAI_MODELS and not model.startswith("openai/"):
             resolved = f"openai/{clean_name}"
-            return ResolvedModel(model, resolved, resolved, True, None)
-        return ResolvedModel(model, model, model, False, None)
+            return ResolvedModel(
+                original=model,
+                model=resolved,
+                response_model=resolved,
+                mapped=True,
+                effort=None,
+                context_window=None,
+            )
+        return ResolvedModel(
+            original=model,
+            model=model,
+            response_model=model,
+            mapped=False,
+            effort=None,
+            context_window=None,
+        )
 
     def _resolve_mapping(
         self, original: str, entry: MappingEntry
@@ -48,11 +70,12 @@ class ModelResolver:
         upstream = self._upstream_target(definition)
         response_model = self._response_model(original, upstream, definition)
         return ResolvedModel(
-            original,
-            upstream,
-            response_model,
-            True,
-            entry.effort,
+            original=original,
+            model=upstream,
+            response_model=response_model,
+            mapped=True,
+            effort=entry.effort,
+            context_window=definition.context_window,
         )
 
     def _model_name(self, entry: MappingEntry) -> str:

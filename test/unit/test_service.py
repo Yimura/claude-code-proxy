@@ -214,6 +214,14 @@ def test_prepare_reconciles_mapped_model_identity():
     assert prepared.system == EXPECTED_MAPPED_IDENTITY
 
 
+def test_prepare_carries_mapped_context_window():
+    service, _, _ = mapped_service()
+
+    prepared = service.prepare(identity_request())
+
+    assert prepared.context_window == 1_000_000
+
+
 @pytest.mark.asyncio
 async def test_complete_dispatches_reconciled_identity_to_codex():
     service, _, codex = mapped_service()
