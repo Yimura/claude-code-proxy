@@ -330,7 +330,7 @@ class _AnthropicStreamState:
                             "stop_reason": event.stop_reason,
                             "stop_sequence": None,
                         },
-                        "usage": {"output_tokens": event.usage.output_tokens},
+                        "usage": _api_usage(event.usage).model_dump(),
                     },
                 ),
                 _sse("message_stop", {"type": "message_stop"}),

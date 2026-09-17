@@ -627,3 +627,78 @@ def test_to_api_response_omits_unreported_thinking_details():
         "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_final_delta_emits_authoritative_cumulative_usage():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    frames = [frame async for frame in serialize_stream(
+        normalized,
+        event_source(
+            StreamComplete("end_turn", TokenUsage(30, 20, 10, 60, 7))
+        ),
+    )]
+    start = next(
+        json.loads(frame.split("data: ", 1)[1])
+        for frame in frames
+        if frame.startswith("event: message_start")
+    )
+    delta = next(
+        json.loads(frame.split("data: ", 1)[1])
+        for frame in frames
+        if frame.startswith("event: message_delta")
+    )
+
+    assert start["message"]["usage"] == {
+        "input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 0,
+    }
+    assert delta["usage"] == {
+        "input_tokens": 30,
+        "output_tokens": 20,
+        "cache_creation_input_tokens": 10,
+        "cache_read_input_tokens": 60,
+        "output_tokens_details": {"thinking_tokens": 7},
+    }
+
+
+@pytest.mark.asyncio
+async def test_final_delta_omits_unreported_thinking_details():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    frames = [frame async for frame in serialize_stream(
+        normalized,
+        event_source(StreamComplete("end_turn", TokenUsage(4, 2))),
+    )]
+    delta = next(
+        json.loads(frame.split("data: ", 1)[1])
+        for frame in frames
+        if frame.startswith("event: message_delta")
+    )
+
+    assert "output_tokens_details" not in delta["usage"]
+
+
+@pytest.mark.asyncio
+async def test_final_delta_preserves_explicit_zero_thinking_tokens():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    frames = [frame async for frame in serialize_stream(
+        normalized,
+        event_source(
+            StreamComplete("end_turn", TokenUsage(4, 2, thinking_tokens=0))
+        ),
+    )]
+    delta = next(
+        json.loads(frame.split("data: ", 1)[1])
+        for frame in frames
+        if frame.startswith("event: message_delta")
+    )
+
+    assert delta["usage"]["output_tokens_details"] == {"thinking_tokens": 0}
