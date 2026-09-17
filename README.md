@@ -123,6 +123,8 @@ Use explicit prefixes to select providers:
 - `anthropic/...` uses LiteLLM with Anthropic authentication.
 - Unprefixed mapping targets default to `openai/...`; explicit prefixes are recommended.
 
+When Claude Code includes its recognized model-identity metadata, mapped requests keep Claude Code identified as the coding-agent CLI harness while naming the exact resolved upstream target as the model generating the response. OpenAI and Gemini targets explicitly state that they are not Anthropic Claude models. Unmapped requests, unrecognized metadata, and unrelated system instructions remain unchanged.
+
 For direct Anthropic mappings, select Anthropic targets explicitly:
 
 ```json
