@@ -1,3 +1,4 @@
+import json
 import logging
 
 import pytest
@@ -5,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from claude_code_proxy.api.routes import build_router
-from claude_code_proxy.config import ModelConfig
+from claude_code_proxy.config import ModelConfig, ModelDefinition
 from claude_code_proxy.domain.models import (
     CompletionResponse,
     StreamComplete,
@@ -17,6 +18,7 @@ from claude_code_proxy.domain.models import (
 from claude_code_proxy.logging import SessionTracker, request_logging_middleware
 from claude_code_proxy.model_mapping import ModelResolver
 from claude_code_proxy.providers.base import ProviderError
+from claude_code_proxy.reasoning import MappingEntry
 from claude_code_proxy.service import ProxyService
 
 
@@ -48,7 +50,7 @@ class Provider:
             raise self.error
         return CompletionResponse(
             "msg-1",
-            request.model,
+            request.response_model,
             (TextBlock("hello"),),
             "end_turn",
             TokenUsage(2, 1),
@@ -70,9 +72,10 @@ class Provider:
         return 7
 
 
-def client(provider=None, *, tracker=None, with_middleware=False):
+def client(provider=None, *, tracker=None, with_middleware=False, config=None):
     provider = provider or Provider()
-    service = ProxyService(ModelResolver(ModelConfig({}, {})), "litellm", provider, provider)
+    config = config or ModelConfig({}, {}, {})
+    service = ProxyService(ModelResolver(config), "litellm", provider, provider)
     app = FastAPI()
     tracker = tracker or SessionTracker(PlainStream(), environ={})
     if with_middleware:
@@ -84,6 +87,18 @@ def client(provider=None, *, tracker=None, with_middleware=False):
         )
     )
     return TestClient(app)
+
+
+def mapped_config():
+    return ModelConfig(
+        models={
+            "sol": ModelDefinition(
+                target="openai/gpt-5.6-sol", context_window=1_000_000
+            )
+        },
+        tiers={"big": "sol"},
+        mappings={"sonnet": MappingEntry(tier="big", effort="high")},
+    )
 
 
 def messages_payload(**changes):
@@ -112,6 +127,25 @@ def test_non_streaming_messages_return_anthropic_json():
     assert response.status_code == 200
     assert response.json()["content"] == [{"type": "text", "text": "hello"}]
     assert "output_tokens_details" not in response.json()["usage"]
+
+
+def test_mapped_non_streaming_response_uses_client_capability_identity():
+    response = client(config=mapped_config()).post(
+        "/v1/messages", json=messages_payload()
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model"] == "claude-sonnet[1m]"
+
+
+def test_mapped_streaming_response_uses_client_capability_identity():
+    response = client(config=mapped_config()).post(
+        "/v1/messages", json=messages_payload(stream=True)
+    )
+
+    start_frame = response.text.split("\n\n", 1)[0]
+    start = json.loads(start_frame.split("data: ", 1)[1])
+    assert start["message"]["model"] == "claude-sonnet[1m]"
 
 
 def test_session_header_reaches_provider_unchanged():

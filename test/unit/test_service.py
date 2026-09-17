@@ -2,7 +2,7 @@ import asyncio
 from dataclasses import replace
 
 import pytest
-from claude_code_proxy.config import ModelConfig
+from claude_code_proxy.config import ModelConfig, ModelDefinition
 from claude_code_proxy.domain.models import CompletionRequest, CompletionResponse, Message, StreamComplete, StreamError, TextBlock, TextDelta, TokenUsage
 from claude_code_proxy.model_mapping import ModelResolver
 from claude_code_proxy.reasoning import MappingEntry, ReasoningPolicy
@@ -15,7 +15,7 @@ class FakeProvider:
     def __init__(self): self.last_request = None
     async def complete(self, request):
         self.last_request = request
-        return CompletionResponse("id", request.model, (TextBlock("ok"),), "end_turn", TokenUsage(1, 1))
+        return CompletionResponse("id", request.response_model, (TextBlock("ok"),), "end_turn", TokenUsage(1, 1))
     async def stream(self, request):
         self.last_request = request
         yield StreamComplete("end_turn", TokenUsage(1, 1))
@@ -25,14 +25,21 @@ class FakeProvider:
 
 
 def make_request(model="claude-sonnet", **changes):
-    request = CompletionRequest(model, model, 100, (Message("user", (TextBlock("hi"),)),), ReasoningPolicy(None, None))
+    request = CompletionRequest(
+        original_model=model,
+        model=model,
+        response_model=model,
+        max_tokens=100,
+        messages=(Message("user", (TextBlock("hi"),)),),
+        reasoning=ReasoningPolicy(None, None),
+    )
     return replace(request, **changes)
 
 
 def test_prepare_preserves_session_id():
     provider = FakeProvider()
     service = ProxyService(
-        ModelResolver(ModelConfig({}, {})), "codex", provider, provider
+        ModelResolver(ModelConfig({}, {}, {})), "codex", provider, provider
     )
 
     prepared = service.prepare(make_request(session_id="session-1"))
@@ -43,7 +50,11 @@ def test_prepare_preserves_session_id():
 @pytest.mark.asyncio
 async def test_codex_transport_selects_codex_for_resolved_openai_model():
     lite, codex = FakeProvider(), FakeProvider()
-    service = ProxyService(ModelResolver(ModelConfig({"big": "openai/gpt-5.6-sol"}, {"sonnet": MappingEntry(tier="big", effort="high")})), "codex", lite, codex)
+    service = ProxyService(ModelResolver(ModelConfig(
+        {"sol": ModelDefinition(target="openai/gpt-5.6-sol", context_window=1_000_000)},
+        {"big": "sol"},
+        {"sonnet": MappingEntry(tier="big", effort="high")},
+    )), "codex", lite, codex)
     await service.complete(make_request())
     assert codex.last_request.model == "openai/gpt-5.6-sol"
     assert codex.last_request.reasoning == ReasoningPolicy(True, "high")
@@ -54,7 +65,7 @@ async def test_codex_transport_selects_codex_for_resolved_openai_model():
 @pytest.mark.parametrize("model", ["gemini/gemini-2.5-pro", "anthropic/claude-opus-5"])
 async def test_non_openai_models_use_litellm(model):
     lite, codex = FakeProvider(), FakeProvider()
-    service = ProxyService(ModelResolver(ModelConfig({}, {})), "codex", lite, codex)
+    service = ProxyService(ModelResolver(ModelConfig({}, {}, {})), "codex", lite, codex)
     await service.complete(make_request(model))
     assert lite.last_request.model == model
     assert codex.last_request is None
@@ -63,7 +74,7 @@ async def test_non_openai_models_use_litellm(model):
 @pytest.mark.asyncio
 async def test_count_tokens_uses_same_selection():
     lite, codex = FakeProvider(), FakeProvider()
-    service = ProxyService(ModelResolver(ModelConfig({}, {})), "codex", lite, codex)
+    service = ProxyService(ModelResolver(ModelConfig({}, {}, {})), "codex", lite, codex)
     assert await service.count_tokens(make_request("openai/gpt-5.6-sol")) == 7
     assert codex.last_request is not None
 
@@ -71,7 +82,7 @@ async def test_count_tokens_uses_same_selection():
 @pytest.mark.asyncio
 async def test_stream_uses_same_selection():
     lite, codex = FakeProvider(), FakeProvider()
-    service = ProxyService(ModelResolver(ModelConfig({}, {})), "litellm", lite, codex)
+    service = ProxyService(ModelResolver(ModelConfig({}, {}, {})), "litellm", lite, codex)
     assert [event async for event in service.stream(make_request())]
     assert lite.last_request is not None
 
@@ -92,7 +103,7 @@ class EventProvider(FakeProvider):
 
 async def service_events(provider):
     service = ProxyService(
-        ModelResolver(ModelConfig({}, {})), "litellm", provider, provider
+        ModelResolver(ModelConfig({}, {}, {})), "litellm", provider, provider
     )
     return [event async for event in service.stream(make_request())]
 
@@ -140,7 +151,7 @@ class TerminalThenBlocksProvider(FakeProvider):
 async def test_stream_forwards_terminal_without_waiting_for_provider_eof():
     provider = TerminalThenBlocksProvider()
     service = ProxyService(
-        ModelResolver(ModelConfig({}, {})), "litellm", provider, provider
+        ModelResolver(ModelConfig({}, {}, {})), "litellm", provider, provider
     )
     stream = service.stream(make_request())
 
@@ -176,8 +187,13 @@ def mapped_service(transport="codex"):
     lite, codex = FakeProvider(), FakeProvider()
     resolver = ModelResolver(
         ModelConfig(
+            {
+                "sol": ModelDefinition(
+                    target="openai/gpt-5.6-sol", context_window=1_000_000
+                )
+            },
             {},
-            {"opus": MappingEntry(model="openai/gpt-5.6-sol", effort="high")},
+            {"opus": MappingEntry(model="sol", effort="high")},
         )
     )
     return ProxyService(resolver, transport, lite, codex), lite, codex
@@ -192,7 +208,9 @@ def test_prepare_reconciles_mapped_model_identity():
 
     prepared = service.prepare(identity_request())
 
+    assert prepared.original_model == "claude-opus-5"
     assert prepared.model == "openai/gpt-5.6-sol"
+    assert prepared.response_model == "claude-opus-5[1m]"
     assert prepared.system == EXPECTED_MAPPED_IDENTITY
 
 
@@ -221,6 +239,7 @@ async def test_count_tokens_dispatches_reconciled_identity():
     assert await service.count_tokens(identity_request()) == 7
 
     assert codex.last_request.system == EXPECTED_MAPPED_IDENTITY
+    assert codex.last_request.response_model == "claude-opus-5[1m]"
 
 
 def test_prepare_reconciles_identity_in_system_role_message():

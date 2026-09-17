@@ -1,12 +1,22 @@
 {
+  "models": {
+    "terra": {
+      "target": "openai/gpt-5.6-terra",
+      "context_window": 1000000
+    },
+    "sol": {
+      "target": "openai/gpt-5.6-sol",
+      "context_window": 1000000
+    }
+  },
   "tiers": {
-    "small": "openai/gpt-5.6-terra",
-    "big": "openai/gpt-5.6-sol"
+    "small": "terra",
+    "big": "sol"
   },
   "mappings": {
     "haiku": {"tier": "small", "effort": "medium"},
     "sonnet": {"tier": "big", "effort": "medium"},
     "opus": {"tier": "big", "effort": "high"},
-    "fable": {"model": "openai/gpt-daybreak-blue-latest", "effort": "high"}
+    "fable": {"model": "sol", "effort": "xhigh"}
   }
 }

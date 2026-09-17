@@ -40,6 +40,7 @@ class ProxyService:
         return replace(
             request,
             model=resolved.model,
+            response_model=resolved.response_model,
             messages=messages,
             system=system,
             reasoning=resolve_reasoning_policy(

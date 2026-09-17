@@ -30,8 +30,11 @@ def test_compose_uses_repository_model_mapping_as_application_config(monkeypatch
     assert config["file"] == f"./{MAPPING_PATH.relative_to(ROOT)}"
 
     loaded = load_model_mapping(MAPPING_PATH)
-    assert loaded.tiers
-    assert loaded.mappings
+    assert loaded.models["terra"].context_window == 1_000_000
+    assert loaded.models["sol"].context_window == 1_000_000
+    assert loaded.tiers == {"small": "terra", "big": "sol"}
+    assert loaded.mappings["fable"].model == "sol"
+    assert loaded.mappings["fable"].effort == "xhigh"
 
 
 def test_compose_publishes_proxy_only_on_ipv4_loopback():

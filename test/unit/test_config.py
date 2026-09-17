@@ -3,7 +3,12 @@ from pathlib import Path
 
 import pytest
 
-from claude_code_proxy.config import ModelConfig, Settings, load_model_mapping
+from claude_code_proxy.config import (
+    ModelConfig,
+    ModelDefinition,
+    Settings,
+    load_model_mapping,
+)
 from claude_code_proxy.reasoning import MappingEntry
 
 
@@ -35,18 +40,30 @@ def test_settings_rejects_invalid_openai_transport(monkeypatch):
 def test_loads_tiers_and_mappings(tmp_path):
     path = tmp_path / "mapping.json"
     path.write_text(json.dumps({
-        "tiers": {"small": "openai/gpt-small", "big": "gemini/gemini-big"},
+        "models": {
+            "small-model": {"target": "openai/gpt-small", "context_window": None},
+            "big-model": {"target": "gemini/gemini-big", "context_window": 1_000_000},
+        },
+        "tiers": {"small": "small-model", "big": "big-model"},
         "mappings": {
             "haiku": {"tier": "small", "effort": "medium"},
-            "opus": {"model": "anthropic/claude-opus-5", "effort": "high"},
+            "opus": {"model": "big-model", "effort": "high"},
         },
     }))
 
     assert load_model_mapping(path) == ModelConfig(
-        tiers={"small": "openai/gpt-small", "big": "gemini/gemini-big"},
+        models={
+            "small-model": ModelDefinition(
+                target="openai/gpt-small", context_window=None
+            ),
+            "big-model": ModelDefinition(
+                target="gemini/gemini-big", context_window=1_000_000
+            ),
+        },
+        tiers={"small": "small-model", "big": "big-model"},
         mappings={
             "haiku": MappingEntry(tier="small", effort="medium"),
-            "opus": MappingEntry(model="anthropic/claude-opus-5", effort="high"),
+            "opus": MappingEntry(model="big-model", effort="high"),
         },
     )
 
@@ -65,10 +82,11 @@ def test_missing_mapping_file_uses_fresh_default_config(tmp_path):
 @pytest.mark.parametrize(
     ("data", "message"),
     [
-        ({"mappings": {}}, "tiers"),
-        ({"tiers": {}, "models": {}}, "mappings"),
-        ({"tiers": {"big": ""}, "mappings": {}}, "big"),
-        ({"tiers": {}, "mappings": {"sonnet": {"tier": "big"}}}, "unknown tier"),
+        ({"tiers": {}, "mappings": {}}, "models"),
+        ({"models": {}, "mappings": {}}, "tiers"),
+        ({"models": {}, "tiers": {}}, "mappings"),
+        ({"models": {}, "tiers": {"big": ""}, "mappings": {}}, "big"),
+        ({"models": {}, "tiers": {}, "mappings": {"sonnet": {"tier": "big"}}}, "unknown tier"),
     ],
 )
 def test_invalid_mapping_file_names_path_and_problem(tmp_path, data, message):
@@ -79,3 +97,105 @@ def test_invalid_mapping_file_names_path_and_problem(tmp_path, data, message):
         load_model_mapping(path)
 
     assert message in str(error.value)
+
+
+def test_loads_required_model_definitions(tmp_path):
+    path = tmp_path / "mapping.json"
+    path.write_text(json.dumps({
+        "models": {
+            "terra": {
+                "target": "openai/gpt-5.6-terra",
+                "context_window": 1_000_000,
+            },
+            "sol": {
+                "target": "openai/gpt-5.6-sol",
+                "context_window": None,
+            },
+        },
+        "tiers": {"small": "terra"},
+        "mappings": {
+            "haiku": {"tier": "small", "effort": "medium"},
+            "opus": {"model": "sol", "effort": "high"},
+        },
+    }))
+
+    config = load_model_mapping(path)
+
+    assert config.models["terra"].target == "openai/gpt-5.6-terra"
+    assert config.models["terra"].context_window == 1_000_000
+    assert config.models["sol"].context_window is None
+    assert config.tiers == {"small": "terra"}
+    assert config.mappings["opus"] == MappingEntry(model="sol", effort="high")
+
+
+def test_mapping_file_requires_models_object(tmp_path):
+    path = tmp_path / "mapping.json"
+    path.write_text(json.dumps({"tiers": {}, "mappings": {}}))
+
+    with pytest.raises(ValueError, match="models"):
+        load_model_mapping(path)
+
+
+@pytest.mark.parametrize(
+    ("definition", "message"),
+    [
+        ({"target": "openai/model"}, "context_window"),
+        ({"target": "openai/model", "context_window": 0}, "context_window"),
+        ({"target": "openai/model", "context_window": "1000000"}, "context_window"),
+        ({"target": "openai/model", "context_window": True}, "context_window"),
+        ({"target": "   ", "context_window": None}, "target"),
+        ({"target": " openai/model", "context_window": None}, "target"),
+        ({"target": "openai/model ", "context_window": None}, "target"),
+    ],
+)
+def test_rejects_invalid_model_definition(tmp_path, definition, message):
+    path = tmp_path / "mapping.json"
+    path.write_text(json.dumps({
+        "models": {"broken": definition},
+        "tiers": {},
+        "mappings": {},
+    }))
+
+    with pytest.raises(ValueError, match=message):
+        load_model_mapping(path)
+
+
+def test_rejects_tier_referencing_unknown_model_definition(tmp_path):
+    path = tmp_path / "mapping.json"
+    path.write_text(json.dumps({
+        "models": {},
+        "tiers": {"big": "missing"},
+        "mappings": {},
+    }))
+
+    with pytest.raises(ValueError, match="unknown model"):
+        load_model_mapping(path)
+
+
+def test_rejects_direct_mapping_referencing_unknown_model_definition(tmp_path):
+    path = tmp_path / "mapping.json"
+    path.write_text(json.dumps({
+        "models": {},
+        "tiers": {},
+        "mappings": {"opus": {"model": "missing"}},
+    }))
+
+    with pytest.raises(ValueError, match="unknown model"):
+        load_model_mapping(path)
+
+
+def test_rejects_legacy_raw_targets(tmp_path):
+    path = tmp_path / "mapping.json"
+    path.write_text(json.dumps({
+        "models": {
+            "sol": {
+                "target": "openai/gpt-5.6-sol",
+                "context_window": 1_000_000,
+            }
+        },
+        "tiers": {"big": "openai/gpt-5.6-sol"},
+        "mappings": {"opus": {"model": "openai/gpt-5.6-sol"}},
+    }))
+
+    with pytest.raises(ValueError, match="unknown model"):
+        load_model_mapping(path)

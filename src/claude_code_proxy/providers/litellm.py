@@ -209,7 +209,7 @@ class LiteLLMProvider:
             blocks.append(TextBlock(""))
         return CompletionResponse(
             data.get("id", f"msg_{uuid.uuid4().hex}") if isinstance(data, dict) else getattr(response, "id", f"msg_{uuid.uuid4().hex}"),
-            request.model, tuple(blocks), {"length": "max_tokens", "tool_calls": "tool_use"}.get(finish, "end_turn"),
+            request.response_model, tuple(blocks), {"length": "max_tokens", "tool_calls": "tool_use"}.get(finish, "end_turn"),
             normalize_usage(usage),
         )
 

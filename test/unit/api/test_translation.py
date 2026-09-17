@@ -32,6 +32,7 @@ def test_normalize_request_preserves_ordered_content_and_options():
     normalized = normalize_request(request)
     assert normalized.original_model == "claude-sonnet-test"
     assert normalized.model == "claude-sonnet-test"
+    assert normalized.response_model == "claude-sonnet-test"
     assert normalized.system == (TextBlock("system"),)
     assert normalized.messages[0].content == (TextBlock("before"), ToolUseBlock("call-1", "lookup", {"q": "x"}))
     assert normalized.messages[1].content == (ToolResultBlock("call-1", "done"),)
@@ -92,6 +93,7 @@ def test_schema_rejects_invalid_effort():
 
 import asyncio
 import json
+from dataclasses import replace
 
 from claude_code_proxy.api.translation import serialize_stream, to_api_response
 from claude_code_proxy.domain.models import (
@@ -147,6 +149,22 @@ async def test_text_stream_has_anthropic_lifecycle_order():
     frames = [frame async for frame in serialize_stream(normalized, event_source(StreamStart(3), TextDelta("hello"), StreamComplete("end_turn", TokenUsage(3, 1))))]
     assert event_names(frames) == ["message_start", "ping", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]
     assert frames[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_stream_start_uses_client_response_model():
+    normalized = normalize_request(
+        MessagesRequest(model="claude-opus-5", max_tokens=10, messages=[])
+    )
+    prepared = replace(normalized, response_model="claude-opus-5[1m]")
+
+    frames = [frame async for frame in serialize_stream(
+        prepared,
+        event_source(StreamComplete("end_turn", TokenUsage(1, 1))),
+    )]
+
+    start = json.loads(frames[0].split("data: ", 1)[1])
+    assert start["message"]["model"] == "claude-opus-5[1m]"
 
 
 @pytest.mark.asyncio
