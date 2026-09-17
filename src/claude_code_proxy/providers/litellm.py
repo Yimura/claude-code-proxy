@@ -16,6 +16,7 @@ from ..domain.models import (
     ToolUseBlock, ToolUseEnd, ToolUseStart,
 )
 from .base import ProviderError, protocol_error, stream_error_from_exception
+from .usage import normalize_usage
 
 logger = logging.getLogger(__name__)
 
@@ -206,15 +207,14 @@ class LiteLLMProvider:
             blocks.append(ToolUseBlock(call.get("id", f"tool_{uuid.uuid4().hex}") if isinstance(call, dict) else getattr(call, "id", f"tool_{uuid.uuid4().hex}"), function.get("name", "") if isinstance(function, dict) else function.name, arguments))
         if not blocks:
             blocks.append(TextBlock(""))
-        get_usage = usage.get if isinstance(usage, dict) else lambda key, default=0: getattr(usage, key, default)
         return CompletionResponse(
             data.get("id", f"msg_{uuid.uuid4().hex}") if isinstance(data, dict) else getattr(response, "id", f"msg_{uuid.uuid4().hex}"),
             request.model, tuple(blocks), {"length": "max_tokens", "tool_calls": "tool_use"}.get(finish, "end_turn"),
-            TokenUsage(get_usage("prompt_tokens", 0), get_usage("completion_tokens", 0)),
+            normalize_usage(usage),
         )
 
     async def stream(self, request: CompletionRequest):
-        input_tokens = output_tokens = 0
+        usage = TokenUsage(0, 0)
         stop_reason = "end_turn"
         finish_seen = False
         slots = set()
@@ -225,9 +225,9 @@ class LiteLLMProvider:
             try:
                 async for chunk in iterator:
                     data = chunk if isinstance(chunk, dict) else chunk.model_dump()
-                    usage = data.get("usage") or {}
-                    input_tokens = usage.get("prompt_tokens", input_tokens)
-                    output_tokens = usage.get("completion_tokens", output_tokens)
+                    raw_usage = data.get("usage")
+                    if raw_usage is not None:
+                        usage = normalize_usage(raw_usage)
                     for choice in data.get("choices", []):
                         delta = choice.get("delta") or {}
                         if delta.get("content"):
@@ -255,7 +255,7 @@ class LiteLLMProvider:
                 return
             for slot in sorted(slots):
                 yield ToolUseEnd(slot)
-            yield StreamComplete(stop_reason, TokenUsage(input_tokens, output_tokens))
+            yield StreamComplete(stop_reason, usage)
         except Exception as error:
             provider_error = self._provider_error(error)
             yield stream_error_from_exception(

@@ -3,6 +3,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from litellm.types.utils import Usage as LiteLLMUsage
 
 from claude_code_proxy.config import Settings
 from claude_code_proxy.domain.models import (
@@ -148,6 +149,56 @@ async def test_complete_returns_normalized_text_and_usage(settings):
 
 
 @pytest.mark.asyncio
+async def test_complete_preserves_nested_cache_and_reasoning_usage(settings):
+    client = FakeClient({
+        "id": "response-usage",
+        "choices": [{
+            "message": {"content": "hello", "tool_calls": None},
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "prompt_tokens_details": {
+                "cached_tokens": 60,
+                "cache_write_tokens": 10,
+            },
+            "completion_tokens_details": {"reasoning_tokens": 7},
+        },
+    })
+
+    response = await LiteLLMProvider(settings, client).complete(request())
+
+    assert response.usage == TokenUsage(30, 20, 10, 60, 7)
+
+
+@pytest.mark.asyncio
+async def test_complete_accepts_litellm_usage_model(settings):
+    usage = LiteLLMUsage(
+        prompt_tokens=100,
+        completion_tokens=20,
+        total_tokens=120,
+        prompt_tokens_details={
+            "cached_tokens": 60,
+            "cache_write_tokens": 10,
+        },
+        completion_tokens_details={"reasoning_tokens": 7},
+    )
+    client = FakeClient({
+        "id": "response-model-usage",
+        "choices": [{
+            "message": {"content": "hello", "tool_calls": None},
+            "finish_reason": "stop",
+        }],
+        "usage": usage,
+    })
+
+    response = await LiteLLMProvider(settings, client).complete(request())
+
+    assert response.usage == TokenUsage(30, 20, 10, 60, 7)
+
+
+@pytest.mark.asyncio
 async def test_complete_normalizes_tool_call_and_invalid_arguments(settings):
     client = FakeClient({"id": "response-1", "choices": [{"message": {"content": None, "tool_calls": [{"id": "call-1", "function": {"name": "lookup", "arguments": "not-json"}}]}, "finish_reason": "tool_calls"}], "usage": {}})
     response = await LiteLLMProvider(settings, client).complete(request())
@@ -163,6 +214,41 @@ async def test_stream_returns_semantic_text_events(settings):
     ])
     events = [event async for event in LiteLLMProvider(settings, client).stream(request())]
     assert events == [StreamStart(), TextDelta("hel"), TextDelta("lo"), StreamComplete("end_turn", TokenUsage(3, 2))]
+
+
+@pytest.mark.asyncio
+async def test_stream_replaces_cumulative_detailed_usage(settings):
+    client = FakeClient(chunks=[
+        {
+            "choices": [{"delta": {"content": "hel"}, "finish_reason": None}],
+            "usage": {
+                "prompt_tokens": 20,
+                "completion_tokens": 2,
+                "prompt_tokens_details": {"cached_tokens": 5},
+            },
+        },
+        {"choices": [{"delta": {"content": "lo"}, "finish_reason": None}]},
+        {
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "prompt_tokens_details": {
+                    "cached_tokens": 60,
+                    "cache_creation_tokens": 10,
+                },
+                "completion_tokens_details": {"reasoning_tokens": 7},
+            },
+        },
+    ])
+
+    events = [
+        event async for event in LiteLLMProvider(settings, client).stream(request())
+    ]
+
+    assert events[-1] == StreamComplete(
+        "end_turn", TokenUsage(30, 20, 10, 60, 7)
+    )
 
 
 @pytest.mark.asyncio

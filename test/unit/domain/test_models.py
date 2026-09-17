@@ -35,3 +35,8 @@ def test_redacted_thinking_block_is_immutable():
     assert block.data == "codex-reasoning-v1:data"
     with pytest.raises(FrozenInstanceError):
         block.data = "changed"
+
+
+def test_token_usage_preserves_reported_thinking_tokens():
+    usage = TokenUsage(4, 10, 1, 3, thinking_tokens=6)
+    assert usage.thinking_tokens == 6

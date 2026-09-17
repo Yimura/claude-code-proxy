@@ -86,6 +86,7 @@ from .schemas import (
     ContentBlockText as ApiTextBlock,
     ContentBlockToolUse as ApiToolUseBlock,
     MessagesResponse,
+    OutputTokensDetails,
     Usage,
 )
 
@@ -329,7 +330,7 @@ class _AnthropicStreamState:
                             "stop_reason": event.stop_reason,
                             "stop_sequence": None,
                         },
-                        "usage": {"output_tokens": event.usage.output_tokens},
+                        "usage": _api_usage(event.usage).model_dump(),
                     },
                 ),
                 _sse("message_stop", {"type": "message_stop"}),
@@ -387,6 +388,11 @@ def _api_usage(usage: TokenUsage) -> Usage:
         output_tokens=usage.output_tokens,
         cache_creation_input_tokens=usage.cache_creation_input_tokens,
         cache_read_input_tokens=usage.cache_read_input_tokens,
+        output_tokens_details=(
+            OutputTokensDetails(thinking_tokens=usage.thinking_tokens)
+            if usage.thinking_tokens is not None
+            else None
+        ),
     )
 
 
