@@ -1,5 +1,8 @@
 from dataclasses import replace
 
+from claude_code_proxy.api.schemas import MessagesRequest
+from claude_code_proxy.api.translation import normalize_request, to_api_response
+
 from claude_code_proxy.domain.models import (
     CompletionRequest, Message, RedactedThinking, RedactedThinkingBlock, StreamComplete, TextBlock, TextDelta, TokenUsage,
     ToolChoice, ToolDefinition, ToolInputDelta, ToolResultBlock, ToolUseBlock,
@@ -196,6 +199,65 @@ def test_response_from_events_preserves_reasoning_before_tool():
         RedactedThinkingBlock(carrier),
         ToolUseBlock("call", "lookup", {}),
     )
+
+
+def test_reasoning_carrier_round_trips_through_anthropic_history():
+    translator = CodexEventTranslator()
+    reasoning = translator.feed(
+        "response.output_item.done",
+        {"item": {
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "encrypted-state",
+        }},
+    )[0]
+    events = [
+        reasoning,
+        ToolUseStart("0", "call-1", "lookup"),
+        ToolInputDelta("0", '{"q":"x"}'),
+        ToolUseEnd("0"),
+        StreamComplete("tool_use", TokenUsage(2, 3)),
+    ]
+    response = response_from_events(request(), events)
+    api_content = [
+        block.model_dump() for block in to_api_response(response).content
+    ]
+    follow_up = MessagesRequest(
+        model="claude-sonnet",
+        max_tokens=100,
+        messages=[
+            {"role": "assistant", "content": api_content},
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call-1",
+                    "content": "done",
+                }],
+            },
+        ],
+    )
+
+    codex = build_request(normalize_request(follow_up))
+
+    assert codex["input"] == [
+        {
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "encrypted-state",
+        },
+        {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "lookup",
+            "arguments": '{"q": "x"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "done",
+        },
+    ]
 
 
 def test_arguments_done_supplies_json_when_no_deltas_arrive():
