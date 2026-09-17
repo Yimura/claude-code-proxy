@@ -14,6 +14,7 @@ def normalize_request(
     return CompletionRequest(
         original_model=request.model,
         model=request.model,
+        response_model=request.model,
         max_tokens=request.max_tokens,
         messages=tuple(Message(role=message.role, content=_normalize_content(message.content)) for message in request.messages),
         reasoning=ReasoningPolicy(None, None),
@@ -190,7 +191,7 @@ class _AnthropicStreamState:
             "id": self.message_id,
             "type": "message",
             "role": "assistant",
-            "model": self.request.model,
+            "model": self.request.response_model,
             "content": [],
             "stop_reason": None,
             "stop_sequence": None,

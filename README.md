@@ -93,47 +93,85 @@ Model selection belongs in `model_mapping.json`. Environment variables configure
 
 ## Model Mapping
 
-`model_mapping.json` is the source of truth for Claude-name matching, upstream model selection, and default reasoning effort:
+`model_mapping.json` is the source of truth for upstream model definitions, context capabilities, tier selection, Claude-name matching, and default reasoning effort:
 
 ```json
 {
+  "models": {
+    "terra": {
+      "target": "openai/gpt-5.6-terra",
+      "context_window": 1000000
+    },
+    "sol": {
+      "target": "openai/gpt-5.6-sol",
+      "context_window": 1000000
+    }
+  },
   "tiers": {
-    "small": "openai/gpt-5.6-terra",
-    "big": "openai/gpt-5.6-sol"
+    "small": "terra",
+    "big": "sol"
   },
   "mappings": {
     "haiku": {"tier": "small", "effort": "medium"},
     "sonnet": {"tier": "big", "effort": "medium"},
     "opus": {"tier": "big", "effort": "high"},
-    "fable": {"model": "openai/gpt-daybreak-blue-latest", "effort": "high"}
+    "fable": {"model": "sol", "effort": "xhigh"}
   }
 }
 ```
 
-Mapping patterns are matched case-insensitively against incoming model names. Each mapping selects exactly one target:
+Every model definition requires:
 
-- `"tier": "small"` resolves through top-level `tiers.small`.
-- `"tier": "big"` resolves through top-level `tiers.big`.
-- `"model": "..."` selects an exact target.
+- `target`: exact upstream provider model.
+- `context_window`: positive token count, or `null` when capability is unknown.
 
-Use explicit prefixes to select providers:
+Tier values reference model-definition names. Each mapping selects exactly one model definition:
+
+- `"tier": "big"` resolves through `tiers.big`.
+- `"model": "sol"` bypasses tiers and selects `models.sol` directly.
+
+Raw provider targets are no longer valid in `tiers` or mapping `model` selectors. Move each target into `models`, then reference its definition name. Invalid and unknown references stop startup with a path-specific error.
+
+Model mapping maintains three separate identities:
+
+1. `original_model` preserves the exact inbound value for conservative prompt matching and logging.
+2. `model` names the resolved upstream target used for provider routing, execution, and upstream system identity.
+3. `response_model` advertises the client-facing Claude Code capability identity.
+
+For an explicitly mapped model with a known context window, response identity is canonicalized from the inbound model. A context window of at least 1,000,000 tokens adds one terminal `[1m]` suffix; a smaller known window removes it. `context_window: null` advertises no capability and preserves the previous upstream response identity. Direct and unmapped requests preserve existing behavior.
+
+Use explicit prefixes in model-definition targets to select providers:
 
 - `openai/...` uses `OPENAI_TRANSPORT` (`litellm` by default, or `codex`).
 - `gemini/...` uses LiteLLM with Google AI Studio or Vertex AI authentication.
 - `anthropic/...` uses LiteLLM with Anthropic authentication.
-- Unprefixed mapping targets default to `openai/...`; explicit prefixes are recommended.
+- Unprefixed targets default to `openai/...`; explicit prefixes are recommended.
 
-When Claude Code includes its recognized model-identity metadata, mapped requests keep Claude Code identified as the coding-agent CLI harness while naming the exact resolved upstream target as the model generating the response. OpenAI and Gemini targets explicitly state that they are not Anthropic Claude models. Unmapped requests, unrecognized metadata, and unrelated system instructions remain unchanged.
+When Claude Code includes recognized model-identity metadata, mapped requests keep Claude Code identified as the coding-agent CLI harness while naming the exact resolved upstream target as the model generating the response. OpenAI and Gemini targets explicitly state that they are not Anthropic Claude models. Response identity does not change this upstream prompt identity. Unmapped requests, unrecognized metadata, and unrelated system instructions remain unchanged.
 
-For direct Anthropic mappings, select Anthropic targets explicitly:
+For direct Anthropic mappings, define and select Anthropic targets explicitly:
 
 ```json
 {
+  "models": {
+    "haiku": {
+      "target": "anthropic/claude-haiku-4-5-20251001",
+      "context_window": 200000
+    },
+    "sonnet": {
+      "target": "anthropic/claude-sonnet-5",
+      "context_window": 1000000
+    },
+    "opus": {
+      "target": "anthropic/claude-opus-5",
+      "context_window": 1000000
+    }
+  },
   "tiers": {},
   "mappings": {
-    "haiku": {"model": "anthropic/claude-haiku-4-5-20251001"},
-    "sonnet": {"model": "anthropic/claude-sonnet-5"},
-    "opus": {"model": "anthropic/claude-opus-5"}
+    "haiku": {"model": "haiku"},
+    "sonnet": {"model": "sonnet"},
+    "opus": {"model": "opus"}
   }
 }
 ```

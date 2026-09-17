@@ -100,6 +100,7 @@ def request(session_id=None):
     return CompletionRequest(
         "claude",
         "openai/gpt-5",
+        "claude",
         100,
         (Message("user", (TextBlock("hi"),)),),
         ReasoningPolicy(None, None),

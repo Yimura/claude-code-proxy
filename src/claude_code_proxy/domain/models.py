@@ -64,6 +64,7 @@ class ToolChoice:
 class CompletionRequest:
     original_model: str
     model: str
+    response_model: str
     max_tokens: int
     messages: tuple[Message, ...]
     reasoning: ReasoningPolicy

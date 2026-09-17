@@ -48,6 +48,7 @@ def request(model="openai/gpt-5.6-sol", **changes):
     base = CompletionRequest(
         original_model=model,
         model=model,
+        response_model=model,
         max_tokens=20000,
         messages=(Message("user", (TextBlock("hello"),)),),
         reasoning=ReasoningPolicy(True, "high"),
@@ -146,6 +147,24 @@ async def test_complete_returns_normalized_text_and_usage(settings):
     assert response.content == (TextBlock("hello"),)
     assert response.stop_reason == "end_turn"
     assert response.usage == TokenUsage(4, 2)
+
+
+@pytest.mark.asyncio
+async def test_complete_uses_client_response_model(settings):
+    client = FakeClient({
+        "id": "response-1",
+        "choices": [{
+            "message": {"content": "hello", "tool_calls": None},
+            "finish_reason": "stop",
+        }],
+        "usage": {},
+    })
+
+    response = await LiteLLMProvider(settings, client).complete(
+        request(response_model="claude-opus-5[1m]")
+    )
+
+    assert response.model == "claude-opus-5[1m]"
 
 
 @pytest.mark.asyncio

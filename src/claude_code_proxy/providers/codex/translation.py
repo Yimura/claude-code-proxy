@@ -261,7 +261,7 @@ def response_from_events(request: CompletionRequest, events: list[StreamEvent]) 
     )
     return CompletionResponse(
         f"msg_{uuid.uuid4().hex[:24]}",
-        request.model,
+        request.response_model,
         tuple(blocks),
         stop_reason,
         complete.usage,

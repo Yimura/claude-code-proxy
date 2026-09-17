@@ -13,12 +13,16 @@ from claude_code_proxy.reasoning import ReasoningPolicy
 def test_completion_request_is_immutable():
     request = CompletionRequest(
         original_model="claude-sonnet",
-        model="claude-sonnet",
+        model="openai/gpt-5.6-sol",
+        response_model="claude-sonnet[1m]",
         max_tokens=100,
         messages=(Message(role="user", content=(TextBlock("hello"),)),),
         reasoning=ReasoningPolicy(None, None),
         session_id="session-1",
     )
+    assert request.original_model == "claude-sonnet"
+    assert request.model == "openai/gpt-5.6-sol"
+    assert request.response_model == "claude-sonnet[1m]"
     assert request.session_id == "session-1"
     with pytest.raises(FrozenInstanceError):
         request.model = "openai/gpt-5"

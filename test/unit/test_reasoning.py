@@ -153,11 +153,11 @@ def test_structured_mapping_supports_tier_and_exact_model():
     assert parse_model_mappings(
         {
             "sonnet": {"tier": "big", "effort": "medium"},
-            "fable": {"model": "gpt-daybreak-blue-latest", "effort": "high"},
+            "fable": {"model": "gpt-custom-large", "effort": "high"},
         }
     ) == {
         "sonnet": MappingEntry(tier="big", effort="medium"),
-        "fable": MappingEntry(model="gpt-daybreak-blue-latest", effort="high"),
+        "fable": MappingEntry(model="gpt-custom-large", effort="high"),
     }
 
 

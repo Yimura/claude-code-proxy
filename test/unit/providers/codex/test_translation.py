@@ -14,7 +14,14 @@ from claude_code_proxy.reasoning import ReasoningPolicy
 
 
 def request(**changes):
-    base = CompletionRequest("claude-sonnet", "openai/gpt-5.6-sol", 100, (Message("user", (TextBlock("hello"),)),), ReasoningPolicy(True, "high"))
+    base = CompletionRequest(
+        original_model="claude-sonnet",
+        model="openai/gpt-5.6-sol",
+        response_model="claude-sonnet[1m]",
+        max_tokens=100,
+        messages=(Message("user", (TextBlock("hello"),)),),
+        reasoning=ReasoningPolicy(True, "high"),
+    )
     return replace(base, **changes)
 
 
@@ -348,6 +355,15 @@ def test_incomplete_response_maps_max_tokens():
 
     assert translator.completed is True
     assert translator.finish().stop_reason == "max_tokens"
+
+
+def test_response_from_events_uses_client_response_model():
+    response = response_from_events(
+        request(),
+        [StreamComplete("end_turn", TokenUsage(2, 3))],
+    )
+
+    assert response.model == "claude-sonnet[1m]"
 
 
 def test_response_from_events_buffers_text_and_tool_json():
