@@ -7,6 +7,7 @@ import httpx
 from ...domain.models import CompletionRequest, StreamError, StreamStart
 from ..base import ProviderError, protocol_error, stream_error_from_exception
 from .auth import CodexAuth
+from .orchestration import reconcile_codex_request
 from .translation import CodexEventTranslator, build_request, response_from_events
 
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -34,6 +35,7 @@ class CodexProvider:
 
     async def stream(self, request: CompletionRequest):
         try:
+            request = reconcile_codex_request(request)
             session_id = request.session_id or str(uuid.uuid4())
             access_token, account_id = await self._auth_credentials()
             payload = build_request(request)
@@ -115,7 +117,7 @@ class CodexProvider:
     async def count_tokens(self, request: CompletionRequest) -> int:
         if self._token_counter is None:
             return 1000
-        return await self._token_counter(request)
+        return await self._token_counter(reconcile_codex_request(request))
 
     async def _response_events(self, response):
         event_type = None

@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 from claude_code_proxy.domain.models import (
@@ -9,8 +11,14 @@ from claude_code_proxy.domain.models import (
     TextBlock,
     TextDelta,
     TokenUsage,
+    ToolDefinition,
 )
 from claude_code_proxy.providers.base import ProviderError
+from claude_code_proxy.providers.codex.orchestration import (
+    AGENT_COMPLETION_POLICY,
+    AGENT_GUIDANCE,
+    TASK_OUTPUT_GUIDANCE,
+)
 from claude_code_proxy.providers.codex.provider import (
     CODEX_RESPONSES_URL,
     CodexProvider,
@@ -96,8 +104,8 @@ def reset_client():
     Client.requests = []
 
 
-def request(session_id=None):
-    return CompletionRequest(
+def request(session_id=None, **changes):
+    base = CompletionRequest(
         "claude",
         "openai/gpt-5",
         "claude",
@@ -105,6 +113,25 @@ def request(session_id=None):
         (Message("user", (TextBlock("hi"),)),),
         ReasoningPolicy(None, None),
         session_id=session_id,
+    )
+    return replace(base, **changes)
+
+
+def orchestration_request():
+    return request(
+        system=(TextBlock("base system"),),
+        tools=(
+            ToolDefinition(
+                "Agent",
+                "Launch worker.",
+                {"type": "object", "properties": {"prompt": {"type": "string"}}},
+            ),
+            ToolDefinition(
+                "TaskOutput",
+                "Retrieve output.",
+                {"type": "object", "properties": {"task_id": {"type": "string"}}},
+            ),
+        ),
     )
 
 
@@ -431,3 +458,32 @@ async def test_count_tokens_uses_local_counter_only():
 
     assert await provider.count_tokens(request()) == 8
     assert calls[0].model == "openai/gpt-5"
+
+
+async def test_stream_applies_codex_agent_completion_guidance():
+    Client.responses = [completed_response()]
+
+    await collect(CodexProvider(Auth(), Client), orchestration_request())
+
+    payload = Client.requests[0][2]["json"]
+    assert payload["instructions"] == f"base system\n\n{AGENT_COMPLETION_POLICY}"
+    assert payload["tools"][0]["description"].endswith(AGENT_GUIDANCE)
+    assert payload["tools"][1]["description"].endswith(TASK_OUTPUT_GUIDANCE)
+    source_tools = orchestration_request().tools
+    assert payload["tools"][0]["parameters"] == source_tools[0].input_schema
+    assert payload["tools"][1]["parameters"] == source_tools[1].input_schema
+
+
+async def test_count_tokens_applies_codex_agent_completion_guidance():
+    captured = []
+
+    async def count_tokens(completion_request):
+        captured.append(completion_request)
+        return 17
+
+    provider = CodexProvider(Auth(), Client, token_counter=count_tokens)
+
+    assert await provider.count_tokens(orchestration_request()) == 17
+    assert captured[0].system[-1] == TextBlock(AGENT_COMPLETION_POLICY)
+    assert captured[0].tools[0].description.endswith(AGENT_GUIDANCE)
+    assert captured[0].tools[1].description.endswith(TASK_OUTPUT_GUIDANCE)
