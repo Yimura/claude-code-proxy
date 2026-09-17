@@ -1,11 +1,11 @@
 from dataclasses import replace
 
 from claude_code_proxy.domain.models import (
-    CompletionRequest, Message, RedactedThinkingBlock, StreamComplete, TextBlock, TextDelta, TokenUsage,
+    CompletionRequest, Message, RedactedThinking, RedactedThinkingBlock, StreamComplete, TextBlock, TextDelta, TokenUsage,
     ToolChoice, ToolDefinition, ToolInputDelta, ToolResultBlock, ToolUseBlock,
     ToolUseEnd, ToolUseStart,
 )
-from claude_code_proxy.providers.codex.reasoning import encode_reasoning
+from claude_code_proxy.providers.codex.reasoning import decode_reasoning, encode_reasoning
 from claude_code_proxy.providers.codex.translation import CodexEventTranslator, build_request, response_from_events
 from claude_code_proxy.reasoning import ReasoningPolicy
 
@@ -139,6 +139,63 @@ def test_event_translator_maps_text_tools_usage_and_stop():
     assert events == [TextDelta("hello"), ToolUseStart("2", "call-1", "lookup"), ToolInputDelta("2", '{"q":"x"}'), ToolUseEnd("2")]
     assert translator.finish() == StreamComplete("tool_use", TokenUsage(4, 2))
 
+
+
+def test_completed_reasoning_item_emits_opaque_carrier():
+    translator = CodexEventTranslator()
+
+    added = translator.feed(
+        "response.output_item.added",
+        {"output_index": 0, "item": {
+            "type": "reasoning",
+            "id": "rs-1",
+            "encrypted_content": None,
+        }},
+    )
+    done = translator.feed(
+        "response.output_item.done",
+        {"output_index": 0, "item": {
+            "type": "reasoning",
+            "id": "rs-1",
+            "summary": [],
+            "encrypted_content": "encrypted-state",
+        }},
+    )
+
+    assert added == ()
+    assert len(done) == 1
+    assert isinstance(done[0], RedactedThinking)
+    assert decode_reasoning(done[0].data) == {
+        "type": "reasoning",
+        "summary": [],
+        "encrypted_content": "encrypted-state",
+    }
+
+
+def test_completed_reasoning_without_encrypted_content_emits_nothing():
+    translator = CodexEventTranslator()
+
+    assert translator.feed(
+        "response.output_item.done",
+        {"item": {"type": "reasoning", "summary": []}},
+    ) == ()
+
+
+def test_response_from_events_preserves_reasoning_before_tool():
+    carrier = encode_reasoning("encrypted-state", [])
+
+    response = response_from_events(request(), [
+        RedactedThinking(carrier),
+        ToolUseStart("0", "call", "lookup"),
+        ToolInputDelta("0", '{}'),
+        ToolUseEnd("0"),
+        StreamComplete("tool_use", TokenUsage(2, 3)),
+    ])
+
+    assert response.content == (
+        RedactedThinkingBlock(carrier),
+        ToolUseBlock("call", "lookup", {}),
+    )
 
 
 def test_arguments_done_supplies_json_when_no_deltas_arrive():

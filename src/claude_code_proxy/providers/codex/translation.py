@@ -8,6 +8,7 @@ from typing import Any
 from ...domain.models import (
     CompletionRequest,
     CompletionResponse,
+    RedactedThinking,
     RedactedThinkingBlock,
     StreamComplete,
     StreamError,
@@ -21,7 +22,7 @@ from ...domain.models import (
     ToolUseEnd,
     ToolUseStart,
 )
-from .reasoning import decode_reasoning
+from .reasoning import decode_reasoning, encode_reasoning
 
 
 def content_to_text(content: Any) -> str:
@@ -123,6 +124,8 @@ class CodexEventTranslator:
             return (TextDelta(text),) if text else ()
         if event_type == "response.output_item.added":
             return self._tool_start(data)
+        if event_type == "response.output_item.done":
+            return self._completed_item(data)
         if event_type == "response.function_call_arguments.delta":
             return self._tool_delta(data)
         if event_type == "response.function_call_arguments.done":
@@ -148,6 +151,22 @@ class CodexEventTranslator:
         return StreamComplete(
             self.stop_reason,
             TokenUsage(self.input_tokens, self.output_tokens),
+        )
+
+    def _completed_item(self, data):
+        item = data.get("item", {})
+        if item.get("type") != "reasoning":
+            return ()
+        encrypted_content = item.get("encrypted_content")
+        summary = item.get("summary", [])
+        if not isinstance(encrypted_content, str) or not encrypted_content:
+            return ()
+        if not isinstance(summary, list) or not all(
+            isinstance(part, dict) for part in summary
+        ):
+            return ()
+        return (
+            RedactedThinking(encode_reasoning(encrypted_content, summary)),
         )
 
     def _tool_start(self, data):
@@ -198,26 +217,57 @@ class CodexEventTranslator:
 def response_from_events(request: CompletionRequest, events: list[StreamEvent]) -> CompletionResponse:
     text = []
     tools: dict[str, dict[str, Any]] = {}
+    order: list[tuple[str, str | RedactedThinkingBlock]] = []
     complete = StreamComplete("end_turn", TokenUsage(0, 0))
     for event in events:
         if isinstance(event, TextDelta):
+            if not order or order[-1] != ("text", ""):
+                order.append(("text", ""))
             text.append(event.text)
+        elif isinstance(event, RedactedThinking):
+            order.append(
+                ("redacted_thinking", RedactedThinkingBlock(event.data))
+            )
         elif isinstance(event, ToolUseStart):
-            tools[event.slot] = {"id": event.id, "name": event.name, "arguments": ""}
+            tools[event.slot] = {
+                "id": event.id,
+                "name": event.name,
+                "arguments": "",
+            }
+            order.append(("tool", event.slot))
         elif isinstance(event, ToolInputDelta):
-            tools.setdefault(event.slot, {"id": "", "name": "", "arguments": ""})["arguments"] += event.partial_json
+            tools.setdefault(
+                event.slot, {"id": "", "name": "", "arguments": ""}
+            )["arguments"] += event.partial_json
         elif isinstance(event, StreamComplete):
             complete = event
     blocks = []
-    if text:
-        blocks.append(TextBlock("".join(text)))
-    for tool in tools.values():
-        try:
-            arguments = json.loads(tool["arguments"] or "{}")
-        except json.JSONDecodeError:
-            arguments = {"raw": tool["arguments"]}
-        blocks.append(ToolUseBlock(tool["id"], tool["name"], arguments))
+    text_value = "".join(text)
+    for kind, value in order:
+        if kind == "text":
+            blocks.append(TextBlock(text_value))
+        elif kind == "redacted_thinking":
+            blocks.append(value)
+        elif kind == "tool":
+            tool = tools[str(value)]
+            try:
+                arguments = json.loads(tool["arguments"] or "{}")
+            except json.JSONDecodeError:
+                arguments = {"raw": tool["arguments"]}
+            blocks.append(
+                ToolUseBlock(tool["id"], tool["name"], arguments)
+            )
     if not blocks:
         blocks.append(TextBlock(""))
-    stop_reason = "tool_use" if tools and complete.stop_reason == "end_turn" else complete.stop_reason
-    return CompletionResponse(f"msg_{uuid.uuid4().hex[:24]}", request.model, tuple(blocks), stop_reason, complete.usage)
+    stop_reason = (
+        "tool_use"
+        if tools and complete.stop_reason == "end_turn"
+        else complete.stop_reason
+    )
+    return CompletionResponse(
+        f"msg_{uuid.uuid4().hex[:24]}",
+        request.model,
+        tuple(blocks),
+        stop_reason,
+        complete.usage,
+    )
