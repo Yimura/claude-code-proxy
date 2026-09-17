@@ -71,6 +71,7 @@ import uuid
 
 from ..domain.models import (
     CompletionResponse,
+    RedactedThinking,
     StreamComplete,
     StreamError,
     StreamStart,
@@ -176,10 +177,12 @@ class _AnthropicStreamState:
     def __init__(self, request: CompletionRequest) -> None:
         self.request = request
         self.message_id = f"msg_{uuid.uuid4().hex[:24]}"
-        self.text_open = True
+        self.text_index: int | None = None
+        self.text_open = False
+        self.non_text_started = False
         self.tool_indices: dict[str, int] = {}
         self.open_tools: set[str] = set()
-        self.next_index = 1
+        self.next_index = 0
 
     def start(self) -> list[str]:
         message = {
@@ -199,22 +202,16 @@ class _AnthropicStreamState:
         }
         return [
             _sse("message_start", {"type": "message_start", "message": message}),
-            _sse(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""},
-                },
-            ),
             _sse("ping", {"type": "ping"}),
         ]
 
     def consume(self, event) -> list[str]:
-        if isinstance(event, (StreamStart,)):
+        if isinstance(event, StreamStart):
             return []
         if isinstance(event, TextDelta):
             return self._text_delta(event)
+        if isinstance(event, RedactedThinking):
+            return self._redacted_thinking(event)
         if isinstance(event, ToolUseStart):
             return self._tool_start(event)
         if isinstance(event, ToolInputDelta):
@@ -228,39 +225,60 @@ class _AnthropicStreamState:
         raise TypeError(f"Unsupported stream event: {type(event).__name__}")
 
     def _text_delta(self, event: TextDelta) -> list[str]:
+        if self.non_text_started:
+            raise ValueError("text delta received after non-text content")
+        frames = []
         if not self.text_open:
-            raise ValueError("text delta received after text block closed")
-        return [
+            self.text_index = self._allocate_index()
+            self.text_open = True
+            frames.append(
+                self._block_start(
+                    self.text_index, {"type": "text", "text": ""}
+                )
+            )
+        frames.append(
             _sse(
                 "content_block_delta",
                 {
                     "type": "content_block_delta",
-                    "index": 0,
+                    "index": self.text_index,
                     "delta": {"type": "text_delta", "text": event.text},
                 },
             )
-        ]
+        )
+        return frames
+
+    def _redacted_thinking(self, event: RedactedThinking) -> list[str]:
+        frames = self._close_text()
+        self.non_text_started = True
+        index = self._allocate_index()
+        frames.extend(
+            [
+                self._block_start(
+                    index,
+                    {"type": "redacted_thinking", "data": event.data},
+                ),
+                self._block_stop(index),
+            ]
+        )
+        return frames
 
     def _tool_start(self, event: ToolUseStart) -> list[str]:
         if event.slot in self.tool_indices:
             raise ValueError(f"duplicate tool start for slot {event.slot}")
         frames = self._close_text()
-        index = self.next_index
-        self.next_index += 1
+        self.non_text_started = True
+        index = self._allocate_index()
         self.tool_indices[event.slot] = index
         self.open_tools.add(event.slot)
         frames.append(
-            _sse(
-                "content_block_start",
+            self._block_start(
+                index,
                 {
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": event.id,
-                        "name": event.name,
-                        "input": {},
-                    },
+                    "type": "tool_use",
+                    "id": event.id,
+                    "name": event.name,
+                    "input": {},
                 },
             )
         )
@@ -294,6 +312,14 @@ class _AnthropicStreamState:
         if self.open_tools:
             raise ValueError("stream completed with open tool blocks")
         frames = self._close_text()
+        if self.next_index == 0:
+            index = self._allocate_index()
+            frames.extend(
+                [
+                    self._block_start(index, {"type": "text", "text": ""}),
+                    self._block_stop(index),
+                ]
+            )
         frames.extend(
             [
                 _sse(
@@ -328,10 +354,26 @@ class _AnthropicStreamState:
         ]
 
     def _close_text(self) -> list[str]:
-        if not self.text_open:
+        if not self.text_open or self.text_index is None:
             return []
         self.text_open = False
-        return [self._block_stop(0)]
+        return [self._block_stop(self.text_index)]
+
+    def _allocate_index(self) -> int:
+        index = self.next_index
+        self.next_index += 1
+        return index
+
+    @staticmethod
+    def _block_start(index: int, content_block: dict[str, Any]) -> str:
+        return _sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": content_block,
+            },
+        )
 
     @staticmethod
     def _block_stop(index: int) -> str:
