@@ -22,6 +22,7 @@ from ...domain.models import (
     ToolUseEnd,
     ToolUseStart,
 )
+from ..usage import normalize_usage
 from .reasoning import decode_reasoning, encode_reasoning
 
 
@@ -109,8 +110,7 @@ def _convert_tool_choice(choice, tools):
 class CodexEventTranslator:
     tool_slots: dict[int, str] = field(default_factory=dict)
     tool_arguments: dict[int, str] = field(default_factory=dict)
-    input_tokens: int = 0
-    output_tokens: int = 0
+    usage: TokenUsage = field(default_factory=lambda: TokenUsage(0, 0))
     stop_reason: str = "end_turn"
     completed: bool = False
 
@@ -148,10 +148,7 @@ class CodexEventTranslator:
         return ()
 
     def finish(self) -> StreamComplete:
-        return StreamComplete(
-            self.stop_reason,
-            TokenUsage(self.input_tokens, self.output_tokens),
-        )
+        return StreamComplete(self.stop_reason, self.usage)
 
     def _completed_item(self, data):
         item = data.get("item", {})
@@ -203,9 +200,7 @@ class CodexEventTranslator:
     def _record_completion(self, data):
         self.completed = True
         response = data if "usage" in data else data.get("response", data)
-        usage = response.get("usage", {})
-        self.input_tokens = usage.get("input_tokens", 0)
-        self.output_tokens = usage.get("output_tokens", 0)
+        self.usage = normalize_usage(response.get("usage"))
         if response.get("status") == "incomplete":
             details = response.get("incomplete_details", {})
             if details.get("reason") == "max_output_tokens":

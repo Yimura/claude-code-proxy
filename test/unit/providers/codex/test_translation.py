@@ -144,6 +144,44 @@ def test_event_translator_maps_text_tools_usage_and_stop():
 
 
 
+def test_completion_maps_nested_cache_and_reasoning_usage():
+    translator = CodexEventTranslator()
+
+    translator.feed("response.completed", {"response": {
+        "status": "completed",
+        "usage": {
+            "input_tokens": 100,
+            "input_tokens_details": {
+                "cached_tokens": 60,
+                "cache_write_tokens": 10,
+            },
+            "output_tokens": 20,
+            "output_tokens_details": {"reasoning_tokens": 7},
+        },
+    }})
+
+    assert translator.finish().usage == TokenUsage(30, 20, 10, 60, 7)
+
+
+def test_incomplete_response_preserves_detailed_usage():
+    translator = CodexEventTranslator()
+
+    translator.feed("response.incomplete", {
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "usage": {
+            "input_tokens": 10,
+            "input_tokens_details": {"cached_tokens": 4},
+            "output_tokens": 5,
+            "output_tokens_details": {"reasoning_tokens": 3},
+        },
+    })
+
+    assert translator.finish() == StreamComplete(
+        "max_tokens", TokenUsage(6, 5, 0, 4, 3)
+    )
+
+
 def test_completed_reasoning_item_emits_opaque_carrier():
     translator = CodexEventTranslator()
 
