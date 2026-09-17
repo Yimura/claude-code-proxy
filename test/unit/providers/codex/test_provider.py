@@ -96,13 +96,14 @@ def reset_client():
     Client.requests = []
 
 
-def request():
+def request(session_id=None):
     return CompletionRequest(
         "claude",
         "openai/gpt-5",
         100,
         (Message("user", (TextBlock("hi"),)),),
         ReasoningPolicy(None, None),
+        session_id=session_id,
     )
 
 
@@ -120,8 +121,9 @@ def completed_response(input_tokens=0, output_tokens=0):
     )
 
 
-async def collect(provider):
-    return [event async for event in provider.stream(request())]
+async def collect(provider, completion_request=None):
+    completion_request = completion_request or request()
+    return [event async for event in provider.stream(completion_request)]
 
 
 async def test_stream_posts_headers_and_returns_semantic_events():
@@ -152,6 +154,63 @@ async def test_stream_posts_headers_and_returns_semantic_events():
         Client.requests[0][2]["headers"]["Authorization"]
         == "Bearer secret-access"
     )
+
+
+async def test_stream_forwards_client_session_id_unchanged():
+    Client.responses = [completed_response()]
+
+    await collect(CodexProvider(Auth(), Client), request("session-1"))
+
+    assert Client.requests[0][2]["headers"]["session-id"] == "session-1"
+
+
+async def test_provider_segregates_different_client_sessions():
+    Client.responses = [completed_response(), completed_response()]
+    provider = CodexProvider(Auth(), Client)
+
+    await collect(provider, request("parent-session"))
+    await collect(provider, request("subagent-session"))
+
+    assert [
+        call[2]["headers"]["session-id"] for call in Client.requests
+    ] == ["parent-session", "subagent-session"]
+
+
+async def test_headerless_requests_receive_distinct_fallback_sessions():
+    Client.responses = [completed_response(), completed_response()]
+    provider = CodexProvider(Auth(), Client)
+
+    await collect(provider)
+    await collect(provider)
+
+    first, second = [
+        call[2]["headers"]["session-id"] for call in Client.requests
+    ]
+    assert first != second
+    assert first
+    assert second
+
+
+async def test_401_retry_reuses_client_session_id():
+    Client.responses = [Response(status=401), completed_response()]
+
+    await collect(CodexProvider(Auth(), Client), request("session-1"))
+
+    assert [
+        call[2]["headers"]["session-id"] for call in Client.requests
+    ] == ["session-1", "session-1"]
+
+
+async def test_401_retry_reuses_generated_fallback_session_id():
+    Client.responses = [Response(status=401), completed_response()]
+
+    await collect(CodexProvider(Auth(), Client))
+
+    first, second = [
+        call[2]["headers"]["session-id"] for call in Client.requests
+    ]
+    assert first == second
+    assert first
 
 
 async def test_401_recovers_credentials_after_closing_response_and_retries_once():

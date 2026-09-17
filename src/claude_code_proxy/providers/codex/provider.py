@@ -20,7 +20,6 @@ class CodexProvider:
         self._auth = auth
         self._client_factory = client_factory
         self._token_counter = token_counter
-        self._session_id = uuid.uuid4().hex
 
     async def complete(self, request: CompletionRequest):
         events = [event async for event in self.stream(request)]
@@ -35,6 +34,7 @@ class CodexProvider:
 
     async def stream(self, request: CompletionRequest):
         try:
+            session_id = request.session_id or str(uuid.uuid4())
             access_token, account_id = await self._auth_credentials()
             payload = build_request(request)
             translator = CodexEventTranslator()
@@ -43,7 +43,9 @@ class CodexProvider:
             ) as client:
                 for attempt in range(2):
                     retry_rejected = False
-                    headers = self._build_headers(access_token, account_id)
+                    headers = self._build_headers(
+                        access_token, account_id, session_id
+                    )
                     async with client.stream(
                         "POST",
                         CODEX_RESPONSES_URL,
@@ -133,7 +135,9 @@ class CodexProvider:
                 continue
             yield event_type or "", data
 
-    def _build_headers(self, access_token: str, account_id: str):
+    def _build_headers(
+        self, access_token: str, account_id: str, session_id: str
+    ):
         return {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
@@ -141,5 +145,5 @@ class CodexProvider:
             "originator": "opencode",
             "x-codex-beta-features": "remote_compaction_v2",
             "chatgpt-account-id": account_id,
-            "session-id": self._session_id,
+            "session-id": session_id,
         }
