@@ -187,6 +187,27 @@ Incoming effort `max` maps to provider effort `high` for broad compatibility. En
 
 If the configured mapping file does not exist, the proxy warns and uses built-in defaults. An existing but invalid file stops startup with a path-specific validation error.
 
+## Codex Agent orchestration
+
+For `OPENAI_TRANSPORT=codex`, the Codex provider reinforces Claude Code's Agent lifecycle in the upstream system and tool descriptions:
+
+- Agent completion is push-based and arrives through one automatic parent notification.
+- Parents continue independent work after dispatch instead of polling.
+- `TaskOutput` is not used for Agent tasks.
+- `TaskOutput` remains available for non-Agent background tasks that require explicit retrieval and have no automatic completion notification.
+
+This is provider-local guidance, not task-ID filtering or runtime interception. Tool names, input schemas, and capabilities remain unchanged, and LiteLLM, Gemini, and direct Anthropic requests are unaffected.
+
+A billable opt-in evaluation exercises the behavior against a running proxy and real Codex model. It is skipped during normal test runs:
+
+```bash
+RUN_CODEX_AGENT_EVAL=1 \
+ANTHROPIC_BASE_URL=http://127.0.0.1:8082 \
+uv run pytest -q test/integration/test_codex_agent_polling.py
+```
+
+The evaluation simulates a running Agent, requires the parent to continue independent work, fails on `TaskOutput` polling, then delivers one synthetic completion notification. Because model behavior is nondeterministic, keep this evaluation outside required CI.
+
 ## How It Works
 
 1. Receive an Anthropic-compatible request.
