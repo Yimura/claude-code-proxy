@@ -60,6 +60,7 @@ class CompletionRequest:
     max_tokens: int
     messages: tuple[Message, ...]
     reasoning: ReasoningPolicy
+    session_id: str | None = None
     system: tuple[TextBlock, ...] = ()
     tools: tuple[ToolDefinition, ...] = ()
     tool_choice: ToolChoice | None = None

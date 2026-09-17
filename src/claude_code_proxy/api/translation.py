@@ -8,13 +8,16 @@ from ..reasoning import ReasoningPolicy
 from .schemas import ContentBlockImage, ContentBlockText, ContentBlockToolResult, ContentBlockToolUse, MessagesRequest
 
 
-def normalize_request(request: MessagesRequest) -> CompletionRequest:
+def normalize_request(
+    request: MessagesRequest, *, session_id: str | None = None
+) -> CompletionRequest:
     return CompletionRequest(
         original_model=request.model,
         model=request.model,
         max_tokens=request.max_tokens,
         messages=tuple(Message(role=message.role, content=_normalize_content(message.content)) for message in request.messages),
         reasoning=ReasoningPolicy(None, None),
+        session_id=session_id,
         system=_normalize_system(request.system),
         tools=tuple(ToolDefinition(name=tool.name, description=tool.description or "", input_schema=deepcopy(tool.input_schema)) for tool in request.tools or []),
         tool_choice=_normalize_tool_choice(request.tool_choice),

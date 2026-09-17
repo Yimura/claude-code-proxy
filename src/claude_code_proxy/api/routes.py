@@ -29,7 +29,9 @@ def build_router(
 
     @router.post("/v1/messages")
     async def create_message(request: MessagesRequest, raw_request: Request):
-        normalized = normalize_request(request)
+        normalized = normalize_request(
+            request, session_id=_session_id(raw_request)
+        )
         prepared = service.prepare(normalized)
         context = _request_context(raw_request, prepared, service, tracker)
         _record_context(raw_request, context)
@@ -52,7 +54,10 @@ def build_router(
 
     @router.post("/v1/messages/count_tokens")
     async def count_tokens(request: TokenCountRequest, raw_request: Request):
-        normalized = normalize_request(_as_messages_request(request))
+        normalized = normalize_request(
+            _as_messages_request(request),
+            session_id=_session_id(raw_request),
+        )
         prepared = service.prepare(normalized)
         context = _request_context(raw_request, prepared, service, tracker)
         _record_context(raw_request, context)
@@ -89,10 +94,17 @@ def _as_messages_request(request: TokenCountRequest) -> MessagesRequest:
     )
 
 
+def _session_id(raw_request: Request) -> str | None:
+    value = raw_request.headers.get(SESSION_HEADER)
+    if value is None or not value.strip():
+        return None
+    return value
+
+
 def _request_context(raw_request, prepared, service, tracker):
     provider = service.provider_for(prepared)
     return RequestLogContext(
-        session=tracker.observe(raw_request.headers.get(SESSION_HEADER)),
+        session=tracker.observe(prepared.session_id),
         method=raw_request.method,
         endpoint=raw_request.url.path,
         original_model=prepared.original_model,
