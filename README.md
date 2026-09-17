@@ -10,7 +10,7 @@ Use Anthropic-compatible clients such as Claude Code with Gemini, OpenAI, Codex 
 
 Choose prerequisites for targets in your `model_mapping.json`:
 
-- Python 3.10+ and [uv](https://docs.astral.sh/uv/) for source setup.
+- Python 3.14.x and [uv](https://docs.astral.sh/uv/) for source setup.
 - Docker with Docker Compose for container setup.
 - One or more provider credentials:
   - OpenAI API key for `openai/...` targets using LiteLLM.
@@ -24,7 +24,7 @@ Choose prerequisites for targets in your `model_mapping.json`:
 git clone https://github.com/Yimura/claude-code-proxy.git
 cd claude-code-proxy
 cp .env.example .env
-uv sync --dev
+uv sync --locked --dev
 uv run uvicorn claude_code_proxy.app:app --app-dir src --host 0.0.0.0 --port 8082
 ```
 
@@ -160,9 +160,17 @@ If the configured mapping file does not exist, the proxy warns and uses built-in
 Application code lives in `src/claude_code_proxy/`; unit tests live in `test/unit/`.
 
 ```bash
-uv sync --dev
+uv sync --locked --dev
 uv run pytest
 uv run uvicorn claude_code_proxy.app:app --app-dir src --reload --port 8082
+```
+
+Before refreshing dependencies, review and update direct constraints in `pyproject.toml`. Then regenerate and verify the lock for the supported Python series:
+
+```bash
+uv lock --python 3.14 --upgrade
+uv sync --locked --dev
+uv run pytest
 ```
 
 Validate Compose wiring without requiring a populated `.env`:
