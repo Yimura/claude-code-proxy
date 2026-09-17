@@ -141,3 +141,72 @@ async def test_stream_forwards_terminal_without_waiting_for_provider_eof():
     await stream.aclose()
 
     assert provider.closed is True
+
+
+IDENTITY_SYSTEM = (
+    TextBlock("You are Claude Code, Anthropic's official CLI for Claude."),
+    TextBlock(
+        "You are powered by the model named Opus 5. "
+        "The exact model ID is claude-opus-5."
+    ),
+)
+EXPECTED_MAPPED_IDENTITY = (
+    TextBlock(
+        "You are running inside Claude Code, Anthropic's coding-agent CLI harness."
+    ),
+    TextBlock(
+        "The model generating this response is openai/gpt-5.6-sol, "
+        "not an Anthropic Claude model."
+    ),
+)
+
+
+def mapped_service(transport="codex"):
+    lite, codex = FakeProvider(), FakeProvider()
+    resolver = ModelResolver(
+        ModelConfig(
+            {},
+            {"opus": MappingEntry(model="openai/gpt-5.6-sol", effort="high")},
+        )
+    )
+    return ProxyService(resolver, transport, lite, codex), lite, codex
+
+
+def identity_request():
+    return make_request("claude-opus-5", system=IDENTITY_SYSTEM)
+
+
+def test_prepare_reconciles_mapped_model_identity():
+    service, _, _ = mapped_service()
+
+    prepared = service.prepare(identity_request())
+
+    assert prepared.model == "openai/gpt-5.6-sol"
+    assert prepared.system == EXPECTED_MAPPED_IDENTITY
+
+
+@pytest.mark.asyncio
+async def test_complete_dispatches_reconciled_identity_to_codex():
+    service, _, codex = mapped_service()
+
+    await service.complete(identity_request())
+
+    assert codex.last_request.system == EXPECTED_MAPPED_IDENTITY
+
+
+@pytest.mark.asyncio
+async def test_stream_dispatches_reconciled_identity_to_litellm():
+    service, lite, _ = mapped_service("litellm")
+
+    assert [event async for event in service.stream(identity_request())]
+
+    assert lite.last_request.system == EXPECTED_MAPPED_IDENTITY
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_dispatches_reconciled_identity():
+    service, _, codex = mapped_service()
+
+    assert await service.count_tokens(identity_request()) == 7
+
+    assert codex.last_request.system == EXPECTED_MAPPED_IDENTITY

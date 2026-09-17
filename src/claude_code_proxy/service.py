@@ -11,6 +11,7 @@ from .domain.models import (
     StreamEvent,
 )
 from .model_mapping import ModelResolver
+from .prompt_identity import reconcile_system_identity
 from .providers.base import Provider, ProviderError, protocol_error, stream_error_from_exception
 from .reasoning import resolve_reasoning_policy
 
@@ -24,7 +25,22 @@ class ProxyService:
 
     def prepare(self, request: CompletionRequest) -> CompletionRequest:
         resolved = self._resolver.resolve(request.model)
-        return replace(request, model=resolved.model, reasoning=resolve_reasoning_policy(output_config=request.output_config, thinking=request.thinking, mapping_effort=resolved.effort))
+        system = reconcile_system_identity(
+            request.system,
+            request.original_model,
+            resolved.model,
+            resolved.mapped,
+        )
+        return replace(
+            request,
+            model=resolved.model,
+            system=system,
+            reasoning=resolve_reasoning_policy(
+                output_config=request.output_config,
+                thinking=request.thinking,
+                mapping_effort=resolved.effort,
+            ),
+        )
 
     def provider_for(self, request: CompletionRequest) -> Provider:
         if self._openai_transport == "codex" and request.model.startswith("openai/"):
