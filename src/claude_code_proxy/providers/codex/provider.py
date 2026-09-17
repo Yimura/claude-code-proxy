@@ -35,23 +35,57 @@ class CodexProvider:
 
     async def stream(self, request: CompletionRequest):
         try:
-            access_token, account_id = self._auth.get_auth()
-            headers = self._build_headers(access_token, account_id)
+            access_token, account_id = await self._auth_credentials()
+            payload = build_request(request)
             translator = CodexEventTranslator()
-            yield StreamStart()
-            async with self._client_factory(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
-                async with client.stream("POST", CODEX_RESPONSES_URL, headers=headers, json=build_request(request)) as response:
-                    if response.status_code != 200:
-                        body = "".join([chunk async for chunk in response.aiter_text()])
-                        raise ProviderError(f"Codex API error {response.status_code}: {body[:500]}", provider=self.name, status_code=response.status_code)
-                    async for event_type, data in self._response_events(response):
-                        for event in translator.feed(event_type, data):
-                            yield event
-                            if isinstance(event, StreamError):
-                                return
+            async with self._client_factory(
+                timeout=httpx.Timeout(300.0, connect=30.0)
+            ) as client:
+                for attempt in range(2):
+                    retry_rejected = False
+                    headers = self._build_headers(access_token, account_id)
+                    async with client.stream(
+                        "POST",
+                        CODEX_RESPONSES_URL,
+                        headers=headers,
+                        json=payload,
+                    ) as response:
+                        if response.status_code == 401 and attempt == 0:
+                            retry_rejected = True
+                        elif response.status_code == 401:
+                            raise ProviderError(
+                                "Codex authentication failed",
+                                provider=self.name,
+                                status_code=401,
+                            )
+                        elif response.status_code != 200:
+                            body = "".join(
+                                [chunk async for chunk in response.aiter_text()]
+                            )
+                            raise ProviderError(
+                                f"Codex API error {response.status_code}: {body[:500]}",
+                                provider=self.name,
+                                status_code=response.status_code,
+                            )
+                        else:
+                            yield StreamStart()
+                            async for event_type, data in self._response_events(
+                                response
+                            ):
+                                for event in translator.feed(event_type, data):
+                                    yield event
+                                    if isinstance(event, StreamError):
+                                        return
+                    if retry_rejected:
+                        access_token, account_id = await self._auth_credentials(
+                            access_token
+                        )
+                        continue
+                    break
             if not translator.completed:
                 yield protocol_error(
-                    "Codex stream ended without response.completed", provider=self.name
+                    "Codex stream ended without response.completed",
+                    provider=self.name,
                 )
                 return
             yield translator.finish()
@@ -61,6 +95,20 @@ class CodexProvider:
             )
         except Exception as error:
             yield stream_error_from_exception(error, provider=self.name)
+
+    async def _auth_credentials(
+        self, rejected_access: str | None = None
+    ) -> tuple[str, str]:
+        try:
+            if rejected_access is None:
+                return await self._auth.get_auth()
+            return await self._auth.recover_rejected(rejected_access)
+        except Exception as error:
+            raise ProviderError(
+                "Codex authentication failed",
+                provider=self.name,
+                status_code=401,
+            ) from error
 
     async def count_tokens(self, request: CompletionRequest) -> int:
         if self._token_counter is None:
