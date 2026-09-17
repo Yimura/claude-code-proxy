@@ -11,7 +11,9 @@ def test_completion_request_is_immutable():
         max_tokens=100,
         messages=(Message(role="user", content=(TextBlock("hello"),)),),
         reasoning=ReasoningPolicy(None, None),
+        session_id="session-1",
     )
+    assert request.session_id == "session-1"
     with pytest.raises(FrozenInstanceError):
         request.model = "openai/gpt-5"
 

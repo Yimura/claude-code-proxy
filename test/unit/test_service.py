@@ -29,6 +29,17 @@ def make_request(model="claude-sonnet", **changes):
     return replace(request, **changes)
 
 
+def test_prepare_preserves_session_id():
+    provider = FakeProvider()
+    service = ProxyService(
+        ModelResolver(ModelConfig({}, {})), "codex", provider, provider
+    )
+
+    prepared = service.prepare(make_request(session_id="session-1"))
+
+    assert prepared.session_id == "session-1"
+
+
 @pytest.mark.asyncio
 async def test_codex_transport_selects_codex_for_resolved_openai_model():
     lite, codex = FakeProvider(), FakeProvider()

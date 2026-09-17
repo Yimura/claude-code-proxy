@@ -40,8 +40,10 @@ class Provider:
         self.count_error = count_error
         self.stream_events = stream_events
         self.stream_error = stream_error
+        self.requests = []
 
     async def complete(self, request):
+        self.requests.append(request)
         if self.error:
             raise self.error
         return CompletionResponse(
@@ -109,6 +111,33 @@ def test_non_streaming_messages_return_anthropic_json():
     response = client().post("/v1/messages", json=messages_payload())
     assert response.status_code == 200
     assert response.json()["content"] == [{"type": "text", "text": "hello"}]
+
+
+def test_session_header_reaches_provider_unchanged():
+    provider = Provider()
+
+    response = client(provider).post(
+        "/v1/messages",
+        headers={"x-claude-code-session-id": "session-1"},
+        json=messages_payload(),
+    )
+
+    assert response.status_code == 200
+    assert provider.requests[0].session_id == "session-1"
+
+
+def test_missing_and_blank_session_headers_become_none():
+    provider = Provider()
+    api = client(provider)
+
+    api.post("/v1/messages", json=messages_payload())
+    api.post(
+        "/v1/messages",
+        headers={"x-claude-code-session-id": "   "},
+        json=messages_payload(),
+    )
+
+    assert [request.session_id for request in provider.requests] == [None, None]
 
 
 def test_streaming_messages_return_event_stream():
