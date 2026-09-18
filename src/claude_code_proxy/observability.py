@@ -12,6 +12,7 @@ import time
 from typing import Literal
 import uuid
 
+from .domain.models import ClientIdentity
 from .limits import MAX_CONTROL_INTEGER
 from .text_safety import scalar_text
 
@@ -26,7 +27,7 @@ _FILTER_FIELDS = frozenset(
 
 @dataclass(frozen=True)
 class SessionMetadata:
-    client_session_id: str | None = field(repr=False)
+    client_identity: ClientIdentity = field(repr=False)
     client_model: str
     upstream_model: str
     provider: str
@@ -53,6 +54,29 @@ class ObservationHandle:
     started_monotonic: float
     is_new: bool
     request_scoped: bool
+    agent_key: str | None = None
+    agent_public_id: str | None = None
+    parent_agent_public_id: str | None = None
+    agent_is_new: bool = False
+
+
+@dataclass(frozen=True)
+class AgentSnapshot:
+    id: str
+    parent_id: str | None
+    state: SessionState
+    active_requests: int
+    requests: int
+    client_model: str
+    model: str
+    provider: str
+    transport: str
+    effort: str
+    context_window: int | None
+    first_seen: datetime
+    last_seen: datetime
+    elapsed_seconds: float
+    last_result: SessionResult | None
 
 
 @dataclass(frozen=True)
@@ -71,6 +95,7 @@ class SessionSnapshot:
     last_seen: datetime
     elapsed_seconds: float
     last_result: SessionResult | None
+    agents: tuple[AgentSnapshot, ...] = ()
 
 
 class InvalidSessionFilter(ValueError):
@@ -103,7 +128,7 @@ class _SnapshotMetadata:
 
 
 @dataclass
-class _SessionRecord:
+class _ActivityRecord:
     public_id: str
     metadata: _SnapshotMetadata
     first_seen: datetime
@@ -112,6 +137,16 @@ class _SessionRecord:
     active: dict[str, float]
     latest_duration: float = 0.0
     last_result: SessionResult | None = None
+
+
+@dataclass
+class _AgentRecord(_ActivityRecord):
+    parent_public_id: str | None = None
+
+
+@dataclass
+class _SessionRecord(_ActivityRecord):
+    agents: dict[str, _AgentRecord] = field(default_factory=dict)
 
 
 class SessionRegistry:
@@ -153,14 +188,73 @@ class SessionRegistry:
             hashlib.sha256,
         ).hexdigest()
 
+    def public_agent_id(self, root_identifier: str, agent_id: str) -> str:
+        normalized_root = root_identifier.strip()
+        normalized_agent = agent_id.strip()
+        return self.public_id(f"agent:{normalized_root}\0{normalized_agent}")
+
+    def _agent_identity(
+        self,
+        root_identifier: str,
+        identity: ClientIdentity,
+    ) -> tuple[str, str, str | None] | None:
+        agent_id = (identity.agent_id or "").strip()
+        if not agent_id:
+            return None
+        public_id = self.public_agent_id(root_identifier, agent_id)
+        parent_id = (identity.parent_agent_id or "").strip()
+        parent_public_id = (
+            self.public_agent_id(root_identifier, parent_id)
+            if parent_id
+            else None
+        )
+        return f"agent:{public_id}", public_id, parent_public_id
+
+    @staticmethod
+    def _begin_agent(
+        session: _SessionRecord,
+        identity: tuple[str, str, str | None] | None,
+        metadata: _SnapshotMetadata,
+        request_id: str,
+        started: float,
+        seen_at: datetime,
+    ) -> tuple[str | None, str | None, str | None, bool]:
+        if identity is None:
+            return None, None, None, False
+        key, public_id, parent_public_id = identity
+        agent = session.agents.get(key)
+        is_new = agent is None
+        if agent is None:
+            agent = _AgentRecord(
+                public_id=public_id,
+                parent_public_id=parent_public_id,
+                metadata=metadata,
+                first_seen=seen_at,
+                last_seen=seen_at,
+                requests=0,
+                active={},
+            )
+            session.agents[key] = agent
+        agent.parent_public_id = parent_public_id
+        _begin_activity(agent, metadata, request_id, started, seen_at)
+        return key, public_id, parent_public_id, is_new
+
     def begin(self, metadata: SessionMetadata) -> ObservationHandle:
-        normalized_id = (metadata.client_session_id or "").strip()
+        identity = metadata.client_identity
+        normalized_id = (identity.session_id or "").strip()
         request_id = uuid.uuid4().hex
         request_scoped = not normalized_id
-        identity = f"request:{request_id}" if request_scoped else normalized_id
-        public_id = self.public_id(identity)
-        key = f"request:{request_id}" if request_scoped else f"session:{public_id}"
+        root_identifier = (
+            f"request:{request_id}" if request_scoped else normalized_id
+        )
+        public_id = self.public_id(root_identifier)
+        key = (
+            f"request:{request_id}"
+            if request_scoped
+            else f"session:{public_id}"
+        )
         snapshot_metadata = _SnapshotMetadata.from_session(metadata)
+        agent_identity = self._agent_identity(root_identifier, identity)
 
         with self._lock:
             started = self._monotonic_clock()
@@ -177,11 +271,24 @@ class SessionRegistry:
                     active={},
                 )
                 self._records[key] = record
-            record.metadata = snapshot_metadata
-            record.last_seen = max(record.last_seen, seen_at)
-            record.requests += 1
-            record.active[request_id] = started
+            _begin_activity(
+                record,
+                snapshot_metadata,
+                request_id,
+                started,
+                seen_at,
+            )
             self._inactive.pop(key, None)
+            agent_key, agent_public_id, parent_public_id, agent_is_new = (
+                self._begin_agent(
+                    record,
+                    agent_identity,
+                    snapshot_metadata,
+                    request_id,
+                    started,
+                    seen_at,
+                )
+            )
 
         return ObservationHandle(
             key=key,
@@ -190,6 +297,10 @@ class SessionRegistry:
             started_monotonic=started,
             is_new=is_new,
             request_scoped=request_scoped,
+            agent_key=agent_key,
+            agent_public_id=agent_public_id,
+            parent_agent_public_id=parent_public_id,
+            agent_is_new=agent_is_new,
         )
 
     def finish(self, handle: ObservationHandle, result: SessionResult) -> None:
@@ -198,16 +309,26 @@ class SessionRegistry:
             record = self._records.get(handle.key)
             if record is None:
                 return
-            started = record.active.get(handle.request_id)
-            if started is None:
-                return
-
             finished_at = self._monotonic_clock()
             seen_at = self._wall_clock()
-            del record.active[handle.request_id]
-            record.latest_duration = max(0.0, finished_at - started)
-            record.last_seen = max(record.last_seen, seen_at)
-            record.last_result = result
+            if not _finish_activity(
+                record,
+                handle.request_id,
+                finished_at,
+                seen_at,
+                result,
+            ):
+                return
+            if handle.agent_key is not None:
+                agent = record.agents.get(handle.agent_key)
+                if agent is not None:
+                    _finish_activity(
+                        agent,
+                        handle.request_id,
+                        finished_at,
+                        seen_at,
+                        result,
+                    )
             if not record.active:
                 self._inactive[handle.key] = None
                 self._inactive.move_to_end(handle.key)
@@ -241,6 +362,35 @@ class SessionRegistry:
             del self._records[oldest_key]
 
 
+def _begin_activity(
+    record: _ActivityRecord,
+    metadata: _SnapshotMetadata,
+    request_id: str,
+    started: float,
+    seen_at: datetime,
+) -> None:
+    record.metadata = metadata
+    record.last_seen = max(record.last_seen, seen_at)
+    record.requests += 1
+    record.active[request_id] = started
+
+
+def _finish_activity(
+    record: _ActivityRecord,
+    request_id: str,
+    finished_at: float,
+    seen_at: datetime,
+    result: SessionResult,
+) -> bool:
+    started = record.active.pop(request_id, None)
+    if started is None:
+        return False
+    record.latest_duration = max(0.0, finished_at - started)
+    record.last_seen = max(record.last_seen, seen_at)
+    record.last_result = result
+    return True
+
+
 def _strip_model_prefix(model: str) -> str:
     _, separator, unprefixed = model.partition("/")
     return unprefixed if separator else model
@@ -266,10 +416,39 @@ def _to_snapshot(record: _SessionRecord, now: float) -> SessionSnapshot:
         last_seen=record.last_seen,
         elapsed_seconds=elapsed,
         last_result=record.last_result,
+        agents=tuple(
+            _to_agent_snapshot(agent, now)
+            for agent in sorted(
+                record.agents.values(),
+                key=lambda item: (item.last_seen, item.public_id),
+                reverse=True,
+            )
+        ),
     )
 
 
-def _session_state(record: _SessionRecord) -> SessionState:
+def _to_agent_snapshot(record: _AgentRecord, now: float) -> AgentSnapshot:
+    metadata = record.metadata
+    return AgentSnapshot(
+        id=record.public_id,
+        parent_id=record.parent_public_id,
+        state=_session_state(record),
+        active_requests=len(record.active),
+        requests=record.requests,
+        client_model=metadata.client_model,
+        model=metadata.model,
+        provider=metadata.provider,
+        transport=metadata.transport,
+        effort=metadata.effort,
+        context_window=metadata.context_window,
+        first_seen=record.first_seen,
+        last_seen=record.last_seen,
+        elapsed_seconds=_elapsed_seconds(record, now),
+        last_result=record.last_result,
+    )
+
+
+def _session_state(record: _ActivityRecord) -> SessionState:
     if record.active:
         return "active"
     if record.last_result == "failed":
@@ -277,7 +456,7 @@ def _session_state(record: _SessionRecord) -> SessionState:
     return "idle"
 
 
-def _elapsed_seconds(record: _SessionRecord, now: float) -> float:
+def _elapsed_seconds(record: _ActivityRecord, now: float) -> float:
     if not record.active:
         return record.latest_duration
     return max(0.0, now - min(record.active.values()))

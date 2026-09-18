@@ -5,6 +5,7 @@ import threading
 
 import pytest
 
+from claude_code_proxy.domain.models import ClientIdentity
 from claude_code_proxy.observability import (
     AmbiguousSessionId,
     InvalidSessionFilter,
@@ -29,16 +30,27 @@ class Clock:
         self.monotonic += seconds
 
 
-def metadata(client_session_id: str | None = "sensitive-session") -> SessionMetadata:
-    return SessionMetadata(
-        client_session_id=client_session_id,
-        client_model="claude-opus",
-        upstream_model="openai/gpt-5.6-sol",
-        provider="openai",
-        transport="codex",
-        effort="high",
-        context_window=1_000_000,
-    )
+def metadata(
+    session_id: str | None = "sensitive-session",
+    agent_id: str | None = None,
+    parent_agent_id: str | None = None,
+    **changes,
+) -> SessionMetadata:
+    values = {
+        "client_identity": ClientIdentity(
+            session_id,
+            agent_id,
+            parent_agent_id,
+        ),
+        "client_model": "claude-opus",
+        "upstream_model": "openai/gpt-5.6-sol",
+        "provider": "openai",
+        "transport": "codex",
+        "effort": "high",
+        "context_window": 1_000_000,
+    }
+    values.update(changes)
+    return SessionMetadata(**values)
 
 
 def registry(clock: Clock, inactive_limit: int = 10) -> SessionRegistry:
@@ -62,6 +74,94 @@ def test_constructor_rejects_negative_inactive_limit() -> None:
     with pytest.raises(ValueError, match="inactive_limit"):
         SessionRegistry(-1)
 
+
+
+def test_agents_share_root_aggregate_but_keep_independent_counts() -> None:
+    clock = Clock()
+    sessions = registry(clock)
+    first = sessions.begin(metadata(agent_id="agent-one"))
+    second = sessions.begin(metadata(agent_id="agent-two"))
+
+    snapshot = sessions.snapshots()[0]
+
+    assert snapshot.requests == 2
+    assert snapshot.active_requests == 2
+    assert len(snapshot.agents) == 2
+    assert {agent.requests for agent in snapshot.agents} == {1}
+    assert {agent.active_requests for agent in snapshot.agents} == {1}
+    assert first.agent_public_id != second.agent_public_id
+
+
+def test_resumed_agent_reuses_public_identity_and_record() -> None:
+    clock = Clock()
+    sessions = registry(clock)
+    first = sessions.begin(metadata(agent_id="agent-one"))
+    sessions.finish(first, "completed")
+    second = sessions.begin(metadata(agent_id="agent-one"))
+
+    snapshot = sessions.snapshots()[0]
+
+    assert first.agent_public_id == second.agent_public_id
+    assert len(snapshot.agents) == 1
+    assert snapshot.agents[0].requests == 2
+    assert snapshot.agents[0].active_requests == 1
+
+
+def test_agent_public_identity_is_scoped_to_root_session() -> None:
+    clock = Clock()
+    sessions = registry(clock)
+    first = sessions.begin(metadata("session-one", "shared-name"))
+    second = sessions.begin(metadata("session-two", "shared-name"))
+
+    assert first.agent_public_id != second.agent_public_id
+
+
+def test_nested_agent_retains_safe_parent_reference() -> None:
+    clock = Clock()
+    sessions = registry(clock)
+    nested = sessions.begin(
+        metadata("session", "nested-agent", "parent-agent")
+    )
+
+    agent = sessions.snapshots()[0].agents[0]
+
+    assert agent.id == nested.agent_public_id
+    assert agent.parent_id == nested.parent_agent_public_id
+    assert agent.id != agent.parent_id
+
+
+def test_main_request_does_not_create_agent_snapshot() -> None:
+    clock = Clock()
+    sessions = registry(clock)
+
+    sessions.begin(metadata())
+
+    assert sessions.snapshots()[0].agents == ()
+
+
+def test_finishing_one_agent_keeps_other_agent_and_root_active() -> None:
+    clock = Clock()
+    sessions = registry(clock)
+    first = sessions.begin(metadata(agent_id="first"))
+    sessions.begin(metadata(agent_id="second"))
+
+    sessions.finish(first, "completed")
+
+    snapshot = sessions.snapshots()[0]
+    states = {agent.id: agent.state for agent in snapshot.agents}
+    assert snapshot.state == "active"
+    assert states[first.agent_public_id] == "idle"
+    assert "active" in states.values()
+
+
+def test_request_scoped_agents_do_not_share_records() -> None:
+    clock = Clock()
+    sessions = registry(clock)
+    first = sessions.begin(metadata(None, "agent"))
+    second = sessions.begin(metadata(None, "agent"))
+
+    assert len(sessions.snapshots()) == 2
+    assert first.agent_public_id != second.agent_public_id
 
 def test_public_id_is_stable_and_raw_id_is_not_exposed() -> None:
     clock = Clock()
@@ -167,7 +267,7 @@ def test_public_metadata_escapes_unpaired_surrogates_without_changing_unicode() 
 
     handle = sessions.begin(
         SessionMetadata(
-            client_session_id="raw-\ud800-session",
+            client_identity=ClientIdentity("raw-\ud800-session"),
             client_model=raw,
             upstream_model=f"openai/{raw}",
             provider=raw,
@@ -204,7 +304,7 @@ def test_later_begin_refreshes_metadata() -> None:
 
     sessions.begin(
         SessionMetadata(
-            client_session_id="sensitive-session",
+            client_identity=ClientIdentity("sensitive-session"),
             client_model="claude-sonnet",
             upstream_model="vertex/claude-sonnet-5",
             provider="vertex",
@@ -277,7 +377,7 @@ def make_filter_registry(clock: Clock) -> tuple[SessionRegistry, dict[str, str]]
     clock.advance()
     idle = sessions.begin(
         SessionMetadata(
-            client_session_id="idle-row",
+            client_identity=ClientIdentity("idle-row"),
             client_model="Claude-Sonnet",
             upstream_model="vertex/Claude-Sonnet-5",
             provider="Vertex",
@@ -291,7 +391,7 @@ def make_filter_registry(clock: Clock) -> tuple[SessionRegistry, dict[str, str]]
     clock.advance()
     failed = sessions.begin(
         SessionMetadata(
-            client_session_id="failed-row",
+            client_identity=ClientIdentity("failed-row"),
             client_model="claude-haiku",
             upstream_model="gemini/gemini-pro",
             provider="Gemini",

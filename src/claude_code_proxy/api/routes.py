@@ -188,7 +188,7 @@ def _session_metadata(
     prepared: CompletionRequest, transport: str
 ) -> SessionMetadata:
     return SessionMetadata(
-        client_session_id=prepared.client_identity.session_id,
+        client_identity=prepared.client_identity,
         client_model=prepared.original_model,
         upstream_model=prepared.model,
         provider=_upstream_provider(prepared.model),

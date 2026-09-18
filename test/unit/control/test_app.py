@@ -13,6 +13,7 @@ from claude_code_proxy.control.schemas import (
     SessionListResponse,
     SessionResponse,
 )
+from claude_code_proxy.domain.models import ClientIdentity
 from claude_code_proxy.observability import (
     SessionMetadata,
     SessionRegistry,
@@ -47,7 +48,7 @@ def metadata(
     context_window: int | None = 1_000_000,
 ) -> SessionMetadata:
     return SessionMetadata(
-        client_session_id=client_id,
+        client_identity=ClientIdentity(client_id),
         client_model=client_model,
         upstream_model=upstream_model,
         provider=provider,
@@ -526,7 +527,11 @@ def test_session_response_validates_snapshot_attributes_and_is_frozen() -> None:
 
     response = SessionResponse.model_validate(snapshot)
 
-    assert response.model_dump() == snapshot.__dict__
+    assert response.model_dump() == {
+        key: value
+        for key, value in snapshot.__dict__.items()
+        if key != "agents"
+    }
     assert "client_session_id" not in SessionResponse.model_fields
     with pytest.raises(ValidationError, match="frozen"):
         response.requests = 4

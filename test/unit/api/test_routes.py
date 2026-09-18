@@ -1115,7 +1115,7 @@ def stream_metadata(
     session_id: str = "direct-stream",
 ) -> SessionMetadata:
     return SessionMetadata(
-        client_session_id=session_id,
+        client_identity=ClientIdentity(session_id=session_id),
         client_model="claude-sonnet",
         upstream_model="openai/gpt-test",
         provider="openai",
