@@ -162,10 +162,13 @@ class FakeClient:
 
 
 @pytest.fixture(autouse=True)
-def reset_fake_client(monkeypatch: pytest.MonkeyPatch) -> None:
+def reset_fake_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     FakeClient.instances = []
     FakeClient.result = response()
     FakeClient.error = None
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli_module, "ControlClient", FakeClient)
 
 
@@ -200,6 +203,11 @@ def test_proxy_uses_environment_settings_and_calls_startup_in_order(
     calls: list[tuple[str, object]] = []
     resolved = tmp_path / "resolved.sock"
     runtime = object()
+    monkeypatch.setattr(
+        cli_module,
+        "_load_current_directory_environment",
+        lambda: calls.append(("dotenv", tmp_path / ".env")),
+    )
     monkeypatch.setattr(
         cli_module.Settings,
         "from_environment",
@@ -285,6 +293,53 @@ def test_proxy_cli_options_override_environment_settings(
         assert getattr(observed[0], name) == value
 
 
+@pytest.mark.parametrize(
+    ("exported", "cli_socket", "expected_name"),
+    [
+        (None, None, "file.sock"),
+        ("exported.sock", None, "exported.sock"),
+        ("exported.sock", "cli.sock", "cli.sock"),
+    ],
+)
+def test_proxy_socket_precedence_in_current_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    exported: str | None,
+    cli_socket: str | None,
+    expected_name: str,
+) -> None:
+    file_socket = tmp_path / "file.sock"
+    (tmp_path / ".env").write_text(f"CONTROL_SOCKET_PATH={file_socket}\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CONTROL_SOCKET_PATH", raising=False)
+    if exported is not None:
+        monkeypatch.setenv("CONTROL_SOCKET_PATH", str(tmp_path / exported))
+
+    observed_settings: list[Settings] = []
+    observed_paths: list[Path] = []
+    monkeypatch.setattr(cli_module, "configure_logging", lambda: None)
+    monkeypatch.setattr(
+        cli_module,
+        "create_runtime",
+        lambda value: observed_settings.append(value) or object(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "run_proxy",
+        lambda runtime, path: observed_paths.append(path),
+    )
+    arguments = ["proxy"]
+    if cli_socket is not None:
+        arguments.extend(["--socket", str(tmp_path / cli_socket)])
+
+    result = runner.invoke(app, arguments)
+
+    expected = (tmp_path / expected_name).absolute()
+    assert result.exit_code == 0
+    assert observed_settings[0].control_socket_path == expected
+    assert observed_paths == [expected]
+
+
 @pytest.mark.parametrize("stage", ["settings", "resolve", "runtime", "run"])
 def test_proxy_reports_ordinary_failures_without_traceback(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stage: str
@@ -344,6 +399,100 @@ def test_proxy_treats_keyboard_interrupt_as_clean_termination(
 
     assert result.exit_code == 0
     assert "Aborted" not in result.output
+
+
+@pytest.mark.parametrize(
+    ("exported", "cli_socket", "expected_name"),
+    [
+        (None, None, "file.sock"),
+        ("exported.sock", None, "exported.sock"),
+        ("exported.sock", "cli.sock", "cli.sock"),
+    ],
+)
+def test_ps_socket_precedence_in_current_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    exported: str | None,
+    cli_socket: str | None,
+    expected_name: str,
+) -> None:
+    file_socket = tmp_path / "file.sock"
+    (tmp_path / ".env").write_text(f"CONTROL_SOCKET_PATH={file_socket}\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CONTROL_SOCKET_PATH", raising=False)
+    if exported is not None:
+        monkeypatch.setenv("CONTROL_SOCKET_PATH", str(tmp_path / exported))
+
+    arguments = ["ps"]
+    if cli_socket is not None:
+        arguments.extend(["--socket", str(tmp_path / cli_socket)])
+    result = runner.invoke(app, arguments)
+
+    assert result.exit_code == 0
+    assert FakeClient.instances[0].socket_path == (
+        tmp_path / expected_name
+    ).absolute()
+
+
+def test_ps_loads_current_directory_dotenv_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[Path, bool]] = []
+    monkeypatch.setattr(
+        cli_module,
+        "load_dotenv",
+        lambda *, dotenv_path, override: calls.append((dotenv_path, override)),
+    )
+
+    result = runner.invoke(app, ["ps", "--socket", str(tmp_path / "cli.sock")])
+
+    assert result.exit_code == 0
+    assert calls == [(tmp_path / ".env", False)]
+
+
+@pytest.mark.parametrize("dotenv_contents", [None, "PROXY_PORT=9000\n"])
+@pytest.mark.parametrize("command", ["proxy", "ps"])
+def test_commands_ignore_ancestor_dotenv_when_cwd_dotenv_is_missing_or_partial(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: str,
+    dotenv_contents: str | None,
+) -> None:
+    ancestor = tmp_path / "ancestor"
+    working_directory = ancestor / "working"
+    working_directory.mkdir(parents=True)
+    (ancestor / ".env").write_text(
+        "PROXY_PORT=9001\nCONTROL_SOCKET_PATH=/ancestor.sock\n"
+    )
+    if dotenv_contents is not None:
+        (working_directory / ".env").write_text(dotenv_contents)
+    monkeypatch.chdir(working_directory)
+    monkeypatch.delenv("PROXY_PORT", raising=False)
+    monkeypatch.delenv("CONTROL_SOCKET_PATH", raising=False)
+
+    observed_socket_settings: list[Path | None] = []
+    observed_proxy_settings: list[Settings] = []
+    monkeypatch.setattr(
+        cli_module,
+        "resolve_socket_path",
+        lambda value: observed_socket_settings.append(value)
+        or working_directory / "fallback.sock",
+    )
+    monkeypatch.setattr(cli_module, "configure_logging", lambda: None)
+    monkeypatch.setattr(
+        cli_module,
+        "create_runtime",
+        lambda value: observed_proxy_settings.append(value) or object(),
+    )
+    monkeypatch.setattr(cli_module, "run_proxy", lambda runtime, socket_path: None)
+
+    result = runner.invoke(app, [command])
+
+    assert result.exit_code == 0
+    assert observed_socket_settings == [None]
+    if command == "proxy":
+        expected_port = 9000 if dotenv_contents is not None else 8082
+        assert observed_proxy_settings[0].proxy_port == expected_port
 
 
 def test_ps_socket_option_overrides_environment(

@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 from typing import Annotated
 
+from dotenv import load_dotenv
 import typer
 from wcwidth import wcwidth, wcswidth
 
@@ -131,6 +132,7 @@ def ps(
     """List sessions observed by a running proxy."""
     normalized = _validated_filters(filters or ())
     try:
+        _load_current_directory_environment()
         socket_path = resolve_socket_path(socket)
         with ControlClient(socket_path) as client:
             result = client.sessions(normalized)
@@ -142,6 +144,10 @@ def ps(
         _exit_with_error(str(error))
     except Exception as error:
         _exit_with_error(str(error))
+
+
+def _load_current_directory_environment() -> None:
+    load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
 
 
 def _apply_proxy_overrides(

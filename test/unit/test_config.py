@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from claude_code_proxy import config as config_module
 from claude_code_proxy.config import (
     ModelConfig,
     ModelDefinition,
@@ -10,6 +11,60 @@ from claude_code_proxy.config import (
     load_model_mapping,
 )
 from claude_code_proxy.reasoning import MappingEntry
+
+
+@pytest.fixture(autouse=True)
+def isolate_dotenv_working_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+
+def test_settings_loads_only_current_directory_dotenv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def record_load(*args: object, **kwargs: object) -> None:
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(config_module, "load_dotenv", record_load)
+
+    Settings.from_environment()
+
+    assert calls == [
+        ((), {"dotenv_path": tmp_path / ".env", "override": False})
+    ]
+
+
+@pytest.mark.parametrize(
+    ("dotenv_contents", "expected_port"),
+    [(None, 8082), ("PROXY_PORT=9000\n", 9000)],
+)
+def test_settings_does_not_supplement_missing_or_partial_dotenv_from_ancestor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    dotenv_contents: str | None,
+    expected_port: int,
+) -> None:
+    ancestor = tmp_path / "ancestor"
+    working_directory = ancestor / "working"
+    working_directory.mkdir(parents=True)
+    (ancestor / ".env").write_text(
+        "PROXY_HOST=ancestor-host\nCONTROL_SOCKET_PATH=/ancestor.sock\n"
+    )
+    if dotenv_contents is not None:
+        (working_directory / ".env").write_text(dotenv_contents)
+    monkeypatch.chdir(working_directory)
+    monkeypatch.delenv("PROXY_HOST", raising=False)
+    monkeypatch.delenv("PROXY_PORT", raising=False)
+    monkeypatch.delenv("CONTROL_SOCKET_PATH", raising=False)
+
+    settings = Settings.from_environment()
+
+    assert settings.proxy_host == "0.0.0.0"
+    assert settings.proxy_port == expected_port
+    assert settings.control_socket_path is None
 
 
 def test_settings_reads_runtime_environment(monkeypatch, tmp_path):

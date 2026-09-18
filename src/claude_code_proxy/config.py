@@ -81,7 +81,7 @@ class Settings:
 
     @classmethod
     def from_environment(cls) -> "Settings":
-        load_dotenv()
+        load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
         transport = os.environ.get("OPENAI_TRANSPORT", "litellm").lower()
         if transport not in ("litellm", "codex"):
             raise ValueError(
