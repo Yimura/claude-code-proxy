@@ -8,8 +8,11 @@ from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
 import claude_code_proxy.api.routes as routes_module
+from claude_code_proxy import cli as cli_module
 from claude_code_proxy.api.routes import build_router
 from claude_code_proxy.config import ModelConfig, ModelDefinition
+from claude_code_proxy.control.app import create_control_app
+from claude_code_proxy.control.schemas import SessionListResponse
 from claude_code_proxy.domain.models import (
     CompletionResponse,
     StreamComplete,
@@ -668,6 +671,153 @@ def test_raw_session_id_is_absent_from_logs_and_safe_prefix_is_present(caplog):
     assert response.status_code == 200
     assert raw_id not in caplog.text
     assert sessions.public_id(raw_id)[:12] in caplog.text
+
+
+_SENSITIVE_MARKERS = {
+    "raw_session": "raw-session-sensitive-marker-10",
+    "credential": "credential-sensitive-marker-10",
+    "system": "system-sensitive-marker-10",
+    "user": "user-sensitive-marker-10",
+    "tool_name": "tool_name_sensitive_marker_10",
+    "tool_description": "tool-description-sensitive-marker-10",
+    "tool_schema": "tool-schema-sensitive-marker-10",
+    "tool_input": "tool-input-sensitive-marker-10",
+    "tool_result": "tool-result-sensitive-marker-10",
+    "thinking": "thinking-sensitive-marker-10",
+}
+_SESSION_RESPONSE_FIELDS = {
+    "id",
+    "state",
+    "active_requests",
+    "requests",
+    "client_model",
+    "model",
+    "provider",
+    "transport",
+    "effort",
+    "context_window",
+    "first_seen",
+    "last_seen",
+    "elapsed_seconds",
+    "last_result",
+}
+
+
+def _sensitive_messages_payload():
+    markers = _SENSITIVE_MARKERS
+    return messages_payload(
+        system=markers["system"],
+        messages=[
+            {"role": "user", "content": markers["user"]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "redacted_thinking", "data": markers["thinking"]},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_10",
+                        "name": markers["tool_name"],
+                        "input": {"value": markers["tool_input"]},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_10",
+                        "content": markers["tool_result"],
+                    }
+                ],
+            },
+        ],
+        tools=[
+            {
+                "name": markers["tool_name"],
+                "description": markers["tool_description"],
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "value": {"description": markers["tool_schema"]}
+                    },
+                },
+            }
+        ],
+    )
+
+
+def _session_exposure_surfaces(sessions, logs):
+    control_app = create_control_app(
+        sessions,
+        application_version="1.0",
+        pid=123,
+    )
+    with TestClient(control_app) as control_client:
+        control = control_client.get("/v1/sessions")
+    assert control.status_code == 200
+    parsed = SessionListResponse.model_validate(control.json())
+    return control, {
+        "registry": repr(sessions.snapshots()[0]),
+        "control": control.text,
+        "table": cli_module._render_sessions(
+            parsed, cli_module.OutputFormat.TABLE, False
+        ),
+        "full_table": cli_module._render_sessions(
+            parsed, cli_module.OutputFormat.TABLE, True
+        ),
+        "json": cli_module._render_sessions(
+            parsed, cli_module.OutputFormat.JSON, True
+        ),
+        "logs": logs,
+    }
+
+
+def test_sensitive_request_data_never_crosses_the_session_metadata_boundary(caplog):
+    provider = Provider()
+    sessions = registry()
+    headers = {
+        "authorization": f"Bearer {_SENSITIVE_MARKERS['credential']}",
+        "x-api-key": _SENSITIVE_MARKERS["credential"],
+        "x-claude-code-session-id": _SENSITIVE_MARKERS["raw_session"],
+    }
+
+    with caplog.at_level(logging.INFO, logger="claude_code_proxy"):
+        response = client(
+            provider,
+            sessions=sessions,
+            with_middleware=True,
+            config=mapped_config(),
+        ).post(
+            "/v1/messages",
+            headers=headers,
+            json=_sensitive_messages_payload(),
+        )
+
+    assert response.status_code == 200
+    provider_payload = repr(provider.requests[0])
+    for name, marker in _SENSITIVE_MARKERS.items():
+        if name != "credential":
+            assert marker in provider_payload
+
+    snapshot = sessions.snapshots()[0]
+    safe_id = sessions.public_id(_SENSITIVE_MARKERS["raw_session"])
+    control, exposed_surfaces = _session_exposure_surfaces(sessions, caplog.text)
+    for surface, content in exposed_surfaces.items():
+        for marker in _SENSITIVE_MARKERS.values():
+            assert marker not in content, f"{marker!r} leaked through {surface}"
+
+    assert len(safe_id) == 64
+    assert snapshot.id == safe_id
+    assert safe_id in exposed_surfaces["registry"]
+    assert safe_id in exposed_surfaces["control"]
+    assert safe_id[:12] in exposed_surfaces["table"]
+    assert safe_id in exposed_surfaces["full_table"]
+    assert _SENSITIVE_MARKERS["raw_session"] not in exposed_surfaces["full_table"]
+    assert safe_id in exposed_surfaces["json"]
+    for value in ("claude-sonnet", "gpt-5.6-sol", "openai", "fake", "high"):
+        assert value in exposed_surfaces["control"]
+    assert set(control.json()["sessions"][0]) == _SESSION_RESPONSE_FIELDS
 
 
 def test_fallback_validation_log_uses_safe_id_without_registry_row(caplog):

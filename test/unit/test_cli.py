@@ -947,12 +947,12 @@ def test_installed_script_and_module_adapter_subprocess_help() -> None:
         assert "ps" in completed.stdout
 
 
-def test_ps_subprocess_escapes_terminal_data_from_unix_socket(tmp_path: Path) -> None:
+def test_ps_subprocess_escapes_model_and_effort_terminal_data(tmp_path: Path) -> None:
     socket_path = tmp_path / "control.sock"
     observed = session(
         "a" * 64,
-        model="界é\x1b\x85\ud800tail",
-        effort="high",
+        model="model界é\n\r\x1b\x85\ud800tail",
+        effort="effort界é\n\r\x1b\x85\ud800tail",
     )
     health = {
         "protocol_version": 1,
@@ -976,10 +976,13 @@ def test_ps_subprocess_escapes_terminal_data_from_unix_socket(tmp_path: Path) ->
     assert completed.returncode == 0, (
         f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
     )
-    assert "界é" in completed.stdout
+    assert "model界é\\x0a\\x0d\\x1b\\x85\\ud800tail" in completed.stdout
+    assert "effort界é\\x0a\\x0d\\x1b\\x85\\ud800tail" in completed.stdout
     assert "\\x1b" in completed.stdout
     assert "\\x85" in completed.stdout
     assert "\\ud800" in completed.stdout
+    assert len(completed.stdout.splitlines()) == 2
+    assert "\r" not in completed.stdout
     assert "\x1b" not in completed.stdout
     assert "\x85" not in completed.stdout
     assert "\ud800" not in completed.stdout
