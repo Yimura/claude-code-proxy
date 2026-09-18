@@ -4,8 +4,12 @@ import asyncio
 from copy import deepcopy
 import json
 import logging
+import os
 import uuid
 from typing import Any
+
+# LiteLLM loads model metadata during import; prefer its bundled map by default.
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
 import litellm
 

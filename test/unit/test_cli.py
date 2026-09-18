@@ -206,11 +206,6 @@ def test_proxy_uses_environment_settings_and_calls_startup_in_order(
     resolved = tmp_path / "resolved.sock"
     runtime = object()
     monkeypatch.setattr(
-        cli_module,
-        "_load_current_directory_environment",
-        lambda: calls.append(("dotenv", tmp_path / ".env")),
-    )
-    monkeypatch.setattr(
         cli_module.Settings,
         "from_environment",
         classmethod(lambda cls: calls.append(("settings", cls)) or configured),
@@ -222,18 +217,21 @@ def test_proxy_uses_environment_settings_and_calls_startup_in_order(
     )
     monkeypatch.setattr(
         cli_module,
-        "configure_logging",
+        "_configure_proxy_logging",
         lambda: calls.append(("logging", None)),
     )
+
+    def create(value: Settings) -> object:
+        calls.append(("runtime", value))
+        return runtime
+
+    def run(value: object, path: Path) -> None:
+        calls.append(("run", (value, path)))
+
     monkeypatch.setattr(
         cli_module,
-        "create_runtime",
-        lambda value: calls.append(("runtime", value)) or runtime,
-    )
-    monkeypatch.setattr(
-        cli_module,
-        "run_proxy",
-        lambda value, path: calls.append(("run", (value, path))),
+        "_load_proxy_runtime",
+        lambda: calls.append(("load", None)) or (create, run),
     )
 
     result = runner.invoke(app, ["proxy"])
@@ -243,6 +241,7 @@ def test_proxy_uses_environment_settings_and_calls_startup_in_order(
         ("settings", cli_module.Settings),
         ("resolve", configured.control_socket_path),
         ("logging", None),
+        ("load", None),
         ("runtime", configured),
         ("run", (runtime, resolved)),
     ]
@@ -260,11 +259,11 @@ def test_proxy_reports_non_linux_control_socket_guidance(
         classmethod(lambda cls: configured),
     )
     monkeypatch.setattr(socket_module.sys, "platform", "darwin")
-    monkeypatch.setattr(cli_module, "configure_logging", lambda: None)
+    monkeypatch.setattr(cli_module, "_configure_proxy_logging", lambda: None)
     monkeypatch.setattr(
         cli_module,
-        "create_runtime",
-        lambda value: pytest.fail("runtime created on unsupported platform"),
+        "_load_proxy_runtime",
+        lambda: pytest.fail("runtime dependencies loaded on unsupported platform"),
     )
 
     result = runner.invoke(app, ["proxy"])
@@ -301,13 +300,15 @@ def test_proxy_cli_options_override_environment_settings(
         classmethod(lambda cls: configured),
     )
     monkeypatch.setattr(cli_module, "resolve_socket_path", lambda path: path)
-    monkeypatch.setattr(cli_module, "configure_logging", lambda: None)
+    monkeypatch.setattr(cli_module, "_configure_proxy_logging", lambda: None)
     monkeypatch.setattr(
         cli_module,
-        "create_runtime",
-        lambda value: observed.append(value) or object(),
+        "_load_proxy_runtime",
+        lambda: (
+            lambda value: observed.append(value) or object(),
+            lambda runtime, path: None,
+        ),
     )
-    monkeypatch.setattr(cli_module, "run_proxy", lambda runtime, path: None)
 
     result = runner.invoke(app, ["proxy", *arguments])
 
@@ -348,16 +349,14 @@ def test_proxy_socket_precedence_in_current_directory(
 
     observed_settings: list[Settings] = []
     observed_paths: list[Path] = []
-    monkeypatch.setattr(cli_module, "configure_logging", lambda: None)
+    monkeypatch.setattr(cli_module, "_configure_proxy_logging", lambda: None)
     monkeypatch.setattr(
         cli_module,
-        "create_runtime",
-        lambda value: observed_settings.append(value) or object(),
-    )
-    monkeypatch.setattr(
-        cli_module,
-        "run_proxy",
-        lambda runtime, path: observed_paths.append(path),
+        "_load_proxy_runtime",
+        lambda: (
+            lambda value: observed_settings.append(value) or object(),
+            lambda runtime, path: observed_paths.append(path),
+        ),
     )
     arguments = ["proxy"]
     if cli_socket is not None:
@@ -371,7 +370,7 @@ def test_proxy_socket_precedence_in_current_directory(
     assert observed_paths == [expected]
 
 
-@pytest.mark.parametrize("stage", ["settings", "resolve", "runtime", "run"])
+@pytest.mark.parametrize("stage", ["settings", "resolve", "load", "runtime", "run"])
 def test_proxy_reports_ordinary_failures_without_traceback(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stage: str
 ) -> None:
@@ -390,17 +389,17 @@ def test_proxy_reports_ordinary_failures_without_traceback(
         "resolve_socket_path",
         lambda path: fail() if stage == "resolve" else tmp_path / "control.sock",
     )
-    monkeypatch.setattr(cli_module, "configure_logging", lambda: None)
-    monkeypatch.setattr(
-        cli_module,
-        "create_runtime",
-        lambda value: fail() if stage == "runtime" else object(),
-    )
-    monkeypatch.setattr(
-        cli_module,
-        "run_proxy",
-        lambda runtime, path: fail() if stage == "run" else None,
-    )
+    monkeypatch.setattr(cli_module, "_configure_proxy_logging", lambda: None)
+
+    def load_runtime():
+        if stage == "load":
+            fail()
+        return (
+            lambda value: fail() if stage == "runtime" else object(),
+            lambda runtime, path: fail() if stage == "run" else None,
+        )
+
+    monkeypatch.setattr(cli_module, "_load_proxy_runtime", load_runtime)
 
     result = runner.invoke(app, ["proxy"])
 
@@ -418,12 +417,14 @@ def test_proxy_treats_keyboard_interrupt_as_clean_termination(
         classmethod(lambda cls: settings(tmp_path)),
     )
     monkeypatch.setattr(cli_module, "resolve_socket_path", lambda path: tmp_path / "control.sock")
-    monkeypatch.setattr(cli_module, "configure_logging", lambda: None)
-    monkeypatch.setattr(cli_module, "create_runtime", lambda value: object())
+    monkeypatch.setattr(cli_module, "_configure_proxy_logging", lambda: None)
     monkeypatch.setattr(
         cli_module,
-        "run_proxy",
-        lambda runtime, path: (_ for _ in ()).throw(KeyboardInterrupt()),
+        "_load_proxy_runtime",
+        lambda: (
+            lambda value: object(),
+            lambda runtime, path: (_ for _ in ()).throw(KeyboardInterrupt()),
+        ),
     )
 
     result = runner.invoke(app, ["proxy"])
@@ -509,13 +510,15 @@ def test_commands_ignore_ancestor_dotenv_when_cwd_dotenv_is_missing_or_partial(
         lambda value: observed_socket_settings.append(value)
         or working_directory / "fallback.sock",
     )
-    monkeypatch.setattr(cli_module, "configure_logging", lambda: None)
+    monkeypatch.setattr(cli_module, "_configure_proxy_logging", lambda: None)
     monkeypatch.setattr(
         cli_module,
-        "create_runtime",
-        lambda value: observed_proxy_settings.append(value) or object(),
+        "_load_proxy_runtime",
+        lambda: (
+            lambda value: observed_proxy_settings.append(value) or object(),
+            lambda runtime, socket_path: None,
+        ),
     )
-    monkeypatch.setattr(cli_module, "run_proxy", lambda runtime, socket_path: None)
 
     result = runner.invoke(app, [command])
 

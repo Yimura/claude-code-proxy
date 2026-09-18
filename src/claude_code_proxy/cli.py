@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
 from enum import Enum
 import json
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, TYPE_CHECKING
 
 from dotenv import load_dotenv
 import typer
@@ -23,10 +24,10 @@ from .control.client import (
 from .control.schemas import SessionListResponse, SessionResponse
 from .control.socket import resolve_socket_path
 from .limits import MAX_CONTROL_INTEGER
-from .logging import configure_logging
-from .runtime import create_runtime
-from .server import run_proxy
 from .text_safety import escaped_text_atom, unicode_escape_atom
+
+if TYPE_CHECKING:
+    from .runtime import RuntimeServices
 
 _MAX_FILTERS = 32
 _MAX_FILTER_LENGTH = 256
@@ -60,6 +61,24 @@ app = typer.Typer(
 class OutputFormat(str, Enum):
     TABLE = "table"
     JSON = "json"
+
+
+def _configure_proxy_logging() -> None:
+    """Configure proxy logging without loading provider code for other commands."""
+    from .logging import configure_logging
+
+    configure_logging()
+
+
+def _load_proxy_runtime() -> tuple[
+    Callable[[Settings], RuntimeServices],
+    Callable[[RuntimeServices, Path], None],
+]:
+    """Load heavyweight proxy dependencies only when proxy execution begins."""
+    from .runtime import create_runtime
+    from .server import run_proxy
+
+    return create_runtime, run_proxy
 
 
 @app.callback()
@@ -104,7 +123,8 @@ def proxy(
             session_limit=session_limit,
         )
         socket_path = resolve_socket_path(effective.control_socket_path)
-        configure_logging()
+        _configure_proxy_logging()
+        create_runtime, run_proxy = _load_proxy_runtime()
         runtime = create_runtime(effective)
         run_proxy(runtime, socket_path)
     except KeyboardInterrupt:

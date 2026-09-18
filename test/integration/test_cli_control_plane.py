@@ -612,3 +612,35 @@ def test_foreground_proxy_serves_isolated_public_and_control_planes(
         _assert_ps_is_empty(tmp_path, executable, running)
         assert not fake_marker.exists(), "ambient PATH executable was invoked"
         _assert_clean_shutdown(running)
+
+
+def test_proxy_startup_uses_bundled_cost_map_without_remote_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    counting_http_server,
+) -> None:
+    monkeypatch.delenv("LITELLM_LOCAL_MODEL_COST_MAP", raising=False)
+    monkeypatch.setenv("LITELLM_MODEL_COST_MAP_URL", counting_http_server.url)
+    mapping_path = tmp_path / "models.json"
+    _write_mapping(mapping_path)
+    (tmp_path / "home").mkdir()
+
+    started = time.monotonic()
+    running = _start_proxy_with_retries(
+        tmp_path,
+        mapping_path,
+        _cli_executable(),
+    )
+    ready_in = time.monotonic() - started
+    try:
+        assert ready_in < 5.0
+        assert counting_http_server.request_count == 0
+        _assert_http_contract(running)
+        _assert_clean_shutdown(running)
+    finally:
+        stdout, stderr = _cleanup_running_proxy(running)
+
+    output = f"{stdout}\n{stderr}".casefold()
+    assert "model cost map" not in output
+    assert "failed to fetch remote" not in output
+    assert counting_http_server.request_count == 0
