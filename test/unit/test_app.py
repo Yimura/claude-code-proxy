@@ -147,3 +147,18 @@ def test_create_app_passes_runtime_sessions_to_middleware_and_router(
         "middleware": runtime.sessions,
         "router": runtime.sessions,
     }
+
+
+@pytest.mark.parametrize("path", ["/v1/health", "/v1/sessions"])
+async def test_public_app_does_not_expose_control_routes(tmp_path, path):
+    from httpx import ASGITransport, AsyncClient
+
+    runtime = runtime_module.create_runtime(settings(tmp_path))
+    application = app_module.create_app(runtime)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://public"
+    ) as client:
+        response = await client.get(path)
+
+    assert response.status_code == 404
