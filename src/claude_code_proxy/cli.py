@@ -340,11 +340,15 @@ def _agent_roots(
     covered: set[str] = set()
 
     def mark_descendants(agent_id: str) -> None:
-        if agent_id in covered:
-            return
-        covered.add(agent_id)
-        for child in children.get(agent_id, []):
-            mark_descendants(child.id)
+        pending = [agent_id]
+        while pending:
+            current = pending.pop()
+            if current in covered:
+                continue
+            covered.add(current)
+            pending.extend(
+                child.id for child in children.get(current, [])
+            )
 
     for root in roots:
         mark_descendants(root.id)
@@ -362,17 +366,16 @@ def _agent_rows(
 ) -> list[tuple[str, ...]]:
     roots, children = _agent_tree(agents)
     candidates = _agent_roots(roots, children, agents)
+    pending = [
+        (agent, "", index == len(candidates) - 1)
+        for index, agent in reversed(list(enumerate(candidates)))
+    ]
     rows: list[tuple[str, ...]] = []
     visited: set[str] = set()
-
-    def append_agent(
-        agent: AgentResponse,
-        prefix: str,
-        is_last: bool,
-        ancestors: frozenset[str],
-    ) -> None:
-        if agent.id in ancestors or agent.id in visited:
-            return
+    while pending:
+        agent, prefix, is_last = pending.pop()
+        if agent.id in visited:
+            continue
         visited.add(agent.id)
         connector = "└─ " if is_last else "├─ "
         rows.append(
@@ -386,21 +389,9 @@ def _agent_rows(
         )
         descendants = children.get(agent.id, [])
         next_prefix = prefix + ("   " if is_last else "│  ")
-        next_ancestors = ancestors | {agent.id}
-        for index, child in enumerate(descendants):
-            append_agent(
-                child,
-                next_prefix,
-                index == len(descendants) - 1,
-                next_ancestors,
-            )
-
-    for index, agent in enumerate(candidates):
-        append_agent(
-            agent,
-            "",
-            index == len(candidates) - 1,
-            frozenset(),
+        pending.extend(
+            (child, next_prefix, index == len(descendants) - 1)
+            for index, child in reversed(list(enumerate(descendants)))
         )
     return rows
 

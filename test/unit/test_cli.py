@@ -701,6 +701,20 @@ def test_ps_json_keeps_flat_agent_collection() -> None:
     assert payload[0]["agents"][0]["parent_id"] == "parent"
 
 
+
+def test_agent_tree_handles_deep_lineage_without_recursion():
+    agents = tuple(
+        agent(
+            f"agent-{index}",
+            parent_id=(f"agent-{index - 1}" if index else None),
+        )
+        for index in range(1_100)
+    )
+
+    rows = cli_module._agent_rows(agents, CAPTURED_AT, no_trunc=True)
+
+    assert len(rows) == len(agents)
+
 def test_ps_agent_cycles_and_orphans_render_once() -> None:
     agents = (
         agent("orphan", parent_id="missing"),
