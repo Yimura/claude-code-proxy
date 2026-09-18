@@ -802,6 +802,35 @@ def test_later_same_session_request_updates_metadata_and_request_count():
     assert snapshot.transport == "fake"
 
 
+
+def test_new_agent_log_uses_safe_agent_and_parent_ids(caplog):
+    sessions = registry()
+    raw_session = "raw-session-marker"
+    raw_agent = "raw-agent-marker"
+    raw_parent = "raw-parent-marker"
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="claude_code_proxy.logging.session",
+    ):
+        response = client(sessions=sessions).post(
+            "/v1/messages",
+            headers={
+                "x-claude-code-session-id": raw_session,
+                "x-claude-code-agent-id": raw_agent,
+                "x-claude-code-parent-agent-id": raw_parent,
+            },
+            json=messages_payload(),
+        )
+
+    assert response.status_code == 200
+    assert "[NEW AGENT]" in caplog.text
+    assert raw_session not in caplog.text
+    assert raw_agent not in caplog.text
+    assert raw_parent not in caplog.text
+    assert sessions.public_agent_id(raw_session, raw_agent)[:12] in caplog.text
+    assert sessions.public_agent_id(raw_session, raw_parent)[:12] in caplog.text
+
 def test_raw_session_id_is_absent_from_logs_and_safe_prefix_is_present(caplog):
     sessions = registry()
     raw_id = "raw-secret-session-value"
@@ -820,6 +849,8 @@ def test_raw_session_id_is_absent_from_logs_and_safe_prefix_is_present(caplog):
 
 _SENSITIVE_MARKERS = {
     "raw_session": "raw-session-sensitive-marker-10",
+    "raw_agent": "raw-agent-sensitive-marker-10",
+    "raw_parent_agent": "raw-parent-agent-sensitive-marker-10",
     "credential": "credential-sensitive-marker-10",
     "system": "system-sensitive-marker-10",
     "user": "user-sensitive-marker-10",
@@ -926,6 +957,8 @@ def test_sensitive_request_data_never_crosses_the_session_metadata_boundary(capl
         "authorization": f"Bearer {_SENSITIVE_MARKERS['credential']}",
         "x-api-key": _SENSITIVE_MARKERS["credential"],
         "x-claude-code-session-id": _SENSITIVE_MARKERS["raw_session"],
+        "x-claude-code-agent-id": _SENSITIVE_MARKERS["raw_agent"],
+        "x-claude-code-parent-agent-id": _SENSITIVE_MARKERS["raw_parent_agent"],
     }
 
     with caplog.at_level(logging.INFO, logger="claude_code_proxy"):
@@ -943,12 +976,22 @@ def test_sensitive_request_data_never_crosses_the_session_metadata_boundary(capl
     assert response.status_code == 200
     provider_payload = repr(provider.requests[0])
     for name, marker in _SENSITIVE_MARKERS.items():
-        if name not in {"credential", "raw_session"}:
+        if name not in {"credential", "raw_session", "raw_agent", "raw_parent_agent"}:
             assert marker in provider_payload
     assert _SENSITIVE_MARKERS["raw_session"] not in provider_payload
+    assert _SENSITIVE_MARKERS["raw_agent"] not in provider_payload
+    assert _SENSITIVE_MARKERS["raw_parent_agent"] not in provider_payload
 
     snapshot = sessions.snapshots()[0]
     safe_id = sessions.public_id(_SENSITIVE_MARKERS["raw_session"])
+    safe_agent_id = sessions.public_agent_id(
+        _SENSITIVE_MARKERS["raw_session"],
+        _SENSITIVE_MARKERS["raw_agent"],
+    )
+    safe_parent_id = sessions.public_agent_id(
+        _SENSITIVE_MARKERS["raw_session"],
+        _SENSITIVE_MARKERS["raw_parent_agent"],
+    )
     control, exposed_surfaces = _session_exposure_surfaces(sessions, caplog.text)
     for surface, content in exposed_surfaces.items():
         for marker in _SENSITIVE_MARKERS.values():
@@ -962,6 +1005,8 @@ def test_sensitive_request_data_never_crosses_the_session_metadata_boundary(capl
     assert safe_id in exposed_surfaces["full_table"]
     assert _SENSITIVE_MARKERS["raw_session"] not in exposed_surfaces["full_table"]
     assert safe_id in exposed_surfaces["json"]
+    assert safe_agent_id in exposed_surfaces["json"]
+    assert safe_parent_id in exposed_surfaces["json"]
     for value in ("claude-sonnet", "gpt-5.6-sol", "openai", "fake", "high"):
         assert value in exposed_surfaces["control"]
     assert set(control.json()["sessions"][0]) == _SESSION_RESPONSE_FIELDS
@@ -970,18 +1015,28 @@ def test_sensitive_request_data_never_crosses_the_session_metadata_boundary(capl
 def test_fallback_validation_log_uses_safe_id_without_registry_row(caplog):
     sessions = registry()
     raw_id = "raw-validation-session"
+    raw_agent = "raw-validation-agent"
+    raw_parent = "raw-validation-parent"
 
     with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
         response = client(sessions=sessions, with_middleware=True).post(
             "/v1/messages",
-            headers={"x-claude-code-session-id": f"  {raw_id}  "},
+            headers={
+                "x-claude-code-session-id": f"  {raw_id}  ",
+                "x-claude-code-agent-id": raw_agent,
+                "x-claude-code-parent-agent-id": raw_parent,
+            },
             json={"model": "model"},
         )
 
     assert response.status_code == 422
     assert sessions.snapshots() == []
     assert raw_id not in caplog.text
+    assert raw_agent not in caplog.text
+    assert raw_parent not in caplog.text
     assert sessions.public_id(raw_id)[:12] in caplog.text
+    assert sessions.public_agent_id(raw_id, raw_agent)[:12] in caplog.text
+    assert sessions.public_agent_id(raw_id, raw_parent)[:12] in caplog.text
 
 
 def test_fallback_exception_log_uses_safe_id_without_registry_row(

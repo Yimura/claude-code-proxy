@@ -11,7 +11,9 @@ from ..logging import (
     REQUEST_LOG_CONTEXT,
     client_identity_from_headers,
     RequestLogContext,
+    agent_identity,
     effective_effort,
+    log_agent_started,
     log_provider_failure,
     log_session_started,
     log_stream_failure,
@@ -214,6 +216,11 @@ def _observe_request(
     )
     context = RequestLogContext(
         session=identity,
+        agent=agent_identity(
+            observation.agent_public_id,
+            observation.parent_agent_public_id,
+            is_new=observation.agent_is_new,
+        ),
         method=raw_request.method,
         endpoint=raw_request.url.path,
         original_model=prepared.original_model,
@@ -228,6 +235,8 @@ def _record_context(raw_request: Request, context: RequestLogContext) -> None:
     setattr(raw_request.state, REQUEST_LOG_CONTEXT, context)
     if context.session.is_new:
         log_session_started(context)
+    if context.agent is not None and context.agent.is_new:
+        log_agent_started(context)
 
 
 def _log_provider_error(

@@ -11,8 +11,10 @@ from claude_code_proxy.domain.models import (
     TokenUsage,
 )
 from claude_code_proxy.logging import (
+    AgentIdentity,
     RequestLogContext,
     SessionIdentity,
+    agent_identity,
     client_identity_from_headers,
     configure_logging,
     effective_effort,
@@ -40,6 +42,22 @@ def make_context(identity: SessionIdentity | None = None) -> RequestLogContext:
     )
 
 
+
+
+def test_agent_identity_hides_raw_values():
+    identity = agent_identity(
+        "a" * 64,
+        "b" * 64,
+        is_new=True,
+        environ={"NO_COLOR": "1"},
+    )
+
+    assert identity == AgentIdentity(
+        label="a" * 12,
+        rendered=f"[agent {'a' * 12}]",
+        parent_label="b" * 12,
+        is_new=True,
+    )
 
 def test_client_identity_from_headers_reads_full_lineage():
     identity = client_identity_from_headers(
