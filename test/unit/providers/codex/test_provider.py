@@ -1,4 +1,5 @@
 from dataclasses import replace
+import json
 
 import pytest
 
@@ -193,16 +194,53 @@ async def test_stream_forwards_client_session_id_unchanged():
     assert Client.requests[0][2]["headers"]["session-id"] == "session-1"
 
 
-async def test_provider_segregates_different_client_sessions():
-    Client.responses = [completed_response(), completed_response()]
+async def test_root_and_agents_share_session_but_use_distinct_threads():
+    Client.responses = [
+        completed_response(),
+        completed_response(),
+        completed_response(),
+    ]
     provider = CodexProvider(Auth(), Client)
 
-    await collect(provider, request("parent-session"))
-    await collect(provider, request("subagent-session"))
+    await collect(
+        provider,
+        request(client_identity=ClientIdentity("session")),
+    )
+    await collect(
+        provider,
+        request(client_identity=ClientIdentity("session", "first")),
+    )
+    await collect(
+        provider,
+        request(client_identity=ClientIdentity("session", "second")),
+    )
 
-    assert [
-        call[2]["headers"]["session-id"] for call in Client.requests
-    ] == ["parent-session", "subagent-session"]
+    headers = [call[2]["headers"] for call in Client.requests]
+    payloads = [call[2]["json"] for call in Client.requests]
+    assert {item["session-id"] for item in headers} == {"session"}
+    assert {body["prompt_cache_key"] for body in payloads} == {"session"}
+    assert len({item["thread-id"] for item in headers}) == 3
+    assert all(
+        item["x-client-request-id"] == item["thread-id"]
+        for item in headers
+    )
+
+
+async def test_nested_agent_forwards_matching_parent_thread_metadata():
+    Client.responses = [completed_response()]
+    client_identity = ClientIdentity("session", "child", "parent")
+
+    await collect(
+        CodexProvider(Auth(), Client),
+        request(client_identity=client_identity),
+    )
+
+    outbound = Client.requests[0][2]
+    headers = outbound["headers"]
+    metadata = json.loads(
+        outbound["json"]["client_metadata"]["x-codex-turn-metadata"]
+    )
+    assert headers["x-codex-parent-thread-id"] == metadata["parent_thread_id"]
 
 
 async def test_headerless_requests_receive_distinct_fallback_sessions():
@@ -212,12 +250,10 @@ async def test_headerless_requests_receive_distinct_fallback_sessions():
     await collect(provider)
     await collect(provider)
 
-    first, second = [
-        call[2]["headers"]["session-id"] for call in Client.requests
-    ]
-    assert first != second
-    assert first
-    assert second
+    first, second = [call[2] for call in Client.requests]
+    assert first["headers"]["session-id"] != second["headers"]["session-id"]
+    assert first["headers"]["thread-id"] != second["headers"]["thread-id"]
+    assert first["json"]["prompt_cache_key"] != second["json"]["prompt_cache_key"]
 
 
 async def test_401_retry_reuses_client_session_id():
@@ -225,9 +261,12 @@ async def test_401_retry_reuses_client_session_id():
 
     await collect(CodexProvider(Auth(), Client), request("session-1"))
 
-    assert [
-        call[2]["headers"]["session-id"] for call in Client.requests
-    ] == ["session-1", "session-1"]
+    first, second = [call[2] for call in Client.requests]
+    assert first["headers"]["session-id"] == second["headers"]["session-id"] == "session-1"
+    assert first["headers"]["thread-id"] == second["headers"]["thread-id"]
+    assert first["headers"]["x-client-request-id"] == second["headers"]["x-client-request-id"]
+    assert first["json"]["prompt_cache_key"] == second["json"]["prompt_cache_key"]
+    assert first["json"]["client_metadata"] == second["json"]["client_metadata"]
 
 
 async def test_401_retry_reuses_generated_fallback_session_id():
@@ -235,11 +274,12 @@ async def test_401_retry_reuses_generated_fallback_session_id():
 
     await collect(CodexProvider(Auth(), Client))
 
-    first, second = [
-        call[2]["headers"]["session-id"] for call in Client.requests
-    ]
-    assert first == second
-    assert first
+    first, second = [call[2] for call in Client.requests]
+    assert first["headers"]["session-id"] == second["headers"]["session-id"]
+    assert first["headers"]["thread-id"] == second["headers"]["thread-id"]
+    assert first["headers"]["x-client-request-id"] == second["headers"]["x-client-request-id"]
+    assert first["json"]["prompt_cache_key"] == second["json"]["prompt_cache_key"]
+    assert first["json"]["client_metadata"] == second["json"]["client_metadata"]
 
 
 async def test_401_recovers_credentials_after_closing_response_and_retries_once():

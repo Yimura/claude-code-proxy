@@ -1,13 +1,15 @@
 from dataclasses import replace
+import json
 
 from claude_code_proxy.api.schemas import MessagesRequest
 from claude_code_proxy.api.translation import normalize_request, to_api_response
 
 from claude_code_proxy.domain.models import (
-    CompletionRequest, Message, RedactedThinking, RedactedThinkingBlock, StreamComplete, TextBlock, TextDelta, TokenUsage,
+    ClientIdentity, CompletionRequest, Message, RedactedThinking, RedactedThinkingBlock, StreamComplete, TextBlock, TextDelta, TokenUsage,
     ToolChoice, ToolDefinition, ToolInputDelta, ToolResultBlock, ToolUseBlock,
     ToolUseEnd, ToolUseStart,
 )
+from claude_code_proxy.providers.codex.identity import CodexIdentity
 from claude_code_proxy.providers.codex.reasoning import decode_reasoning, encode_reasoning
 from claude_code_proxy.providers.codex.translation import CodexEventTranslator, build_request, response_from_events
 from claude_code_proxy.reasoning import ReasoningPolicy
@@ -24,6 +26,25 @@ def request(**changes):
     )
     return replace(base, **changes)
 
+
+
+def test_build_request_adds_shared_cache_and_turn_metadata():
+    identity = CodexIdentity.from_client(
+        ClientIdentity("session", "agent", "parent")
+    )
+
+    payload = build_request(request(), identity)
+
+    assert payload["prompt_cache_key"] == "session"
+    assert payload["client_metadata"]["session_id"] == "session"
+    assert payload["client_metadata"]["thread_id"] == identity.thread_id
+    assert json.loads(
+        payload["client_metadata"]["x-codex-turn-metadata"]
+    ) == {
+        "parent_thread_id": identity.parent_thread_id,
+        "session_id": "session",
+        "thread_id": identity.thread_id,
+    }
 
 def test_build_request_maps_tools_messages_and_reasoning():
     body = build_request(request(

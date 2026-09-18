@@ -1,12 +1,11 @@
 """Codex subscription HTTP provider."""
 
-import uuid
-
 import httpx
 
 from ...domain.models import CompletionRequest, StreamError, StreamStart
 from ..base import ProviderError, protocol_error, stream_error_from_exception
 from .auth import CodexAuth
+from .identity import CodexIdentity
 from .orchestration import reconcile_codex_request
 from .translation import CodexEventTranslator, build_request, response_from_events
 
@@ -36,9 +35,9 @@ class CodexProvider:
     async def stream(self, request: CompletionRequest):
         try:
             request = reconcile_codex_request(request)
-            session_id = request.client_identity.session_id or str(uuid.uuid4())
+            identity = CodexIdentity.from_client(request.client_identity)
             access_token, account_id = await self._auth_credentials()
-            payload = build_request(request)
+            payload = build_request(request, identity)
             translator = CodexEventTranslator()
             async with self._client_factory(
                 timeout=httpx.Timeout(300.0, connect=30.0)
@@ -46,7 +45,9 @@ class CodexProvider:
                 for attempt in range(2):
                     retry_rejected = False
                     headers = self._build_headers(
-                        access_token, account_id, session_id
+                        access_token,
+                        account_id,
+                        identity,
                     )
                     async with client.stream(
                         "POST",
@@ -138,14 +139,22 @@ class CodexProvider:
             yield event_type or "", data
 
     def _build_headers(
-        self, access_token: str, account_id: str, session_id: str
-    ):
-        return {
+        self,
+        access_token: str,
+        account_id: str,
+        identity: CodexIdentity,
+    ) -> dict[str, str]:
+        headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
             "User-Agent": CODEX_USER_AGENT,
             "originator": "opencode",
             "x-codex-beta-features": "remote_compaction_v2",
             "chatgpt-account-id": account_id,
-            "session-id": session_id,
+            "session-id": identity.session_id,
+            "thread-id": identity.thread_id,
+            "x-client-request-id": identity.thread_id,
         }
+        if identity.parent_thread_id is not None:
+            headers["x-codex-parent-thread-id"] = identity.parent_thread_id
+        return headers

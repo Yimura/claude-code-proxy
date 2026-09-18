@@ -23,6 +23,7 @@ from ...domain.models import (
     ToolUseStart,
 )
 from ..usage import normalize_usage
+from .identity import CodexIdentity
 from .reasoning import decode_reasoning, encode_reasoning
 
 
@@ -44,12 +45,20 @@ def content_to_text(content: Any) -> str:
     return str(content)
 
 
-def build_request(request: CompletionRequest) -> dict[str, Any]:
+def build_request(
+    request: CompletionRequest,
+    identity: CodexIdentity | None = None,
+) -> dict[str, Any]:
+    resolved_identity = identity or CodexIdentity.from_client(
+        request.client_identity
+    )
     body: dict[str, Any] = {
         "model": request.model.removeprefix("openai/"),
         "input": _convert_messages(request),
         "store": False,
         "stream": True,
+        "prompt_cache_key": resolved_identity.session_id,
+        "client_metadata": resolved_identity.client_metadata(),
     }
     if request.reasoning.enabled and request.reasoning.effort:
         body["reasoning"] = {"effort": request.reasoning.effort}
