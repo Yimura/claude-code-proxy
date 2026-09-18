@@ -12,6 +12,7 @@ import threading
 import tomllib
 
 import pytest
+from click import unstyle
 from wcwidth import wcswidth
 from typer.testing import CliRunner
 
@@ -1200,9 +1201,10 @@ def test_command_help_lists_documented_options(command: str) -> None:
     result = runner.invoke(app, [command, "--help"])
 
     assert result.exit_code == 0
+    help_text = unstyle(result.stdout)
     if command == "proxy":
         for option in ("--host", "--port", "--socket", "--session-limit"):
-            assert option in result.stdout
+            assert option in help_text
     else:
         for option in ("--filter", "--format", "--no-trunc", "--socket"):
-            assert option in result.stdout
+            assert option in help_text

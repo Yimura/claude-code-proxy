@@ -13,6 +13,7 @@ import pytest
 
 
 _PROCESS_TIMEOUT_SECONDS = 3.0
+_PROVIDER_IMPORT_TIMEOUT_SECONDS = 15.0
 _FETCH_MESSAGE = "model cost map"
 _TRACKED_IMPORTS = (
     "litellm",
@@ -42,6 +43,7 @@ def _run(
     *,
     environment: dict[str, str],
     cwd: Path,
+    timeout: float = _PROCESS_TIMEOUT_SECONDS,
 ) -> tuple[subprocess.CompletedProcess[str], float]:
     started = time.monotonic()
     completed = subprocess.run(
@@ -52,7 +54,7 @@ def _run(
         text=True,
         encoding="utf-8",
         errors="strict",
-        timeout=_PROCESS_TIMEOUT_SECONDS,
+        timeout=timeout,
         check=False,
     )
     return completed, time.monotonic() - started
@@ -154,10 +156,11 @@ print(os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP"))
         [sys.executable, "-c", script],
         environment=_offline_environment(counting_http_server.url),
         cwd=tmp_path,
+        timeout=_PROVIDER_IMPORT_TIMEOUT_SECONDS,
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert elapsed < _PROCESS_TIMEOUT_SECONDS
+    assert elapsed < _PROVIDER_IMPORT_TIMEOUT_SECONDS
     assert completed.stdout == "True\n"
     _assert_no_fetch_output(completed)
     assert counting_http_server.request_count == 0

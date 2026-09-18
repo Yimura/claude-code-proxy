@@ -27,6 +27,7 @@ def rendered_compose(tmp_path: Path, port: str | None = None) -> dict:
     ):
         shutil.copy2(ROOT / name, project / name)
     assert not (project / ".env").exists()
+    (project / ".env").write_text("")
 
     env_file = tmp_path / "compose.env"
     env_file.write_text("")

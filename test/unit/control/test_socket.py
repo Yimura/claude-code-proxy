@@ -615,7 +615,6 @@ def test_matching_dead_prior_metadata_reclaims_refused_socket(
     stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     stale.bind(str(path))
     stale.close()
-    old_inode = path.lstat().st_ino
     dead_pid = 4242
     _write_prior_metadata(
         path,
@@ -628,8 +627,14 @@ def test_matching_dead_prior_metadata_reclaims_refused_socket(
     )
     _set_process_identity_seams(monkeypatch, pid_ticks={dead_pid: None})
 
-    with SocketLease.acquire(path):
-        assert path.lstat().st_ino != old_inode
+    with SocketLease.acquire(path) as lease:
+        _connect_and_accept(path, lease.socket)
+        metadata = json.loads(path.with_name("control.lock").read_text())
+        identity = path.lstat()
+        assert (metadata["socket_dev"], metadata["socket_ino"]) == (
+            identity.st_dev,
+            identity.st_ino,
+        )
 
 
 def test_bound_unlistening_socket_without_proof_is_preserved(
@@ -689,7 +694,6 @@ def test_pid_reuse_start_tick_mismatch_allows_recovery(
     endpoint.bind(str(path))
     endpoint.close()
     owner_pid = 4242
-    old_inode = path.lstat().st_ino
     _write_prior_metadata(
         path,
         _prior_metadata(
@@ -701,8 +705,14 @@ def test_pid_reuse_start_tick_mismatch_allows_recovery(
     )
     _set_process_identity_seams(monkeypatch, pid_ticks={owner_pid: 222})
 
-    with SocketLease.acquire(path):
-        assert path.lstat().st_ino != old_inode
+    with SocketLease.acquire(path) as lease:
+        _connect_and_accept(path, lease.socket)
+        metadata = json.loads(path.with_name("control.lock").read_text())
+        identity = path.lstat()
+        assert (metadata["socket_dev"], metadata["socket_ino"]) == (
+            identity.st_dev,
+            identity.st_ino,
+        )
 
 
 @pytest.mark.parametrize("metadata_kind", ["malformed", "wrong-inode"])
