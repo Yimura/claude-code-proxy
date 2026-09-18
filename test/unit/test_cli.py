@@ -25,7 +25,7 @@ from claude_code_proxy.control.client import (
     ControlUnavailable,
     IncompatibleProtocol,
 )
-from claude_code_proxy.control.schemas import SessionListResponse, SessionResponse
+from claude_code_proxy.control.schemas import AgentResponse, SessionListResponse, SessionResponse
 
 
 runner = CliRunner()
@@ -64,6 +64,7 @@ def session(
     active_requests: int = 0,
     requests: int = 3,
     seconds_ago: int = 0,
+    agents: tuple[AgentResponse, ...] = (),
 ) -> SessionResponse:
     return SessionResponse(
         id=identifier,
@@ -80,6 +81,35 @@ def session(
         last_seen=CAPTURED_AT - timedelta(seconds=seconds_ago),
         elapsed_seconds=7200,
         last_result="completed",
+        agents=agents,
+    )
+
+
+def agent(
+    identifier: str,
+    *,
+    parent_id: str | None = None,
+    seconds_ago: int = 0,
+    state: str = "idle",
+    requests: int = 1,
+) -> AgentResponse:
+    observed = CAPTURED_AT - timedelta(seconds=seconds_ago)
+    return AgentResponse(
+        id=identifier,
+        parent_id=parent_id,
+        state=state,
+        active_requests=1 if state == "active" else 0,
+        requests=requests,
+        client_model="claude-sonnet",
+        model="gpt-5.6-sol",
+        provider="openai",
+        transport="codex",
+        effort="high",
+        context_window=1_000_000,
+        first_seen=observed,
+        last_seen=observed,
+        elapsed_seconds=1.0,
+        last_result=None if state == "active" else "completed",
     )
 
 
@@ -637,6 +667,55 @@ def test_ps_accepts_filter_count_and_length_boundaries() -> None:
     assert len(FakeClient.instances[0].filters[-1]) == 256
 
 
+
+def test_ps_table_renders_nested_agents_parent_before_child() -> None:
+    parent = agent("parent-agent")
+    child = agent("child-agent", parent_id="parent-agent")
+    FakeClient.result = response(
+        session("session-id", agents=(child, parent))
+    )
+
+    result = runner.invoke(app, ["ps", "--no-trunc"])
+
+    assert result.exit_code == 0
+    assert "SESSION / AGENT" in result.stdout
+    assert result.stdout.index("parent-agent") < result.stdout.index("child-agent")
+    assert "└─ parent-agent" in result.stdout
+    assert "   └─ child-agent" in result.stdout
+
+
+def test_ps_json_keeps_flat_agent_collection() -> None:
+    FakeClient.result = response(
+        session(
+            "session-id",
+            agents=(agent("child", parent_id="parent"),),
+        )
+    )
+
+    result = runner.invoke(app, ["ps", "--format", "json"])
+    payload = json.loads(result.stdout)
+
+    assert result.exit_code == 0
+    assert len(payload[0]["agents"]) == 1
+    assert payload[0]["agents"][0]["id"] == "child"
+    assert payload[0]["agents"][0]["parent_id"] == "parent"
+
+
+def test_ps_agent_cycles_and_orphans_render_once() -> None:
+    agents = (
+        agent("orphan", parent_id="missing"),
+        agent("self", parent_id="self"),
+        agent("cycle-a", parent_id="cycle-b"),
+        agent("cycle-b", parent_id="cycle-a"),
+    )
+    FakeClient.result = response(session("session-id", agents=agents))
+
+    result = runner.invoke(app, ["ps", "--no-trunc"])
+
+    assert result.exit_code == 0
+    for item in agents:
+        assert result.stdout.count(item.id) == 1
+
 def test_ps_table_has_exact_headers_and_preserves_server_order() -> None:
     FakeClient.result = response(
         session("b" * 64, model="newest-model", seconds_ago=0),
@@ -649,6 +728,8 @@ def test_ps_table_has_exact_headers_and_preserves_server_order() -> None:
     lines = result.stdout.splitlines()
     assert lines[0].split() == [
         "SESSION",
+        "/",
+        "AGENT",
         "MODEL",
         "STATE",
         "EFFORT",

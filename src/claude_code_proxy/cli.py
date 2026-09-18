@@ -21,7 +21,7 @@ from .control.client import (
     ControlUnavailable,
     IncompatibleProtocol,
 )
-from .control.schemas import SessionListResponse, SessionResponse
+from .control.schemas import AgentResponse, SessionListResponse, SessionResponse
 from .control.socket import resolve_socket_path
 from .limits import MAX_CONTROL_INTEGER
 from .text_safety import escaped_text_atom, unicode_escape_atom
@@ -40,7 +40,7 @@ _EFFORT_DISPLAY_LENGTH = 12
 _DISPLAY_ATOMS_PER_CELL = 4
 _ERROR_DISPLAY_LENGTH = 400
 _HEADERS = (
-    "SESSION",
+    "SESSION / AGENT",
     "MODEL",
     "STATE",
     "EFFORT",
@@ -250,10 +250,23 @@ def _render_sessions(
 
 
 def _render_table(result: SessionListResponse, no_trunc: bool) -> str:
-    rows = [
-        _session_row(item, result.captured_at, no_trunc)
-        for item in result.sessions
-    ]
+    rows: list[tuple[str, ...]] = []
+    for session in result.sessions:
+        rows.append(
+            _activity_row(
+                session,
+                session.id,
+                result.captured_at,
+                no_trunc,
+            )
+        )
+        rows.extend(
+            _agent_rows(
+                session.agents,
+                result.captured_at,
+                no_trunc,
+            )
+        )
     widths = [
         max(
             _display_width(header),
@@ -268,29 +281,128 @@ def _render_table(result: SessionListResponse, no_trunc: bool) -> str:
     return "\n".join(lines)
 
 
-def _session_row(
-    session: SessionResponse,
+def _activity_row(
+    activity: SessionResponse | AgentResponse,
+    identifier: str,
     captured_at: datetime,
     no_trunc: bool,
+    prefix: str = "",
 ) -> tuple[str, ...]:
     if no_trunc:
-        identifier = _terminal_text(session.id)
-        model = _terminal_text(session.model)
-        effort = _terminal_text(session.effort)
+        rendered_id = _terminal_text(identifier)
+        model = _terminal_text(activity.model)
+        effort = _terminal_text(activity.effort)
     else:
-        identifier = _terminal_text(session.id, maximum=12, ellipsis=False)
-        model = _terminal_text(session.model, maximum=_MODEL_DISPLAY_LENGTH)
-        effort = _terminal_text(session.effort, maximum=_EFFORT_DISPLAY_LENGTH)
+        rendered_id = _terminal_text(identifier, maximum=12, ellipsis=False)
+        model = _terminal_text(activity.model, maximum=_MODEL_DISPLAY_LENGTH)
+        effort = _terminal_text(activity.effort, maximum=_EFFORT_DISPLAY_LENGTH)
     return (
-        identifier,
+        prefix + rendered_id,
         model,
-        _terminal_text(session.state),
+        _terminal_text(activity.state),
         effort,
-        _format_context(session.context_window),
-        _format_count(session.active_requests),
-        _format_count(session.requests),
-        _format_relative_time(session.last_seen, captured_at),
+        _format_context(activity.context_window),
+        _format_count(activity.active_requests),
+        _format_count(activity.requests),
+        _format_relative_time(activity.last_seen, captured_at),
     )
+
+
+def _ordered_agents(agents: list[AgentResponse]) -> list[AgentResponse]:
+    by_id = sorted(agents, key=lambda item: item.id)
+    return sorted(by_id, key=lambda item: item.last_seen, reverse=True)
+
+
+def _agent_tree(
+    agents: tuple[AgentResponse, ...],
+) -> tuple[list[AgentResponse], dict[str, list[AgentResponse]]]:
+    by_id = {agent.id: agent for agent in agents}
+    children: dict[str, list[AgentResponse]] = {}
+    roots: list[AgentResponse] = []
+    for agent in agents:
+        parent_id = agent.parent_id
+        if parent_id is None or parent_id == agent.id or parent_id not in by_id:
+            roots.append(agent)
+            continue
+        children.setdefault(parent_id, []).append(agent)
+    return _ordered_agents(roots), {
+        parent_id: _ordered_agents(items)
+        for parent_id, items in children.items()
+    }
+
+
+def _agent_roots(
+    roots: list[AgentResponse],
+    children: dict[str, list[AgentResponse]],
+    agents: tuple[AgentResponse, ...],
+) -> list[AgentResponse]:
+    candidates = list(roots)
+    covered: set[str] = set()
+
+    def mark_descendants(agent_id: str) -> None:
+        if agent_id in covered:
+            return
+        covered.add(agent_id)
+        for child in children.get(agent_id, []):
+            mark_descendants(child.id)
+
+    for root in roots:
+        mark_descendants(root.id)
+    for agent in _ordered_agents(list(agents)):
+        if agent.id not in covered:
+            candidates.append(agent)
+            mark_descendants(agent.id)
+    return candidates
+
+
+def _agent_rows(
+    agents: tuple[AgentResponse, ...],
+    captured_at: datetime,
+    no_trunc: bool,
+) -> list[tuple[str, ...]]:
+    roots, children = _agent_tree(agents)
+    candidates = _agent_roots(roots, children, agents)
+    rows: list[tuple[str, ...]] = []
+    visited: set[str] = set()
+
+    def append_agent(
+        agent: AgentResponse,
+        prefix: str,
+        is_last: bool,
+        ancestors: frozenset[str],
+    ) -> None:
+        if agent.id in ancestors or agent.id in visited:
+            return
+        visited.add(agent.id)
+        connector = "└─ " if is_last else "├─ "
+        rows.append(
+            _activity_row(
+                agent,
+                agent.id,
+                captured_at,
+                no_trunc,
+                prefix + connector,
+            )
+        )
+        descendants = children.get(agent.id, [])
+        next_prefix = prefix + ("   " if is_last else "│  ")
+        next_ancestors = ancestors | {agent.id}
+        for index, child in enumerate(descendants):
+            append_agent(
+                child,
+                next_prefix,
+                index == len(descendants) - 1,
+                next_ancestors,
+            )
+
+    for index, agent in enumerate(candidates):
+        append_agent(
+            agent,
+            "",
+            index == len(candidates) - 1,
+            frozenset(),
+        )
+    return rows
 
 
 def _table_line(values: tuple[str, ...], widths: list[int]) -> str:
