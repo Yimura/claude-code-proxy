@@ -10,7 +10,9 @@ from typing import Literal
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .limits import MAX_CONTROL_INTEGER
 from .reasoning import MappingEntry, parse_model_mappings
+from .text_safety import log_text
 
 logger = logging.getLogger(__name__)
 OpenAITransport = Literal["litellm", "codex"]
@@ -22,7 +24,7 @@ class ModelDefinition(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     target: str
-    context_window: int | None = Field(strict=True, gt=0)
+    context_window: int | None = Field(strict=True, gt=0, le=MAX_CONTROL_INTEGER)
 
     @model_validator(mode="after")
     def validate_target(self) -> "ModelDefinition":
@@ -74,10 +76,14 @@ class Settings:
     openai_transport: OpenAITransport
     opencode_data_dir: Path
     model_mapping_path: Path
+    proxy_host: str = "0.0.0.0"
+    proxy_port: int = 8082
+    control_socket_path: Path | None = None
+    session_retention_limit: int = 1000
 
     @classmethod
     def from_environment(cls) -> "Settings":
-        load_dotenv()
+        load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
         transport = os.environ.get("OPENAI_TRANSPORT", "litellm").lower()
         if transport not in ("litellm", "codex"):
             raise ValueError(
@@ -95,7 +101,48 @@ class Settings:
             openai_transport=transport,
             opencode_data_dir=Path(os.environ.get("OPENCODE_DATA_DIR", "~/.local/share/opencode")).expanduser(),
             model_mapping_path=Path(os.environ.get("MODEL_MAPPING_PATH", "model_mapping.json")),
+            proxy_host=os.environ.get("PROXY_HOST", "0.0.0.0"),
+            proxy_port=_proxy_port_from_environment(),
+            control_socket_path=_control_socket_path_from_environment(),
+            session_retention_limit=_session_retention_limit_from_environment(),
         )
+
+
+def _proxy_port_from_environment() -> int:
+    raw = os.environ.get("PROXY_PORT", "8082")
+    try:
+        port = int(raw)
+    except ValueError as error:
+        raise ValueError("PROXY_PORT must be an integer") from error
+    if not 1 <= port <= 65535:
+        raise ValueError("PROXY_PORT must be between 1 and 65535")
+    return port
+
+
+def _control_socket_path_from_environment() -> Path | None:
+    raw = os.environ.get("CONTROL_SOCKET_PATH")
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value:
+        raise ValueError("CONTROL_SOCKET_PATH must not be empty")
+    return Path(value).expanduser()
+
+
+def _session_retention_limit_from_environment() -> int:
+    raw = os.environ.get("SESSION_RETENTION_LIMIT", "1000")
+    try:
+        limit = int(raw)
+    except ValueError as error:
+        raise ValueError(
+            "SESSION_RETENTION_LIMIT must be a non-negative integer"
+        ) from error
+    if not 0 <= limit <= MAX_CONTROL_INTEGER:
+        raise ValueError(
+            "SESSION_RETENTION_LIMIT must be between 0 and "
+            f"{MAX_CONTROL_INTEGER}"
+        )
+    return limit
 
 
 def parse_model_mapping_config(data: object) -> ModelConfig:
@@ -169,7 +216,10 @@ def load_model_mapping(path: Path) -> ModelConfig:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        logger.warning("Model mapping file not found at %s, using defaults", path)
+        logger.warning(
+            "Model mapping file not found at %s, using defaults",
+            log_text(str(path)),
+        )
         return ModelConfig(
             models=DEFAULT_MODEL_CONFIG.models.copy(),
             tiers=DEFAULT_MODEL_CONFIG.tiers.copy(),

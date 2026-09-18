@@ -1,31 +1,34 @@
+import asyncio
 import logging
-from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from claude_code_proxy.domain.models import StreamError, TextDelta
+from claude_code_proxy.domain.models import (
+    StreamComplete,
+    StreamError,
+    TextDelta,
+    TokenUsage,
+)
 from claude_code_proxy.logging import (
     RequestLogContext,
     SessionIdentity,
-    SessionTracker,
+    configure_logging,
     effective_effort,
+    log_provider_failure,
+    log_session_started,
+    log_stream_failure,
+    log_unexpected_failure,
     observe_stream,
     palette_index,
+    session_identity,
 )
 from claude_code_proxy.reasoning import ReasoningPolicy
 
 
-class Stream:
-    def __init__(self, tty: bool) -> None:
-        self.tty = tty
-
-    def isatty(self) -> bool:
-        return self.tty
-
-
-def make_context() -> RequestLogContext:
+def make_context(identity: SessionIdentity | None = None) -> RequestLogContext:
     return RequestLogContext(
-        session=SessionIdentity("abcdef12", "[session abcdef12]", False),
+        session=identity
+        or SessionIdentity("abcdef123456", "[session abcdef123456]", False),
         method="POST",
         endpoint="/v1/messages",
         original_model="claude-sonnet",
@@ -35,53 +38,52 @@ def make_context() -> RequestLogContext:
     )
 
 
+def test_configure_logging_exposes_readiness_info_and_keeps_uvicorn_quiet():
+    configure_logging()
+
+    assert logging.getLogger(
+        "claude_code_proxy.logging.readiness"
+    ).isEnabledFor(logging.INFO)
+    assert not logging.getLogger("uvicorn").isEnabledFor(logging.INFO)
+    assert not logging.getLogger("uvicorn.access").isEnabledFor(logging.INFO)
+    assert not logging.getLogger("uvicorn.error").isEnabledFor(logging.INFO)
+
+
 def test_palette_index_is_stable_and_bounded():
-    first = palette_index("session-123")
-    assert first == palette_index("session-123")
+    first = palette_index("safe-public-id")
+    assert first == palette_index("safe-public-id")
     assert 0 <= first < 5
 
 
-def test_session_label_is_colored_for_non_tty_log_pipe():
-    identity = SessionTracker(Stream(False), environ={}).observe("abcdef123456")
-    assert identity.rendered.startswith("[session \033[")
-    assert identity.rendered.endswith("abcdef12\033[0m]")
-
-
-def test_session_label_is_colored_for_tty():
-    identity = SessionTracker(Stream(True), environ={}).observe("abcdef123456")
-    assert identity.rendered.startswith("[session \033[")
-    assert identity.rendered.endswith("abcdef12\033[0m]")
-
-
-def test_no_color_disables_color_for_non_tty_log_pipe():
-    identity = SessionTracker(Stream(False), environ={"NO_COLOR": "1"}).observe(
-        "abcdef123456"
+def test_session_identity_uses_twelve_character_safe_public_label():
+    identity = session_identity(
+        "abcdef1234567890", request_scoped=False, is_new=True, environ={}
     )
-    assert identity.rendered == "[session abcdef12]"
+
+    assert identity.label == "abcdef123456"
+    assert identity.rendered.endswith("abcdef123456\033[0m]")
+    assert identity.is_new is True
 
 
-def test_first_observation_marks_session_new_once():
-    tracker = SessionTracker(Stream(False), environ={})
-    assert tracker.observe("session-123").is_new is True
-    assert tracker.observe("session-123").is_new is False
+def test_request_scoped_identity_is_clearly_marked():
+    identity = session_identity(
+        "abcdef1234567890", request_scoped=True, is_new=True, environ={}
+    )
+
+    assert identity.label == "abcdef123456"
+    assert identity.rendered.startswith("[request \033[")
+    assert identity.is_new is True
 
 
-def test_concurrent_observation_marks_session_new_once():
-    tracker = SessionTracker(Stream(False), environ={})
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        observations = list(pool.map(tracker.observe, ["session-123"] * 32))
-    assert sum(item.is_new for item in observations) == 1
+def test_no_color_disables_identity_color():
+    identity = session_identity(
+        "abcdef1234567890",
+        request_scoped=False,
+        is_new=False,
+        environ={"NO_COLOR": "1"},
+    )
 
-
-def test_missing_session_uses_unique_unregistered_request_labels():
-    tracker = SessionTracker(Stream(False), environ={})
-    first = tracker.observe(None)
-    second = tracker.observe("")
-    assert first.label.startswith("req-")
-    assert second.label.startswith("req-")
-    assert first.label != second.label
-    assert first.is_new is False
-    assert second.is_new is False
+    assert identity.rendered == "[session abcdef123456]"
 
 
 @pytest.mark.parametrize(
@@ -97,13 +99,80 @@ def test_effective_effort(policy, expected):
     assert effective_effort(policy) == expected
 
 
+def test_untrusted_log_context_escapes_record_and_terminal_controls(caplog):
+    hostile = "field\n\r\t\x1b\x85\u2028\u2029\u202e\ud800"
+    context = RequestLogContext(
+        session=SessionIdentity("safe", "[session safe]", True),
+        method=hostile,
+        endpoint=hostile,
+        original_model=hostile,
+        upstream_model=hostile,
+        provider=hostile,
+        effort=hostile,
+    )
+
+    with caplog.at_level(logging.INFO):
+        log_session_started(context)
+        log_provider_failure(context, 503)
+        log_stream_failure(
+            context,
+            StreamError(error_type=hostile, provider=hostile),
+        )
+        log_unexpected_failure(context, hostile)
+
+    rendered = caplog.text
+    for token in (
+        "\\x0a",
+        "\\x0d",
+        "\\x09",
+        "\\x1b",
+        "\\x85",
+        "\\u2028",
+        "\\u2029",
+        "\\u202e",
+        "\\ud800",
+    ):
+        assert token in rendered
+    for control in ("\r", "\t", "\x1b", "\x85", "\u2028", "\u2029", "\u202e", "\ud800"):
+        assert control not in rendered
+    assert "field\n" not in rendered
+    rendered.encode("utf-8", errors="strict")
+
+
+def test_application_generated_session_ansi_is_preserved(caplog):
+    context = make_context(
+        SessionIdentity("abcdef123456", "[session \x1b[96mabcdef123456\x1b[0m]", True)
+    )
+
+    with caplog.at_level(
+        logging.INFO, logger="claude_code_proxy.logging.session"
+    ):
+        log_session_started(context)
+
+    assert "\x1b[96mabcdef123456\x1b[0m" in caplog.records[-1].getMessage()
+
+
 async def iter_events(events):
     for event in events:
         yield event
 
 
 @pytest.mark.asyncio
-async def test_observe_stream_logs_semantic_error_and_preserves_events(caplog):
+async def test_observe_stream_preserves_terminal_event():
+    complete = StreamComplete("end_turn", TokenUsage(2, 1))
+
+    observed = [
+        event
+        async for event in observe_stream(
+            iter_events([TextDelta("hello"), complete]), make_context()
+        )
+    ]
+
+    assert observed == [TextDelta("hello"), complete]
+
+
+@pytest.mark.asyncio
+async def test_observe_stream_logs_semantic_error_once_and_preserves_events(caplog):
     error = StreamError(
         error_type="api_error",
         message="Internal server error",
@@ -113,8 +182,10 @@ async def test_observe_stream_logs_semantic_error_and_preserves_events(caplog):
     events = [TextDelta("hello"), error]
     with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
         observed = [
-            event async for event in observe_stream(iter_events(events), make_context())
+            event
+            async for event in observe_stream(iter_events(events), make_context())
         ]
+
     assert observed == events
     assert caplog.text.count("provider stream failed") == 1
     assert "error=api_error" in caplog.text
@@ -137,11 +208,35 @@ class ClosableEvents:
 
 
 @pytest.mark.asyncio
-async def test_closing_observer_closes_wrapped_iterator():
+async def test_closing_observer_closes_upstream_iterator():
     events = ClosableEvents()
     observed = observe_stream(events, make_context())
 
     await anext(observed)
     await observed.aclose()
+
+    assert events.closed is True
+
+
+class CancelledEvents:
+    def __init__(self):
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise asyncio.CancelledError
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_observe_stream_does_not_swallow_cancellation():
+    events = CancelledEvents()
+
+    with pytest.raises(asyncio.CancelledError):
+        await anext(observe_stream(events, make_context()))
 
     assert events.closed is True

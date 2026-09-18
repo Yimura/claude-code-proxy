@@ -4,14 +4,17 @@ services:
     restart: unless-stopped
     env_file: .env
     ports:
-      - "127.0.0.1:8082:8082"
+      - "127.0.0.1:${PROXY_PORT:-8082}:${PROXY_PORT:-8082}"
     volumes:
       - ${OPENCODE_DATA_DIR:-~/.local/share/opencode}:/opencode-auth:ro
     configs:
       - source: model_mapping
         target: /claude-code-proxy/model_mapping.json
     environment:
-      - OPENCODE_DATA_DIR=/opencode-auth
+      PROXY_HOST: 0.0.0.0
+      PROXY_PORT: ${PROXY_PORT:-8082}
+      OPENCODE_DATA_DIR: /opencode-auth
+      CONTROL_SOCKET_PATH: /run/claude-code-proxy/control.sock
 
 configs:
   model_mapping:

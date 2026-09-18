@@ -68,6 +68,7 @@ class CompletionRequest:
     max_tokens: int
     messages: tuple[Message, ...]
     reasoning: ReasoningPolicy
+    context_window: int | None = None
     session_id: str | None = None
     system: tuple[TextBlock, ...] = ()
     tools: tuple[ToolDefinition, ...] = ()
