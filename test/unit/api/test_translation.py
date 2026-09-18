@@ -592,6 +592,142 @@ class FutureEvents:
         self.closed = True
 
 
+class MalformedClosableEvents:
+    def __init__(self):
+        self.events = iter(
+            [
+                ToolUseStart("slot", "tool-1", "lookup"),
+                StreamComplete("tool_use", TokenUsage(1, 1)),
+            ]
+        )
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self.events)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_serialize_stream_ignores_ordinary_error_callback_failure():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    events = MalformedClosableEvents()
+
+    def fail_callback(_error):
+        raise OSError("logging sink unavailable")
+
+    frames = [
+        frame
+        async for frame in serialize_stream(
+            normalized,
+            events,
+            on_error=fail_callback,
+        )
+    ]
+
+    assert event_names(frames)[-1] == "error"
+    assert "data: [DONE]\n\n" not in frames
+    assert events.closed is True
+
+
+@pytest.mark.asyncio
+async def test_serialize_stream_does_not_suppress_callback_cancellation():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    events = MalformedClosableEvents()
+
+    def cancel_callback(_error):
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        _ = [
+            frame
+            async for frame in serialize_stream(
+                normalized,
+                events,
+                on_error=cancel_callback,
+            )
+        ]
+
+    assert events.closed is True
+
+
+@pytest.mark.asyncio
+async def test_serialize_stream_reports_synthesized_state_error():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    errors = []
+    events = event_source(
+        ToolUseStart("slot", "tool-1", "lookup"),
+        StreamComplete("tool_use", TokenUsage(1, 1)),
+    )
+
+    frames = [
+        frame
+        async for frame in serialize_stream(
+            normalized,
+            events,
+            on_error=errors.append,
+        )
+    ]
+
+    assert event_names(frames)[-1] == "error"
+    assert len(errors) == 1
+    assert errors[0].diagnostic == "stream completed with open tool blocks"
+
+
+@pytest.mark.asyncio
+async def test_serialize_stream_reports_synthesized_eof_error():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    errors = []
+
+    frames = [
+        frame
+        async for frame in serialize_stream(
+            normalized,
+            event_source(TextDelta("partial")),
+            on_error=errors.append,
+        )
+    ]
+
+    assert event_names(frames)[-1] == "error"
+    assert len(errors) == 1
+    assert errors[0].diagnostic == "stream ended without terminal outcome"
+
+
+@pytest.mark.asyncio
+async def test_serialize_stream_does_not_report_upstream_error_as_synthesized():
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+    errors = []
+
+    frames = [
+        frame
+        async for frame in serialize_stream(
+            normalized,
+            event_source(StreamError(diagnostic="upstream failed")),
+            on_error=errors.append,
+        )
+    ]
+
+    assert event_names(frames)[-1] == "error"
+    assert errors == []
+
+
 @pytest.mark.asyncio
 async def test_stream_accepts_future_backed_async_iterator():
     normalized = normalize_request(

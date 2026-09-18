@@ -5,11 +5,10 @@ from dataclasses import dataclass
 import hashlib
 import logging
 import os
-import sys
-import threading
 import uuid
 
 from .domain.models import StreamError, StreamEvent
+from .observability import SessionRegistry
 from .providers.base import ProviderError
 from .reasoning import ReasoningPolicy
 
@@ -79,32 +78,22 @@ def palette_index(identifier: str) -> int:
     return int.from_bytes(digest[:8], "big") % len(SESSION_COLORS)
 
 
-class SessionTracker:
-    def __init__(self, stream=None, environ: Mapping[str, str] | None = None) -> None:
-        self._stream = stream or sys.stderr
-        self._environ = os.environ if environ is None else environ
-        self._seen: set[str] = set()
-        self._lock = threading.Lock()
-
-    def observe(self, identifier: str | None) -> SessionIdentity:
-        identifier = identifier.strip() if identifier else ""
-        if not identifier:
-            label = f"req-{uuid.uuid4().hex[:8]}"
-            return SessionIdentity(label, f"[request {label}]", False)
-
-        with self._lock:
-            is_new = identifier not in self._seen
-            self._seen.add(identifier)
-
-        label = identifier[:8]
-        rendered_label = label
-        if self._color_enabled():
-            color = SESSION_COLORS[palette_index(identifier)]
-            rendered_label = f"{color}{label}{_RESET}"
-        return SessionIdentity(label, f"[session {rendered_label}]", is_new)
-
-    def _color_enabled(self) -> bool:
-        return "NO_COLOR" not in self._environ
+def session_identity(
+    public_id: str,
+    *,
+    request_scoped: bool,
+    is_new: bool,
+    environ: Mapping[str, str] | None = None,
+) -> SessionIdentity:
+    """Render an opaque registry ID without exposing its source identifier."""
+    label = public_id[:12]
+    rendered_label = label
+    environment = os.environ if environ is None else environ
+    if "NO_COLOR" not in environment:
+        color = SESSION_COLORS[palette_index(public_id)]
+        rendered_label = f"{color}{label}{_RESET}"
+    scope = "request" if request_scoped else "session"
+    return SessionIdentity(label, f"[{scope} {rendered_label}]", is_new)
 
 
 def effective_effort(policy: ReasoningPolicy) -> str:
@@ -192,7 +181,9 @@ def log_unexpected_failure(context: RequestLogContext, error_type: str) -> None:
     )
 
 
-def log_http_failure(request, session_tracker: SessionTracker, status_code: int) -> None:
+def log_http_failure(
+    request, sessions: SessionRegistry, status_code: int
+) -> None:
     context = getattr(request.state, REQUEST_LOG_CONTEXT, None)
     if context is not None:
         logger.warning(
@@ -209,7 +200,13 @@ def log_http_failure(request, session_tracker: SessionTracker, status_code: int)
         )
         return
 
-    session = session_tracker.observe(request.headers.get(SESSION_HEADER))
+    raw_id = (request.headers.get(SESSION_HEADER) or "").strip()
+    source_id = raw_id or uuid.uuid4().hex
+    session = session_identity(
+        sessions.public_id(source_id),
+        request_scoped=not raw_id,
+        is_new=False,
+    )
     logger.warning(
         "%s %s %s HTTP request failed status=%s",
         session.rendered,
@@ -220,14 +217,20 @@ def log_http_failure(request, session_tracker: SessionTracker, status_code: int)
 
 
 def log_middleware_exception(
-    request, session_tracker: SessionTracker, error_type: str
+    request, sessions: SessionRegistry, error_type: str
 ) -> None:
     context = getattr(request.state, REQUEST_LOG_CONTEXT, None)
     if context is not None:
         log_unexpected_failure(context, error_type)
         return
 
-    session = session_tracker.observe(request.headers.get(SESSION_HEADER))
+    raw_id = (request.headers.get(SESSION_HEADER) or "").strip()
+    source_id = raw_id or uuid.uuid4().hex
+    session = session_identity(
+        sessions.public_id(source_id),
+        request_scoped=not raw_id,
+        is_new=False,
+    )
     logger.error(
         "%s %s %s unexpected HTTP failure error=%s",
         session.rendered,
@@ -237,15 +240,13 @@ def log_middleware_exception(
     )
 
 
-def request_logging_middleware(session_tracker: SessionTracker):
+def request_logging_middleware(sessions: SessionRegistry):
     async def middleware(request, call_next):
         try:
             response = await call_next(request)
         except Exception as error:
             if not getattr(request.state, FAILURE_LOGGED, False):
-                log_middleware_exception(
-                    request, session_tracker, type(error).__name__
-                )
+                log_middleware_exception(request, sessions, type(error).__name__)
                 setattr(request.state, FAILURE_LOGGED, True)
             raise
 
@@ -253,7 +254,7 @@ def request_logging_middleware(session_tracker: SessionTracker):
             response.status_code >= 300
             and not getattr(request.state, FAILURE_LOGGED, False)
         ):
-            log_http_failure(request, session_tracker, response.status_code)
+            log_http_failure(request, sessions, response.status_code)
             setattr(request.state, FAILURE_LOGGED, True)
         return response
 

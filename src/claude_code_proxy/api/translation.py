@@ -2,6 +2,7 @@
 
 from contextlib import suppress
 from copy import deepcopy
+from collections.abc import Callable
 from typing import Any
 from ..domain.models import CompletionRequest, ImageBlock, Message, RedactedThinkingBlock, TextBlock, ToolChoice, ToolDefinition, ToolResultBlock, ToolUseBlock
 from ..reasoning import ReasoningPolicy
@@ -121,8 +122,28 @@ def to_api_response(response: CompletionResponse) -> MessagesResponse:
     )
 
 
+DONE_FRAME = "data: [DONE]\n\n"
+
+
+def _notify_stream_error(
+    callback: Callable[[StreamError], None] | None,
+    error: StreamError,
+) -> None:
+    """Keep an observability callback from replacing safe protocol output."""
+    if callback is None:
+        return
+    try:
+        callback(error)
+    except Exception:
+        pass
+
+
 async def serialize_stream(
-    request: CompletionRequest, events, *, heartbeat_interval: float = 15.0
+    request: CompletionRequest,
+    events,
+    *,
+    heartbeat_interval: float = 15.0,
+    on_error: Callable[[StreamError], None] | None = None,
 ):
     state = _AnthropicStreamState(request)
     for frame in state.start():
@@ -148,8 +169,9 @@ async def serialize_stream(
             try:
                 frames = state.consume(event)
             except ValueError as error:
-                frames = state.error(StreamError(diagnostic=str(error)))
-                for frame in frames:
+                stream_error = StreamError(diagnostic=str(error))
+                _notify_stream_error(on_error, stream_error)
+                for frame in state.error(stream_error):
                     yield frame
                 return
             for frame in frames:
@@ -158,9 +180,11 @@ async def serialize_stream(
                 return
             pending_event = asyncio.ensure_future(anext(iterator))
 
-        for frame in state.error(
-            StreamError(diagnostic="stream ended without terminal outcome")
-        ):
+        stream_error = StreamError(
+            diagnostic="stream ended without terminal outcome"
+        )
+        _notify_stream_error(on_error, stream_error)
+        for frame in state.error(stream_error):
             yield frame
     finally:
         try:
@@ -335,7 +359,7 @@ class _AnthropicStreamState:
                     },
                 ),
                 _sse("message_stop", {"type": "message_stop"}),
-                "data: [DONE]\n\n",
+                DONE_FRAME,
             ]
         )
         return frames

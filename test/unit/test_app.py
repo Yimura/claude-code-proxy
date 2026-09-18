@@ -116,3 +116,34 @@ def test_importing_app_does_not_construct_runtime_or_expose_application(
         package.app = app_module
 
     assert not hasattr(imported, "app")
+
+
+def test_create_app_passes_runtime_sessions_to_middleware_and_router(
+    tmp_path, monkeypatch
+):
+    from fastapi import APIRouter
+
+    runtime = runtime_module.create_runtime(settings(tmp_path))
+    observed = {}
+
+    def capture_middleware(sessions):
+        observed["middleware"] = sessions
+
+        async def middleware(request, call_next):
+            return await call_next(request)
+
+        return middleware
+
+    def capture_router(service, sessions):
+        observed["router"] = sessions
+        return APIRouter()
+
+    monkeypatch.setattr(app_module, "request_logging_middleware", capture_middleware)
+    monkeypatch.setattr(app_module, "build_router", capture_router)
+
+    app_module.create_app(runtime)
+
+    assert observed == {
+        "middleware": runtime.sessions,
+        "router": runtime.sessions,
+    }
