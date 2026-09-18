@@ -36,7 +36,7 @@ class CodexProvider:
     async def stream(self, request: CompletionRequest):
         try:
             request = reconcile_codex_request(request)
-            session_id = request.session_id or str(uuid.uuid4())
+            session_id = request.client_identity.session_id or str(uuid.uuid4())
             access_token, account_id = await self._auth_credentials()
             payload = build_request(request)
             translator = CodexEventTranslator()

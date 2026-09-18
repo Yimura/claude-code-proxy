@@ -4,13 +4,15 @@ from contextlib import suppress
 from copy import deepcopy
 from collections.abc import Callable
 from typing import Any
-from ..domain.models import CompletionRequest, ImageBlock, Message, RedactedThinkingBlock, TextBlock, ToolChoice, ToolDefinition, ToolResultBlock, ToolUseBlock
+from ..domain.models import ClientIdentity, CompletionRequest, ImageBlock, Message, RedactedThinkingBlock, TextBlock, ToolChoice, ToolDefinition, ToolResultBlock, ToolUseBlock
 from ..reasoning import ReasoningPolicy
 from .schemas import ContentBlockImage, ContentBlockRedactedThinking, ContentBlockText, ContentBlockToolResult, ContentBlockToolUse, MessagesRequest
 
 
 def normalize_request(
-    request: MessagesRequest, *, session_id: str | None = None
+    request: MessagesRequest,
+    *,
+    client_identity: ClientIdentity | None = None,
 ) -> CompletionRequest:
     return CompletionRequest(
         original_model=request.model,
@@ -19,7 +21,7 @@ def normalize_request(
         max_tokens=request.max_tokens,
         messages=tuple(Message(role=message.role, content=_normalize_content(message.content)) for message in request.messages),
         reasoning=ReasoningPolicy(None, None),
-        session_id=session_id,
+        client_identity=client_identity or ClientIdentity(),
         system=_normalize_system(request.system),
         tools=tuple(ToolDefinition(name=tool.name, description=tool.description or "", input_schema=deepcopy(tool.input_schema)) for tool in request.tools or []),
         tool_choice=_normalize_tool_choice(request.tool_choice),

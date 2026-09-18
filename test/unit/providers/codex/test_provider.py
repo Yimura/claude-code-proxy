@@ -3,6 +3,7 @@ from dataclasses import replace
 import pytest
 
 from claude_code_proxy.domain.models import (
+    ClientIdentity,
     CompletionRequest,
     Message,
     StreamComplete,
@@ -112,7 +113,7 @@ def request(session_id=None, **changes):
         100,
         (Message("user", (TextBlock("hi"),)),),
         ReasoningPolicy(None, None),
-        session_id=session_id,
+        client_identity=ClientIdentity(session_id=session_id),
     )
     return replace(base, **changes)
 

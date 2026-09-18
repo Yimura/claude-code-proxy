@@ -15,6 +15,7 @@ from claude_code_proxy.config import ModelConfig, ModelDefinition
 from claude_code_proxy.control.app import create_control_app
 from claude_code_proxy.control.schemas import SessionListResponse
 from claude_code_proxy.domain.models import (
+    ClientIdentity,
     CompletionResponse,
     StreamComplete,
     StreamError,
@@ -274,7 +275,49 @@ def test_session_header_reaches_provider_unchanged():
     )
 
     assert response.status_code == 200
-    assert provider.requests[0].session_id == "session-1"
+    assert provider.requests[0].client_identity == ClientIdentity("session-1")
+
+
+def test_route_preserves_shared_session_and_distinct_agent_identity():
+    provider = Provider()
+    api = client(provider)
+
+    for agent_id in ("agent-one", "agent-two"):
+        response = api.post(
+            "/v1/messages",
+            headers={
+                "x-claude-code-session-id": "shared-session",
+                "x-claude-code-agent-id": agent_id,
+            },
+            json=messages_payload(),
+        )
+        assert response.status_code == 200
+
+    assert [request.client_identity for request in provider.requests] == [
+        ClientIdentity("shared-session", "agent-one", None),
+        ClientIdentity("shared-session", "agent-two", None),
+    ]
+
+
+def test_route_preserves_nested_agent_identity():
+    provider = Provider()
+
+    response = client(provider=provider).post(
+        "/v1/messages",
+        headers={
+            "x-claude-code-session-id": "shared-session",
+            "x-claude-code-agent-id": "nested-agent",
+            "x-claude-code-parent-agent-id": "parent-agent",
+        },
+        json=messages_payload(),
+    )
+
+    assert response.status_code == 200
+    assert provider.requests[0].client_identity == ClientIdentity(
+        "shared-session",
+        "nested-agent",
+        "parent-agent",
+    )
 
 
 def test_missing_and_blank_session_headers_become_none():
@@ -288,7 +331,10 @@ def test_missing_and_blank_session_headers_become_none():
         json=messages_payload(),
     )
 
-    assert [request.session_id for request in provider.requests] == [None, None]
+    assert [request.client_identity for request in provider.requests] == [
+        ClientIdentity(),
+        ClientIdentity(),
+    ]
 
 
 def test_streaming_messages_return_event_stream():
@@ -896,8 +942,9 @@ def test_sensitive_request_data_never_crosses_the_session_metadata_boundary(capl
     assert response.status_code == 200
     provider_payload = repr(provider.requests[0])
     for name, marker in _SENSITIVE_MARKERS.items():
-        if name != "credential":
+        if name not in {"credential", "raw_session"}:
             assert marker in provider_payload
+    assert _SENSITIVE_MARKERS["raw_session"] not in provider_payload
 
     snapshot = sessions.snapshots()[0]
     safe_id = sessions.public_id(_SENSITIVE_MARKERS["raw_session"])

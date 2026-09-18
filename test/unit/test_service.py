@@ -3,7 +3,7 @@ from dataclasses import replace
 
 import pytest
 from claude_code_proxy.config import ModelConfig, ModelDefinition
-from claude_code_proxy.domain.models import CompletionRequest, CompletionResponse, Message, StreamComplete, StreamError, TextBlock, TextDelta, TokenUsage
+from claude_code_proxy.domain.models import ClientIdentity, CompletionRequest, CompletionResponse, Message, StreamComplete, StreamError, TextBlock, TextDelta, TokenUsage
 from claude_code_proxy.model_mapping import ModelResolver
 from claude_code_proxy.reasoning import MappingEntry, ReasoningPolicy
 from claude_code_proxy.service import ProxyService
@@ -36,15 +36,16 @@ def make_request(model="claude-sonnet", **changes):
     return replace(request, **changes)
 
 
-def test_prepare_preserves_session_id():
+def test_prepare_preserves_client_identity():
     provider = FakeProvider()
     service = ProxyService(
         ModelResolver(ModelConfig({}, {}, {})), "codex", provider, provider
     )
+    identity = ClientIdentity("session-1", "agent-1", "parent-1")
 
-    prepared = service.prepare(make_request(session_id="session-1"))
+    prepared = service.prepare(make_request(client_identity=identity))
 
-    assert prepared.session_id == "session-1"
+    assert prepared.client_identity is identity
 
 
 @pytest.mark.asyncio

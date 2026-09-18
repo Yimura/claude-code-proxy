@@ -9,7 +9,7 @@ from ..domain.models import CompletionRequest
 from ..logging import (
     FAILURE_LOGGED,
     REQUEST_LOG_CONTEXT,
-    SESSION_HEADER,
+    client_identity_from_headers,
     RequestLogContext,
     effective_effort,
     log_provider_failure,
@@ -42,7 +42,8 @@ def build_router(service: ProxyService, sessions: SessionRegistry) -> APIRouter:
     @router.post("/v1/messages")
     async def create_message(request: MessagesRequest, raw_request: Request):
         normalized = normalize_request(
-            request, session_id=_session_id(raw_request)
+            request,
+            client_identity=client_identity_from_headers(raw_request.headers),
         )
         prepared = service.prepare(normalized)
         observation, context = _observe_request(
@@ -79,7 +80,7 @@ def build_router(service: ProxyService, sessions: SessionRegistry) -> APIRouter:
     async def count_tokens(request: TokenCountRequest, raw_request: Request):
         normalized = normalize_request(
             _as_messages_request(request),
-            session_id=_session_id(raw_request),
+            client_identity=client_identity_from_headers(raw_request.headers),
         )
         prepared = service.prepare(normalized)
         observation, context = _observe_request(
@@ -175,12 +176,6 @@ def _as_messages_request(request: TokenCountRequest) -> MessagesRequest:
     )
 
 
-def _session_id(raw_request: Request) -> str | None:
-    value = raw_request.headers.get(SESSION_HEADER)
-    if value is None or not value.strip():
-        return None
-    return value
-
 
 def _upstream_provider(model: str) -> str:
     prefix, separator, _ = model.partition("/")
@@ -193,7 +188,7 @@ def _session_metadata(
     prepared: CompletionRequest, transport: str
 ) -> SessionMetadata:
     return SessionMetadata(
-        client_session_id=prepared.session_id,
+        client_session_id=prepared.client_identity.session_id,
         client_model=prepared.original_model,
         upstream_model=prepared.model,
         provider=_upstream_provider(prepared.model),

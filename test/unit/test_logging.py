@@ -4,6 +4,7 @@ import logging
 import pytest
 
 from claude_code_proxy.domain.models import (
+    ClientIdentity,
     StreamComplete,
     StreamError,
     TextDelta,
@@ -12,6 +13,7 @@ from claude_code_proxy.domain.models import (
 from claude_code_proxy.logging import (
     RequestLogContext,
     SessionIdentity,
+    client_identity_from_headers,
     configure_logging,
     effective_effort,
     log_provider_failure,
@@ -37,6 +39,36 @@ def make_context(identity: SessionIdentity | None = None) -> RequestLogContext:
         effort="high",
     )
 
+
+
+def test_client_identity_from_headers_reads_full_lineage():
+    identity = client_identity_from_headers(
+        {
+            "x-claude-code-session-id": " session ",
+            "x-claude-code-agent-id": " agent ",
+            "x-claude-code-parent-agent-id": " parent ",
+        }
+    )
+
+    assert identity.session_id == " session "
+    assert identity.agent_id == " agent "
+    assert identity.parent_agent_id == " parent "
+
+
+def test_client_identity_from_headers_normalizes_blank_and_orphan_parent():
+    blank = client_identity_from_headers(
+        {
+            "x-claude-code-session-id": "   ",
+            "x-claude-code-agent-id": "\t",
+            "x-claude-code-parent-agent-id": "parent",
+        }
+    )
+    orphan = client_identity_from_headers(
+        {"x-claude-code-parent-agent-id": "parent"}
+    )
+
+    assert blank == ClientIdentity()
+    assert orphan == ClientIdentity()
 
 def test_configure_logging_exposes_readiness_info_and_keeps_uvicorn_quiet():
     configure_logging()

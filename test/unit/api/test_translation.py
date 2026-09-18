@@ -3,6 +3,7 @@ from pydantic import ValidationError
 from claude_code_proxy.api.schemas import MessagesRequest
 from claude_code_proxy.api.translation import normalize_request, to_api_response
 from claude_code_proxy.domain.models import (
+    ClientIdentity,
     CompletionResponse,
     RedactedThinkingBlock,
     TextBlock,
@@ -39,6 +40,15 @@ def test_normalize_request_preserves_ordered_content_and_options():
     assert normalized.reasoning == ReasoningPolicy(None, None)
     assert normalized.tool_choice.name == "lookup"
 
+
+
+def test_normalize_request_preserves_client_identity():
+    identity = ClientIdentity("session", "agent", "parent")
+    request = MessagesRequest(model="model", max_tokens=100, messages=[])
+
+    normalized = normalize_request(request, client_identity=identity)
+
+    assert normalized.client_identity is identity
 
 def test_normalize_request_preserves_redacted_thinking():
     request = MessagesRequest(

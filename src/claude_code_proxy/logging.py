@@ -8,13 +8,15 @@ import os
 from pathlib import Path
 import uuid
 
-from .domain.models import StreamError, StreamEvent
+from .domain.models import ClientIdentity, StreamError, StreamEvent
 from .observability import SessionRegistry
 from .providers.base import ProviderError
 from .reasoning import ReasoningPolicy
 from .text_safety import log_text
 
 SESSION_HEADER = "x-claude-code-session-id"
+AGENT_HEADER = "x-claude-code-agent-id"
+PARENT_AGENT_HEADER = "x-claude-code-parent-agent-id"
 FAILURE_LOGGED = "failure_logged"
 REQUEST_LOG_CONTEXT = "request_log_context"
 SESSION_COLORS = (
@@ -85,6 +87,24 @@ class RequestLogContext:
             "effort",
         ):
             object.__setattr__(self, name, log_text(getattr(self, name)))
+
+
+def _nonblank_header(headers: Mapping[str, str], name: str) -> str | None:
+    value = headers.get(name)
+    if value is None or not value.strip():
+        return None
+    return value
+
+
+def client_identity_from_headers(headers: Mapping[str, str]) -> ClientIdentity:
+    session_id = _nonblank_header(headers, SESSION_HEADER)
+    agent_id = _nonblank_header(headers, AGENT_HEADER)
+    parent_agent_id = (
+        _nonblank_header(headers, PARENT_AGENT_HEADER)
+        if agent_id is not None
+        else None
+    )
+    return ClientIdentity(session_id, agent_id, parent_agent_id)
 
 
 def palette_index(identifier: str) -> int:
