@@ -208,9 +208,18 @@ def log_proxy_ready(host: str, port: int, socket_path: Path) -> None:
     )
 
 
-def _request_fields(context: RequestLogContext) -> tuple[object, ...]:
+def _request_fields(
+    context: RequestLogContext,
+    *,
+    include_agent: bool = True,
+) -> tuple[object, ...]:
+    correlation = (
+        _correlation(context)
+        if include_agent
+        else context.session.rendered
+    )
     return (
-        _correlation(context),
+        correlation,
         context.method,
         context.endpoint,
         context.original_model,
@@ -223,7 +232,7 @@ def _request_fields(context: RequestLogContext) -> tuple[object, ...]:
 def log_session_started(context: RequestLogContext) -> None:
     session_logger.info(
         "[NEW] %s %s %s %s → %s provider=%s effort=%s",
-        *_request_fields(context),
+        *_request_fields(context, include_agent=False),
     )
 
 

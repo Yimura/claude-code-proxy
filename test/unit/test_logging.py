@@ -149,6 +149,28 @@ def test_effective_effort(policy, expected):
     assert effective_effort(policy) == expected
 
 
+
+def test_root_lifecycle_log_excludes_agent_context(caplog):
+    context = RequestLogContext(
+        session=SessionIdentity("session-safe", "[session session-safe]", True),
+        agent=AgentIdentity("agent-safe", "[agent agent-safe]", None, True),
+        method="POST",
+        endpoint="/v1/messages",
+        original_model="claude-sonnet",
+        upstream_model="openai/gpt-5.6-sol",
+        provider="codex",
+        effort="high",
+    )
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="claude_code_proxy.logging.session",
+    ):
+        log_session_started(context)
+
+    assert "[session session-safe]" in caplog.text
+    assert "[agent agent-safe]" not in caplog.text
+
 def test_untrusted_log_context_escapes_record_and_terminal_controls(caplog):
     hostile = "field\n\r\t\x1b\x85\u2028\u2029\u202e\ud800"
     context = RequestLogContext(
