@@ -13,6 +13,7 @@ from claude_code_proxy.control.schemas import (
     SessionListResponse,
     SessionResponse,
 )
+from claude_code_proxy.domain.models import ClientIdentity
 from claude_code_proxy.observability import (
     SessionMetadata,
     SessionRegistry,
@@ -38,6 +39,8 @@ class RegistryClock:
 
 def metadata(
     client_id: str,
+    agent_id: str | None = None,
+    parent_agent_id: str | None = None,
     *,
     client_model: str = "claude-opus",
     upstream_model: str = "openai/gpt-5.6-sol",
@@ -47,7 +50,11 @@ def metadata(
     context_window: int | None = 1_000_000,
 ) -> SessionMetadata:
     return SessionMetadata(
-        client_session_id=client_id,
+        client_identity=ClientIdentity(
+            client_id,
+            agent_id,
+            parent_agent_id,
+        ),
         client_model=client_model,
         upstream_model=upstream_model,
         provider=provider,
@@ -114,6 +121,43 @@ async def request(app, path: str, params=None):
         return await client.get(path, params=params)
 
 
+async def test_session_response_includes_agent_snapshots() -> None:
+    clock = RegistryClock()
+    sessions = registry(clock)
+    handle = sessions.begin(metadata("session", "agent", "parent"))
+    app = create_control_app(
+        sessions,
+        application_version="1.0",
+        pid=123,
+    )
+
+    response = await request(app, "/v1/sessions")
+
+    assert response.status_code == 200
+    agent = response.json()["sessions"][0]["agents"][0]
+    assert agent["id"] == handle.agent_public_id
+    assert agent["parent_id"] == handle.parent_agent_public_id
+    assert "client_session_id" not in agent
+    assert "agent_id" not in agent
+
+
+async def test_health_counts_roots_not_agent_rows() -> None:
+    clock = RegistryClock()
+    sessions = registry(clock)
+    sessions.begin(metadata("session", "first"))
+    sessions.begin(metadata("session", "second"))
+    app = create_control_app(
+        sessions,
+        application_version="1.0",
+        pid=123,
+    )
+
+    response = await request(app, "/v1/health")
+
+    assert response.json()["capabilities"] == ["sessions", "agents"]
+    assert response.json()["sessions"] == {"active": 1, "retained": 1}
+
+
 async def test_health_reports_exact_version_process_time_limit_and_counts() -> None:
     registry_clock = RegistryClock()
     sessions = registry(registry_clock, inactive_limit=7)
@@ -139,7 +183,7 @@ async def test_health_reports_exact_version_process_time_limit_and_counts() -> N
         "pid": 4321,
         "started_at": "2026-01-02T03:04:05Z",
         "uptime_seconds": 12.5,
-        "capabilities": ["sessions"],
+        "capabilities": ["sessions", "agents"],
         "sessions": {"active": 1, "retained": 2},
         "inactive_limit": 7,
     }
@@ -455,6 +499,7 @@ async def test_session_json_excludes_raw_ids_and_internal_fields() -> None:
         "last_seen",
         "elapsed_seconds",
         "last_result",
+        "agents",
     }
     assert all(set(item) == expected_fields for item in response.json()["sessions"])
 

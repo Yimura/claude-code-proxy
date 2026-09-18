@@ -29,7 +29,7 @@ def health_payload(**overrides: object) -> dict[str, object]:
         "pid": 42,
         "started_at": "2026-01-02T03:04:05Z",
         "uptime_seconds": 10.5,
-        "capabilities": ["sessions"],
+        "capabilities": ["sessions", "agents"],
         "sessions": {"active": 1, "retained": 2},
         "inactive_limit": 1000,
     }
@@ -184,6 +184,12 @@ def test_control_schemas_enforce_strict_signed_64_integer_fields() -> None:
     observed["context_window"] = maximum + 1
     with pytest.raises(ValidationError, match="context_window"):
         SessionResponse.model_validate(observed)
+
+
+def test_new_client_accepts_legacy_session_without_agents() -> None:
+    parsed = SessionResponse.model_validate(session_payload())
+
+    assert parsed.agents == ()
 
 
 def test_health_accepts_signed_64_maximum_integer_fields() -> None:

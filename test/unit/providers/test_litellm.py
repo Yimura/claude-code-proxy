@@ -7,7 +7,7 @@ from litellm.types.utils import Usage as LiteLLMUsage
 
 from claude_code_proxy.config import Settings
 from claude_code_proxy.domain.models import (
-    CompletionRequest,
+    ClientIdentity, CompletionRequest,
     ImageBlock,
     Message,
     StreamComplete,
@@ -55,6 +55,22 @@ def request(model="openai/gpt-5.6-sol", **changes):
     )
     return replace(base, **changes)
 
+
+
+def test_build_request_does_not_forward_client_identity(settings):
+    provider = LiteLLMProvider(settings, object())
+    payload = provider.build_request(
+        request(
+            client_identity=ClientIdentity("session", "agent", "parent")
+        ),
+        stream=False,
+    )
+
+    assert "session_id" not in payload
+    assert "agent_id" not in payload
+    assert "parent_agent_id" not in payload
+    assert "client_metadata" not in payload
+    assert "prompt_cache_key" not in payload
 
 def test_build_request_preserves_tools_reasoning_and_auth(settings):
     provider = LiteLLMProvider(settings, object())

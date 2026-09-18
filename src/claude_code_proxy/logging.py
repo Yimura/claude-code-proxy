@@ -8,13 +8,15 @@ import os
 from pathlib import Path
 import uuid
 
-from .domain.models import StreamError, StreamEvent
+from .domain.models import ClientIdentity, StreamError, StreamEvent
 from .observability import SessionRegistry
 from .providers.base import ProviderError
 from .reasoning import ReasoningPolicy
 from .text_safety import log_text
 
 SESSION_HEADER = "x-claude-code-session-id"
+AGENT_HEADER = "x-claude-code-agent-id"
+PARENT_AGENT_HEADER = "x-claude-code-parent-agent-id"
 FAILURE_LOGGED = "failure_logged"
 REQUEST_LOG_CONTEXT = "request_log_context"
 SESSION_COLORS = (
@@ -66,6 +68,14 @@ class SessionIdentity:
 
 
 @dataclass(frozen=True)
+class AgentIdentity:
+    label: str
+    rendered: str
+    parent_label: str | None
+    is_new: bool
+
+
+@dataclass(frozen=True)
 class RequestLogContext:
     session: SessionIdentity
     method: str
@@ -74,6 +84,7 @@ class RequestLogContext:
     upstream_model: str
     provider: str
     effort: str
+    agent: AgentIdentity | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -85,6 +96,24 @@ class RequestLogContext:
             "effort",
         ):
             object.__setattr__(self, name, log_text(getattr(self, name)))
+
+
+def _nonblank_header(headers: Mapping[str, str], name: str) -> str | None:
+    value = headers.get(name)
+    if value is None or not value.strip():
+        return None
+    return value
+
+
+def client_identity_from_headers(headers: Mapping[str, str]) -> ClientIdentity:
+    session_id = _nonblank_header(headers, SESSION_HEADER)
+    agent_id = _nonblank_header(headers, AGENT_HEADER)
+    parent_agent_id = (
+        _nonblank_header(headers, PARENT_AGENT_HEADER)
+        if agent_id is not None
+        else None
+    )
+    return ClientIdentity(session_id, agent_id, parent_agent_id)
 
 
 def palette_index(identifier: str) -> int:
@@ -108,6 +137,47 @@ def session_identity(
         rendered_label = f"{color}{label}{_RESET}"
     scope = "request" if request_scoped else "session"
     return SessionIdentity(label, f"[{scope} {rendered_label}]", is_new)
+
+
+def agent_identity(
+    public_id: str | None,
+    parent_public_id: str | None,
+    *,
+    is_new: bool,
+    environ: Mapping[str, str] | None = None,
+) -> AgentIdentity | None:
+    if public_id is None:
+        return None
+    label = public_id[:12]
+    rendered_label = label
+    environment = os.environ if environ is None else environ
+    if "NO_COLOR" not in environment:
+        color = SESSION_COLORS[palette_index(public_id)]
+        rendered_label = f"{color}{label}{_RESET}"
+    return AgentIdentity(
+        label=label,
+        rendered=f"[agent {rendered_label}]",
+        parent_label=(
+            parent_public_id[:12] if parent_public_id is not None else None
+        ),
+        is_new=is_new,
+    )
+
+
+def _render_correlation(
+    session: SessionIdentity,
+    agent: AgentIdentity | None,
+) -> str:
+    parts = [session.rendered]
+    if agent is not None:
+        parts.append(agent.rendered)
+        if agent.parent_label is not None:
+            parts.append(f"parent={agent.parent_label}")
+    return " ".join(parts)
+
+
+def _correlation(context: RequestLogContext) -> str:
+    return _render_correlation(context.session, context.agent)
 
 
 def effective_effort(policy: ReasoningPolicy) -> str:
@@ -138,9 +208,18 @@ def log_proxy_ready(host: str, port: int, socket_path: Path) -> None:
     )
 
 
-def _request_fields(context: RequestLogContext) -> tuple[object, ...]:
+def _request_fields(
+    context: RequestLogContext,
+    *,
+    include_agent: bool = True,
+) -> tuple[object, ...]:
+    correlation = (
+        _correlation(context)
+        if include_agent
+        else context.session.rendered
+    )
     return (
-        context.session.rendered,
+        correlation,
         context.method,
         context.endpoint,
         context.original_model,
@@ -153,6 +232,13 @@ def _request_fields(context: RequestLogContext) -> tuple[object, ...]:
 def log_session_started(context: RequestLogContext) -> None:
     session_logger.info(
         "[NEW] %s %s %s %s → %s provider=%s effort=%s",
+        *_request_fields(context, include_agent=False),
+    )
+
+
+def log_agent_started(context: RequestLogContext) -> None:
+    session_logger.info(
+        "[NEW AGENT] %s %s %s %s → %s provider=%s effort=%s",
         *_request_fields(context),
     )
 
@@ -161,7 +247,7 @@ def log_provider_failure(context: RequestLogContext, status_code: int) -> None:
     logger.warning(
         "%s %s %s provider request failed status=%s model=%s upstream=%s "
         "provider=%s effort=%s",
-        context.session.rendered,
+        _correlation(context),
         context.method,
         context.endpoint,
         status_code,
@@ -178,7 +264,7 @@ def log_stream_failure(
     logger.warning(
         "%s %s %s provider stream failed error=%s status=%s retryable=%s "
         "model=%s upstream=%s provider=%s effort=%s",
-        context.session.rendered,
+        _correlation(context),
         context.method,
         context.endpoint,
         log_text(error.error_type),
@@ -195,7 +281,7 @@ def log_unexpected_failure(context: RequestLogContext, error_type: str) -> None:
     logger.error(
         "%s %s %s unexpected request failure error=%s model=%s upstream=%s "
         "provider=%s effort=%s",
-        context.session.rendered,
+        _correlation(context),
         context.method,
         context.endpoint,
         log_text(error_type),
@@ -203,6 +289,35 @@ def log_unexpected_failure(context: RequestLogContext, error_type: str) -> None:
         context.upstream_model,
         context.provider,
         context.effort,
+    )
+
+
+def _fallback_context_identity(
+    request,
+    sessions: SessionRegistry,
+) -> tuple[SessionIdentity, AgentIdentity | None]:
+    identity = client_identity_from_headers(request.headers)
+    raw_session = (identity.session_id or "").strip()
+    source_id = raw_session or uuid.uuid4().hex
+    session = session_identity(
+        sessions.public_id(source_id),
+        request_scoped=not raw_session,
+        is_new=False,
+    )
+    raw_agent = (identity.agent_id or "").strip()
+    if not raw_agent:
+        return session, None
+    public_agent = sessions.public_agent_id(source_id, raw_agent)
+    raw_parent = (identity.parent_agent_id or "").strip()
+    public_parent = (
+        sessions.public_agent_id(source_id, raw_parent)
+        if raw_parent
+        else None
+    )
+    return session, agent_identity(
+        public_agent,
+        public_parent,
+        is_new=False,
     )
 
 
@@ -214,7 +329,7 @@ def log_http_failure(
         logger.warning(
             "%s %s %s HTTP request failed status=%s model=%s upstream=%s "
             "provider=%s effort=%s",
-            context.session.rendered,
+            _correlation(context),
             context.method,
             context.endpoint,
             status_code,
@@ -225,16 +340,10 @@ def log_http_failure(
         )
         return
 
-    raw_id = (request.headers.get(SESSION_HEADER) or "").strip()
-    source_id = raw_id or uuid.uuid4().hex
-    session = session_identity(
-        sessions.public_id(source_id),
-        request_scoped=not raw_id,
-        is_new=False,
-    )
+    session, agent = _fallback_context_identity(request, sessions)
     logger.warning(
         "%s %s %s HTTP request failed status=%s",
-        session.rendered,
+        _render_correlation(session, agent),
         log_text(request.method),
         log_text(request.url.path),
         status_code,
@@ -249,16 +358,10 @@ def log_middleware_exception(
         log_unexpected_failure(context, error_type)
         return
 
-    raw_id = (request.headers.get(SESSION_HEADER) or "").strip()
-    source_id = raw_id or uuid.uuid4().hex
-    session = session_identity(
-        sessions.public_id(source_id),
-        request_scoped=not raw_id,
-        is_new=False,
-    )
+    session, agent = _fallback_context_identity(request, sessions)
     logger.error(
         "%s %s %s unexpected HTTP failure error=%s",
-        session.rendered,
+        _render_correlation(session, agent),
         log_text(request.method),
         log_text(request.url.path),
         log_text(error_type),

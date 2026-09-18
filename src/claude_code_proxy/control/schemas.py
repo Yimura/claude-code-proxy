@@ -37,7 +37,7 @@ class HealthResponse(_FrozenModel):
     pid: PositiveControlInteger
     started_at: datetime
     uptime_seconds: float
-    capabilities: tuple[str, ...] = ("sessions",)
+    capabilities: tuple[str, ...] = ("sessions", "agents")
     sessions: SessionCounts
     inactive_limit: NonNegativeControlInteger
 
@@ -47,7 +47,7 @@ class HealthResponse(_FrozenModel):
         return _require_wire_duration(value)
 
 
-class SessionResponse(_FrozenModel):
+class _ActivityResponse(_FrozenModel):
     model_config = ConfigDict(from_attributes=True, frozen=True)
 
     id: str
@@ -69,6 +69,14 @@ class SessionResponse(_FrozenModel):
     @classmethod
     def validate_elapsed_wire_type(cls, value: object) -> object:
         return _require_wire_duration(value)
+
+
+class AgentResponse(_ActivityResponse):
+    parent_id: str | None
+
+
+class SessionResponse(_ActivityResponse):
+    agents: tuple[AgentResponse, ...] = ()
 
 
 class SessionListResponse(_FrozenModel):

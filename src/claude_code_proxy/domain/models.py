@@ -1,6 +1,6 @@
 """Immutable provider-neutral request, response, and stream models."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias
 
 from ..reasoning import OutputConfig, ReasoningPolicy, ThinkingConfig
@@ -61,6 +61,13 @@ class ToolChoice:
 
 
 @dataclass(frozen=True)
+class ClientIdentity:
+    session_id: str | None = field(default=None, repr=False)
+    agent_id: str | None = field(default=None, repr=False)
+    parent_agent_id: str | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
 class CompletionRequest:
     original_model: str
     model: str
@@ -69,7 +76,7 @@ class CompletionRequest:
     messages: tuple[Message, ...]
     reasoning: ReasoningPolicy
     context_window: int | None = None
-    session_id: str | None = None
+    client_identity: ClientIdentity = field(default_factory=ClientIdentity)
     system: tuple[TextBlock, ...] = ()
     tools: tuple[ToolDefinition, ...] = ()
     tool_choice: ToolChoice | None = None

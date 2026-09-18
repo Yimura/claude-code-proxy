@@ -325,26 +325,27 @@ def _assert_http_contract(running: _RunningProxy) -> None:
     sessions = _control_get(running.socket_path, "/v1/sessions")
     assert health.status_code == sessions.status_code == 200
     assert health.json()["protocol_version"] == 1
-    assert health.json()["capabilities"] == ["sessions"]
+    assert health.json()["capabilities"] == ["sessions", "agents"]
     assert health.json()["pid"] == running.process.pid
     assert health.json()["inactive_limit"] == 2
     assert health.json()["sessions"] == {"active": 0, "retained": 0}
     assert sessions.json()["sessions"] == []
 
 
-def _assert_ps_is_empty(
+def _run_ps(
     tmp_path: Path,
     executable: Path,
     running: _RunningProxy,
-) -> None:
-    completed = subprocess.run(
+    output_format: str,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
         [
             str(executable),
             "ps",
             "--socket",
             str(running.socket_path),
             "--format",
-            "json",
+            output_format,
         ],
         cwd=tmp_path,
         env=running.environment,
@@ -355,6 +356,14 @@ def _assert_ps_is_empty(
         timeout=_PROCESS_TIMEOUT_SECONDS,
         check=False,
     )
+
+
+def _assert_ps_is_empty(
+    tmp_path: Path,
+    executable: Path,
+    running: _RunningProxy,
+) -> None:
+    completed = _run_ps(tmp_path, executable, running, "json")
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout == "[]\n"
     assert completed.stderr == ""
@@ -612,6 +621,51 @@ def test_foreground_proxy_serves_isolated_public_and_control_planes(
         _assert_ps_is_empty(tmp_path, executable, running)
         assert not fake_marker.exists(), "ambient PATH executable was invoked"
         _assert_clean_shutdown(running)
+
+
+def test_agent_identity_reaches_control_json_and_nested_ps(
+    tmp_path: Path,
+) -> None:
+    mapping_path = tmp_path / "models.json"
+    _write_mapping(mapping_path)
+    (tmp_path / "home").mkdir()
+    executable = _cli_executable()
+    headers = {
+        "x-claude-code-session-id": "integration-session",
+        "x-claude-code-agent-id": "integration-agent",
+        "x-claude-code-parent-agent-id": "integration-parent",
+    }
+    body = {
+        "model": "claude-haiku",
+        "messages": [{"role": "user", "content": "count me"}],
+    }
+
+    with _proxy_process(tmp_path, mapping_path, executable) as running:
+        with httpx.Client(timeout=5.0, trust_env=False) as public_client:
+            response = public_client.post(
+                f"http://127.0.0.1:{running.port}/v1/messages/count_tokens",
+                headers=headers,
+                json=body,
+            )
+        assert response.status_code == 200
+
+        json_result = _run_ps(tmp_path, executable, running, "json")
+        table_result = _run_ps(tmp_path, executable, running, "table")
+
+    assert json_result.returncode == 0, json_result.stderr
+    payload = json.loads(json_result.stdout)
+    assert len(payload) == 1
+    assert payload[0]["requests"] == 1
+    assert len(payload[0]["agents"]) == 1
+    assert payload[0]["agents"][0]["requests"] == 1
+    assert payload[0]["agents"][0]["parent_id"] is not None
+    assert table_result.returncode == 0, table_result.stderr
+    assert "SESSION / AGENT" in table_result.stdout
+    assert "└─ " in table_result.stdout
+    combined = json_result.stdout + table_result.stdout
+    assert "integration-session" not in combined
+    assert "integration-agent" not in combined
+    assert "integration-parent" not in combined
 
 
 def test_proxy_startup_uses_bundled_cost_map_without_remote_request(

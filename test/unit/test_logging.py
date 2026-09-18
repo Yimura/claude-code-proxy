@@ -4,14 +4,18 @@ import logging
 import pytest
 
 from claude_code_proxy.domain.models import (
+    ClientIdentity,
     StreamComplete,
     StreamError,
     TextDelta,
     TokenUsage,
 )
 from claude_code_proxy.logging import (
+    AgentIdentity,
     RequestLogContext,
     SessionIdentity,
+    agent_identity,
+    client_identity_from_headers,
     configure_logging,
     effective_effort,
     log_provider_failure,
@@ -37,6 +41,52 @@ def make_context(identity: SessionIdentity | None = None) -> RequestLogContext:
         effort="high",
     )
 
+
+
+
+def test_agent_identity_hides_raw_values():
+    identity = agent_identity(
+        "a" * 64,
+        "b" * 64,
+        is_new=True,
+        environ={"NO_COLOR": "1"},
+    )
+
+    assert identity == AgentIdentity(
+        label="a" * 12,
+        rendered=f"[agent {'a' * 12}]",
+        parent_label="b" * 12,
+        is_new=True,
+    )
+
+def test_client_identity_from_headers_reads_full_lineage():
+    identity = client_identity_from_headers(
+        {
+            "x-claude-code-session-id": " session ",
+            "x-claude-code-agent-id": " agent ",
+            "x-claude-code-parent-agent-id": " parent ",
+        }
+    )
+
+    assert identity.session_id == " session "
+    assert identity.agent_id == " agent "
+    assert identity.parent_agent_id == " parent "
+
+
+def test_client_identity_from_headers_normalizes_blank_and_orphan_parent():
+    blank = client_identity_from_headers(
+        {
+            "x-claude-code-session-id": "   ",
+            "x-claude-code-agent-id": "\t",
+            "x-claude-code-parent-agent-id": "parent",
+        }
+    )
+    orphan = client_identity_from_headers(
+        {"x-claude-code-parent-agent-id": "parent"}
+    )
+
+    assert blank == ClientIdentity()
+    assert orphan == ClientIdentity()
 
 def test_configure_logging_exposes_readiness_info_and_keeps_uvicorn_quiet():
     configure_logging()
@@ -98,6 +148,28 @@ def test_no_color_disables_identity_color():
 def test_effective_effort(policy, expected):
     assert effective_effort(policy) == expected
 
+
+
+def test_root_lifecycle_log_excludes_agent_context(caplog):
+    context = RequestLogContext(
+        session=SessionIdentity("session-safe", "[session session-safe]", True),
+        agent=AgentIdentity("agent-safe", "[agent agent-safe]", None, True),
+        method="POST",
+        endpoint="/v1/messages",
+        original_model="claude-sonnet",
+        upstream_model="openai/gpt-5.6-sol",
+        provider="codex",
+        effort="high",
+    )
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="claude_code_proxy.logging.session",
+    ):
+        log_session_started(context)
+
+    assert "[session session-safe]" in caplog.text
+    assert "[agent agent-safe]" not in caplog.text
 
 def test_untrusted_log_context_escapes_record_and_terminal_controls(caplog):
     hostile = "field\n\r\t\x1b\x85\u2028\u2029\u202e\ud800"

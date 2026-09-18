@@ -9,9 +9,11 @@ from ..domain.models import CompletionRequest
 from ..logging import (
     FAILURE_LOGGED,
     REQUEST_LOG_CONTEXT,
-    SESSION_HEADER,
+    client_identity_from_headers,
     RequestLogContext,
+    agent_identity,
     effective_effort,
+    log_agent_started,
     log_provider_failure,
     log_session_started,
     log_stream_failure,
@@ -42,7 +44,8 @@ def build_router(service: ProxyService, sessions: SessionRegistry) -> APIRouter:
     @router.post("/v1/messages")
     async def create_message(request: MessagesRequest, raw_request: Request):
         normalized = normalize_request(
-            request, session_id=_session_id(raw_request)
+            request,
+            client_identity=client_identity_from_headers(raw_request.headers),
         )
         prepared = service.prepare(normalized)
         observation, context = _observe_request(
@@ -79,7 +82,7 @@ def build_router(service: ProxyService, sessions: SessionRegistry) -> APIRouter:
     async def count_tokens(request: TokenCountRequest, raw_request: Request):
         normalized = normalize_request(
             _as_messages_request(request),
-            session_id=_session_id(raw_request),
+            client_identity=client_identity_from_headers(raw_request.headers),
         )
         prepared = service.prepare(normalized)
         observation, context = _observe_request(
@@ -175,12 +178,6 @@ def _as_messages_request(request: TokenCountRequest) -> MessagesRequest:
     )
 
 
-def _session_id(raw_request: Request) -> str | None:
-    value = raw_request.headers.get(SESSION_HEADER)
-    if value is None or not value.strip():
-        return None
-    return value
-
 
 def _upstream_provider(model: str) -> str:
     prefix, separator, _ = model.partition("/")
@@ -193,7 +190,7 @@ def _session_metadata(
     prepared: CompletionRequest, transport: str
 ) -> SessionMetadata:
     return SessionMetadata(
-        client_session_id=prepared.session_id,
+        client_identity=prepared.client_identity,
         client_model=prepared.original_model,
         upstream_model=prepared.model,
         provider=_upstream_provider(prepared.model),
@@ -219,6 +216,11 @@ def _observe_request(
     )
     context = RequestLogContext(
         session=identity,
+        agent=agent_identity(
+            observation.agent_public_id,
+            observation.parent_agent_public_id,
+            is_new=observation.agent_is_new,
+        ),
         method=raw_request.method,
         endpoint=raw_request.url.path,
         original_model=prepared.original_model,
@@ -233,6 +235,8 @@ def _record_context(raw_request: Request, context: RequestLogContext) -> None:
     setattr(raw_request.state, REQUEST_LOG_CONTEXT, context)
     if context.session.is_new:
         log_session_started(context)
+    if context.agent is not None and context.agent.is_new:
+        log_agent_started(context)
 
 
 def _log_provider_error(
