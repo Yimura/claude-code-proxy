@@ -845,6 +845,7 @@ _SESSION_RESPONSE_FIELDS = {
     "last_seen",
     "elapsed_seconds",
     "last_result",
+    "agents",
 }
 
 

@@ -325,7 +325,7 @@ def _assert_http_contract(running: _RunningProxy) -> None:
     sessions = _control_get(running.socket_path, "/v1/sessions")
     assert health.status_code == sessions.status_code == 200
     assert health.json()["protocol_version"] == 1
-    assert health.json()["capabilities"] == ["sessions"]
+    assert health.json()["capabilities"] == ["sessions", "agents"]
     assert health.json()["pid"] == running.process.pid
     assert health.json()["inactive_limit"] == 2
     assert health.json()["sessions"] == {"active": 0, "retained": 0}
