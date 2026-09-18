@@ -7,16 +7,19 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, auto
 import errno
-import fcntl
 import json
 import os
 from pathlib import Path
 import secrets
 import socket
 import stat
+import sys
 import tempfile
 from types import TracebackType
 from typing import Self
+
+if sys.platform == "linux":
+    import fcntl
 
 
 _APP_DIRECTORY_NAME = "claude-code-proxy"
@@ -129,6 +132,7 @@ class SocketLease:
         started_at: datetime | None = None,
     ) -> Self:
         """Acquire the lock, recover a stale endpoint, and bind the socket."""
+        _require_linux()
         expected_uid = os.getuid() if uid is None else uid
         socket_path = _absolute_socket_path(path)
         socket_leaf = _socket_leaf(socket_path)
@@ -224,6 +228,14 @@ class SocketLease:
         self.close()
 
 
+def _require_linux() -> None:
+    if sys.platform != "linux":
+        raise RuntimeError(
+            "secure control socket requires Linux; "
+            "use Docker on other platforms"
+        )
+
+
 def resolve_socket_path(
     explicit: Path | None,
     environ: Mapping[str, str] | None = None,
@@ -231,6 +243,7 @@ def resolve_socket_path(
     uid: int | None = None,
 ) -> Path:
     """Resolve the control socket location in deterministic priority order."""
+    _require_linux()
     expected_uid = os.getuid() if uid is None else uid
     environment = os.environ if environ is None else environ
     if explicit is not None:

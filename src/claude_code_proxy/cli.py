@@ -15,16 +15,18 @@ from wcwidth import wcwidth, wcswidth
 
 from .config import Settings
 from .control.client import (
-    MAX_CONTROL_INTEGER,
     ControlClient,
     ControlError,
     ControlUnavailable,
+    IncompatibleProtocol,
 )
 from .control.schemas import SessionListResponse, SessionResponse
 from .control.socket import resolve_socket_path
+from .limits import MAX_CONTROL_INTEGER
 from .logging import configure_logging
 from .runtime import create_runtime
 from .server import run_proxy
+from .text_safety import escaped_text_atom, unicode_escape_atom
 
 _MAX_FILTERS = 32
 _MAX_FILTER_LENGTH = 256
@@ -86,6 +88,7 @@ def proxy(
         typer.Option(
             "--session-limit",
             min=0,
+            max=MAX_CONTROL_INTEGER,
             help="Maximum retained inactive sessions.",
         ),
     ] = None,
@@ -139,6 +142,11 @@ def ps(
         typer.echo(_render_sessions(result, output_format, no_trunc))
     except ControlUnavailable as error:
         _report_unavailable(error)
+        raise typer.Exit(code=1) from None
+    except IncompatibleProtocol as error:
+        _report_control_guidance(
+            f"Incompatible control API at {socket_path}: {error}"
+        )
         raise typer.Exit(code=1) from None
     except ControlError as error:
         _exit_with_error(str(error))
@@ -350,18 +358,18 @@ def _terminal_text(
 
 
 def _terminal_atom(character: str) -> str:
-    code = ord(character)
-    if code < 0x20 or 0x7F <= code <= 0x9F:
-        return f"\\x{code:02x}"
-    if character.isprintable() and wcwidth(character) >= 0:
-        return character
-    if code <= 0xFFFF:
-        return f"\\u{code:04x}"
-    return f"\\U{code:08x}"
+    atom = escaped_text_atom(character)
+    if atom != character or wcwidth(character) >= 0:
+        return atom
+    return unicode_escape_atom(character)
 
 
 def _report_unavailable(error: ControlUnavailable) -> None:
-    typer.echo(f"Error: {_bounded_error(str(error))}", err=True)
+    _report_control_guidance(str(error))
+
+
+def _report_control_guidance(message: str) -> None:
+    typer.echo(f"Error: {_bounded_error(message)}", err=True)
     typer.echo("source: start `claude-code-proxy proxy`", err=True)
     typer.echo(
         "Docker: run `docker compose exec proxy claude-code-proxy ps`",

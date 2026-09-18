@@ -16,6 +16,7 @@ import uvicorn
 from .app import create_app
 from .control.app import create_control_app
 from .control.socket import SocketLease
+from .logging import log_proxy_ready
 from .runtime import RuntimeServices
 
 UVICORN_GRACEFUL_TIMEOUT_SECONDS = 10.0
@@ -34,6 +35,7 @@ class _Server(Protocol):
 
 
 ServerFactory = Callable[[uvicorn.Config], _Server]
+ReadyReporter = Callable[[str, int, Path], None]
 
 
 class _ServerTaskFailure(Exception):
@@ -68,6 +70,7 @@ async def serve_proxy(
     stop_event: asyncio.Event | None = None,
     server_factory: ServerFactory = ManagedServer,
     _ready_event: asyncio.Event | None = None,
+    _ready_reporter: ReadyReporter = log_proxy_ready,
     _force_event: asyncio.Event | None = None,
     _uvicorn_grace_timeout: float = UVICORN_GRACEFUL_TIMEOUT_SECONDS,
     _hard_timeout: float = COORDINATOR_HARD_TIMEOUT_SECONDS,
@@ -141,6 +144,11 @@ async def serve_proxy(
                 elif public_state == "started" and not (
                     stop.is_set() or force.is_set()
                 ):
+                    _ready_reporter(
+                        runtime.settings.proxy_host,
+                        runtime.settings.proxy_port,
+                        lease.path,
+                    )
                     if _ready_event is not None:
                         _ready_event.set()
                     failure_message = await _wait_for_stop_or_completion(

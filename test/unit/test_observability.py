@@ -50,6 +50,14 @@ def registry(clock: Clock, inactive_limit: int = 10) -> SessionRegistry:
     )
 
 
+def test_constructor_enforces_signed_64_inactive_limit() -> None:
+    maximum = 2**63 - 1
+
+    assert SessionRegistry(maximum).inactive_limit == maximum
+    with pytest.raises(ValueError, match="inactive_limit"):
+        SessionRegistry(maximum + 1)
+
+
 def test_constructor_rejects_negative_inactive_limit() -> None:
     with pytest.raises(ValueError, match="inactive_limit"):
         SessionRegistry(-1)
@@ -150,6 +158,42 @@ def test_finish_is_idempotent_for_finished_and_unknown_handles() -> None:
     sessions.finish(replace(handle, request_id="unknown"), "failed")
 
     assert sessions.snapshots()[0] == finished
+
+
+def test_public_metadata_escapes_unpaired_surrogates_without_changing_unicode() -> None:
+    clock = Clock()
+    sessions = registry(clock)
+    raw = "ordinary-界-\ud800-\udfff"
+
+    handle = sessions.begin(
+        SessionMetadata(
+            client_session_id="raw-\ud800-session",
+            client_model=raw,
+            upstream_model=f"openai/{raw}",
+            provider=raw,
+            transport=raw,
+            effort=raw,
+            context_window=1,
+        )
+    )
+
+    snapshot = sessions.snapshots()[0]
+    expected = "ordinary-界-\\ud800-\\udfff"
+    assert snapshot.client_model == expected
+    assert snapshot.model == expected
+    assert snapshot.provider == expected
+    assert snapshot.transport == expected
+    assert snapshot.effort == expected
+    assert handle.public_id == sessions.public_id("raw-\ud800-session")
+    assert "raw-\ud800-session" not in repr(sessions)
+    for value in (
+        snapshot.client_model,
+        snapshot.model,
+        snapshot.provider,
+        snapshot.transport,
+        snapshot.effort,
+    ):
+        value.encode("utf-8", errors="strict")
 
 
 def test_later_begin_refreshes_metadata() -> None:

@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime
 import json
 import logging
 
@@ -203,6 +204,66 @@ def test_mapped_streaming_response_uses_client_capability_identity():
     assert start["message"]["model"] == "claude-sonnet[1m]"
 
 
+def test_surrogate_model_reaches_provider_unchanged_and_control_snapshot_is_safe():
+    provider = Provider()
+
+    async def complete_with_safe_response(request):
+        provider.requests.append(request)
+        return CompletionResponse(
+            "msg-1",
+            "safe-response-model",
+            (TextBlock("hello"),),
+            "end_turn",
+            TokenUsage(2, 1),
+        )
+
+    provider.complete = complete_with_safe_response
+    sessions = registry()
+    public = client(provider, sessions=sessions)
+    body = (
+        b'{"model":"poison\\ud800model","max_tokens":10,'
+        b'"messages":[{"role":"user","content":"hi"}]}'
+    )
+
+    response = public.post(
+        "/v1/messages",
+        content=body,
+        headers={"content-type": "application/json"},
+    )
+    normal_response = public.post(
+        "/v1/messages", json=messages_payload(model="healthy-model")
+    )
+    control = TestClient(
+        create_control_app(sessions, started_at=datetime.now(UTC))
+    )
+    snapshot_response = control.get("/v1/sessions")
+
+    assert response.status_code == normal_response.status_code == 200
+    assert provider.requests[0].original_model == "poison\ud800model"
+    assert provider.requests[0].model == "poison\ud800model"
+    assert snapshot_response.status_code == 200
+    snapshot_response.content.decode("utf-8", errors="strict")
+    payload = json.loads(snapshot_response.content)
+    by_client_model = {
+        item["client_model"]: item for item in payload["sessions"]
+    }
+    assert by_client_model["poison\\ud800model"]["model"] == "poison\\ud800model"
+    assert by_client_model["healthy-model"]["model"] == "healthy-model"
+
+    validated = SessionListResponse.model_validate(payload)
+    table = cli_module._render_sessions(
+        validated, cli_module.OutputFormat.TABLE, no_trunc=True
+    )
+    structured = cli_module._render_sessions(
+        validated, cli_module.OutputFormat.JSON, no_trunc=True
+    )
+    table.encode("utf-8", errors="strict")
+    assert "poison\\ud800model" in table
+    assert "healthy-model" in table
+    assert len(table.splitlines()) == 3
+    assert json.loads(structured) == payload["sessions"]
+
+
 def test_session_header_reaches_provider_unchanged():
     provider = Provider()
 
@@ -274,6 +335,44 @@ def test_new_session_logs_resolved_request_context_without_success_summary(caplo
     assert "provider=fake" in caplog.text
     assert "effort=default" in caplog.text
     assert "200 OK" not in caplog.text
+
+
+def test_route_log_encodes_hostile_model_without_changing_provider_request(
+    caplog, monkeypatch
+):
+    monkeypatch.setenv("NO_COLOR", "1")
+    provider = Provider()
+
+    async def complete_with_safe_response(request):
+        provider.requests.append(request)
+        return CompletionResponse(
+            "msg-1",
+            "safe-response-model",
+            (TextBlock("hello"),),
+            "end_turn",
+            TokenUsage(2, 1),
+        )
+
+    provider.complete = complete_with_safe_response
+    hostile = "model\nforged\r\x1b\x85\u2028\u202e\ud800"
+    body = json.dumps(
+        messages_payload(model=hostile, messages=[]), ensure_ascii=True
+    ).encode("ascii")
+    with caplog.at_level(
+        logging.INFO, logger="claude_code_proxy.logging.session"
+    ):
+        response = client(provider).post(
+            "/v1/messages",
+            content=body,
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 200
+    assert provider.requests[0].original_model == hostile
+    assert "model\\x0aforged\\x0d\\x1b\\x85\\u2028\\u202e\\ud800" in caplog.text
+    assert "model\nforged" not in caplog.text
+    for control in ("\r", "\x1b", "\x85", "\u2028", "\u202e", "\ud800"):
+        assert control not in caplog.text
 
 
 def test_repeated_session_logs_new_only_once(caplog):

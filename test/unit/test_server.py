@@ -2,6 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+import logging
 import signal
 import socket
 from types import SimpleNamespace
@@ -15,8 +16,9 @@ from claude_code_proxy.observability import SessionRegistry
 
 
 class FakeLease:
-    def __init__(self, close_error=None):
+    def __init__(self, close_error=None, path=Path("/safe/control.sock")):
         self.socket = object()
+        self.path = path
         self.close_calls = 0
         self.close_error = close_error
 
@@ -258,6 +260,99 @@ async def test_ready_hook_is_set_only_after_both_servers_start(fake_apps):
 
     stop.set()
     await task
+
+
+async def test_readiness_report_occurs_once_after_both_servers_are_live(
+    fake_apps,
+):
+    control = FakeServer("control")
+    public = FakeServer("public")
+    stop = asyncio.Event()
+    ready = asyncio.Event()
+    reports: list[tuple[str, int, Path]] = []
+
+    def report(host: str, port: int, socket_path: Path) -> None:
+        assert control.started and public.started
+        assert not ready.is_set()
+        reports.append((host, port, socket_path))
+
+    task = asyncio.create_task(
+        server_module.serve_proxy(
+            runtime(),
+            FakeLease(),
+            stop_event=stop,
+            server_factory=QueueFactory(control, public),
+            _ready_event=ready,
+            _ready_reporter=report,
+        )
+    )
+    await ready.wait()
+
+    assert reports == [("198.51.100.7", 9876, Path("/safe/control.sock"))]
+    stop.set()
+    await task
+    assert len(reports) == 1
+
+
+async def test_startup_failure_and_stop_race_do_not_report_readiness(fake_apps):
+    reports: list[tuple[str, int, Path]] = []
+    reporter = lambda host, port, path: reports.append((host, port, path))
+
+    with pytest.raises(RuntimeError, match="public.*startup"):
+        await server_module.serve_proxy(
+            runtime(),
+            FakeLease(),
+            server_factory=QueueFactory(
+                FakeServer("control"),
+                FakeServer("public", start_error=RuntimeError("boom")),
+            ),
+            _ready_reporter=reporter,
+        )
+
+    stop = asyncio.Event()
+    await server_module.serve_proxy(
+        runtime(),
+        FakeLease(),
+        stop_event=stop,
+        server_factory=QueueFactory(
+            StopOnStartServer("control", stop), FakeServer("public")
+        ),
+        _ready_reporter=reporter,
+    )
+    assert reports == []
+
+
+async def test_default_readiness_log_is_info_and_encodes_public_fields(
+    fake_apps, caplog
+):
+    configured = runtime()
+    configured.settings.proxy_host = "host\n\x1b\u202e\ud800"
+    stop = asyncio.Event()
+    ready = asyncio.Event()
+    with caplog.at_level(
+        logging.INFO, logger="claude_code_proxy.logging.readiness"
+    ):
+        task = asyncio.create_task(
+            server_module.serve_proxy(
+                configured,
+                FakeLease(path=Path("/safe/socket\n\u202e.sock")),
+                stop_event=stop,
+                server_factory=QueueFactory(
+                    FakeServer("control"), FakeServer("public")
+                ),
+                _ready_event=ready,
+            )
+        )
+        await ready.wait()
+        stop.set()
+        await task
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == [
+        "Proxy ready host=host\\x0a\\x1b\\u202e\\ud800 "
+        "port=9876 control_socket=/safe/socket\\x0a\\u202e.sock"
+    ]
+    messages[0].encode("utf-8", errors="strict")
 
 
 async def test_external_stop_gracefully_stops_both_and_closes_lease_once(fake_apps):

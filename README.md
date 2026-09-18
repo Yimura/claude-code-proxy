@@ -10,8 +10,8 @@ Use Anthropic-compatible clients such as Claude Code with Gemini, OpenAI, Codex 
 
 Choose prerequisites for targets in your `model_mapping.json`:
 
-- Python 3.14.x and [uv](https://docs.astral.sh/uv/) for source setup.
-- Docker with Docker Compose for container setup.
+- Linux, Python 3.14.x, and [uv](https://docs.astral.sh/uv/) for source setup. Source `proxy` and host-side `ps` use a Linux-only secure Unix-socket backend.
+- Docker with Docker Compose for container setup. Linux containers remain supported on macOS and Windows hosts.
 - One or more provider credentials:
   - OpenAI API key for `openai/...` targets using LiteLLM.
   - Google AI Studio API key or Vertex AI Application Default Credentials for `gemini/...` targets.
@@ -27,6 +27,8 @@ cp .env.example .env
 uv sync --locked --dev
 uv run claude-code-proxy proxy
 ```
+
+Source `proxy` and host-side `ps` are supported on Linux only. On macOS or Windows, use the Docker setup below and run `ps` inside the Linux container.
 
 Edit `.env` before starting. Configure only credentials required by targets in `model_mapping.json`. The `proxy` and `ps` commands read `.env` from the current working directory; already-exported environment variables win, and command options override both. The example binds source deployments to `127.0.0.1` because the public API does not authenticate inbound requests. The proxy command runs in the foreground.
 
@@ -53,7 +55,7 @@ The image starts through the installed `claude-code-proxy` executable; `uv run` 
 docker compose exec proxy claude-code-proxy ps
 ```
 
-The default control socket is container-local at `/run/claude-code-proxy/control.sock`. It is not published or mounted, so a CLI running on the host cannot query the container unless you deliberately change the deployment.
+The default control socket is container-local at `/run/claude-code-proxy/control.sock`. It is not published or mounted, so a CLI running on the host cannot query the container unless you deliberately change the deployment. On macOS and Windows hosts, run `ps` through `docker compose exec` as shown above; the source launcher and host-side control client are supported on Linux only.
 
 ### Connect Claude Code
 
@@ -111,7 +113,7 @@ Model selection belongs in `model_mapping.json`. Environment variables configure
 | `PROXY_HOST` | Selects the public proxy bind host | Optional; keep source deployments on loopback unless external access is secured | Built-in: `0.0.0.0`; `.env.example`: `127.0.0.1`; Compose container: `0.0.0.0` |
 | `PROXY_PORT` | Selects the public proxy TCP port; Compose applies it to the listener and loopback publication | Optional | `8082` |
 | `CONTROL_SOCKET_PATH` | Overrides the private local control Unix socket path | Optional for source; must be absolute with an existing private parent | Automatic XDG/private fallback for source; image uses `/run/claude-code-proxy/control.sock` |
-| `SESSION_RETENTION_LIMIT` | Sets the maximum inactive logical session rows retained in memory | Optional; must be a non-negative integer | `1000` |
+| `SESSION_RETENTION_LIMIT` | Sets the maximum inactive logical session rows retained in memory | Optional; must be an integer from `0` through `9223372036854775807` | `1000` |
 
 ### Conflicting choices
 
@@ -162,7 +164,7 @@ Model selection belongs in `model_mapping.json`. Environment variables configure
 Every model definition requires:
 
 - `target`: exact upstream provider model.
-- `context_window`: positive token count, or `null` when capability is unknown.
+- `context_window`: positive token count up to `9223372036854775807`, or `null` when capability is unknown.
 
 Tier values reference model-definition names. Each mapping selects exactly one model definition:
 

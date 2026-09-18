@@ -12,9 +12,10 @@ from typing import Any, Self
 import httpx
 from pydantic import ValidationError
 
+from ..limits import MAX_CONTROL_INTEGER
+from ..text_safety import escaped_text_atom
 from .schemas import HealthResponse, SessionListResponse, SessionResponse
 
-MAX_CONTROL_INTEGER = 2**63 - 1
 _PROTOCOL_VERSION = 1
 _DEFAULT_TIMEOUT_SECONDS = 2.0
 _MAX_ERROR_DETAIL = 200
@@ -126,6 +127,10 @@ class ControlClient:
             response = self._client.get(path, params=params)
         except httpx.RequestError as error:
             raise ControlUnavailable(self.socket_path, str(error)) from error
+        if path == "/v1/health" and response.status_code == 404:
+            raise IncompatibleProtocol(
+                "Control API health endpoint is missing (HTTP 404)"
+            )
         if not response.is_success:
             raise ControlError(_http_error_message(response))
         try:
@@ -213,7 +218,7 @@ def _http_error_message(response: httpx.Response) -> str:
 
 
 def _safe_text(value: str, limit: int = _MAX_ERROR_DETAIL) -> str:
-    atoms = [_safe_atom(character) for character in value]
+    atoms = [escaped_text_atom(character) for character in value]
     escaped = "".join(atoms)
     if len(escaped) <= limit:
         return escaped
@@ -228,14 +233,3 @@ def _safe_text(value: str, limit: int = _MAX_ERROR_DETAIL) -> str:
         selected.append(atom)
         selected_length += len(atom)
     return "".join(selected) + marker
-
-
-def _safe_atom(character: str) -> str:
-    code = ord(character)
-    if code < 0x20 or 0x7F <= code <= 0x9F:
-        return f"\\x{code:02x}"
-    if character.isprintable():
-        return character
-    if code <= 0xFFFF:
-        return f"\\u{code:04x}"
-    return f"\\U{code:08x}"

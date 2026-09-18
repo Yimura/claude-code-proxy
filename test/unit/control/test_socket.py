@@ -139,6 +139,26 @@ def _replace_leaf_during_quarantine(
     return real_rename
 
 
+def test_acquire_rejects_non_linux_before_filesystem_side_effects(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "not-created" / "control.sock"
+    monkeypatch.setattr(socket_module.sys, "platform", "darwin")
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "secure control socket requires Linux; "
+            "use Docker on other platforms"
+        ),
+    ):
+        SocketLease.acquire(path)
+
+    assert not path.parent.exists()
+    assert not path.exists()
+    assert not path.with_name("control.lock").exists()
+
+
 def test_resolve_socket_path_prefers_explicit_and_expands_home(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

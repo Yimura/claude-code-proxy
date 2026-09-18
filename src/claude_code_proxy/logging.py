@@ -5,12 +5,14 @@ from dataclasses import dataclass
 import hashlib
 import logging
 import os
+from pathlib import Path
 import uuid
 
 from .domain.models import StreamError, StreamEvent
 from .observability import SessionRegistry
 from .providers.base import ProviderError
 from .reasoning import ReasoningPolicy
+from .text_safety import log_text
 
 SESSION_HEADER = "x-claude-code-session-id"
 FAILURE_LOGGED = "failure_logged"
@@ -25,6 +27,7 @@ SESSION_COLORS = (
 _RESET = "\033[0m"
 
 logger = logging.getLogger(__name__)
+readiness_logger = logging.getLogger(f"{__name__}.readiness")
 session_logger = logging.getLogger(f"{__name__}.session")
 
 
@@ -72,6 +75,17 @@ class RequestLogContext:
     provider: str
     effort: str
 
+    def __post_init__(self) -> None:
+        for name in (
+            "method",
+            "endpoint",
+            "original_model",
+            "upstream_model",
+            "provider",
+            "effort",
+        ):
+            object.__setattr__(self, name, log_text(getattr(self, name)))
+
 
 def palette_index(identifier: str) -> int:
     digest = hashlib.sha256(identifier.encode()).digest()
@@ -109,8 +123,19 @@ def configure_logging() -> None:
     )
     logging.getLogger().addFilter(MessageFilter())
     session_logger.setLevel(logging.INFO)
+    readiness_logger.setLevel(logging.INFO)
     for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
         logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def log_proxy_ready(host: str, port: int, socket_path: Path) -> None:
+    """Report the production endpoint only after both servers are live."""
+    readiness_logger.info(
+        "Proxy ready host=%s port=%s control_socket=%s",
+        log_text(host),
+        port,
+        log_text(str(socket_path)),
+    )
 
 
 def _request_fields(context: RequestLogContext) -> tuple[object, ...]:
@@ -156,12 +181,12 @@ def log_stream_failure(
         context.session.rendered,
         context.method,
         context.endpoint,
-        error.error_type,
+        log_text(error.error_type),
         error.status_code,
         error.retryable,
         context.original_model,
         context.upstream_model,
-        error.provider or context.provider,
+        log_text(error.provider) if error.provider else context.provider,
         context.effort,
     )
 
@@ -173,7 +198,7 @@ def log_unexpected_failure(context: RequestLogContext, error_type: str) -> None:
         context.session.rendered,
         context.method,
         context.endpoint,
-        error_type,
+        log_text(error_type),
         context.original_model,
         context.upstream_model,
         context.provider,
@@ -210,8 +235,8 @@ def log_http_failure(
     logger.warning(
         "%s %s %s HTTP request failed status=%s",
         session.rendered,
-        request.method,
-        request.url.path,
+        log_text(request.method),
+        log_text(request.url.path),
         status_code,
     )
 
@@ -234,9 +259,9 @@ def log_middleware_exception(
     logger.error(
         "%s %s %s unexpected HTTP failure error=%s",
         session.rendered,
-        request.method,
-        request.url.path,
-        error_type,
+        log_text(request.method),
+        log_text(request.url.path),
+        log_text(error_type),
     )
 
 

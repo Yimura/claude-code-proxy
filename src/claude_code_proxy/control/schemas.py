@@ -1,9 +1,19 @@
 """Validated response schemas for the local control API."""
 
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from ..limits import MAX_CONTROL_INTEGER
+
+
+NonNegativeControlInteger = Annotated[
+    int, Field(strict=True, ge=0, le=MAX_CONTROL_INTEGER)
+]
+PositiveControlInteger = Annotated[
+    int, Field(strict=True, ge=1, le=MAX_CONTROL_INTEGER)
+]
 
 
 class _FrozenModel(BaseModel):
@@ -17,19 +27,19 @@ def _require_wire_duration(value: object) -> object:
 
 
 class SessionCounts(_FrozenModel):
-    active: StrictInt
-    retained: StrictInt
+    active: NonNegativeControlInteger
+    retained: NonNegativeControlInteger
 
 
 class HealthResponse(_FrozenModel):
     protocol_version: Literal[1] = 1
     application_version: str
-    pid: StrictInt
+    pid: PositiveControlInteger
     started_at: datetime
     uptime_seconds: float
     capabilities: tuple[str, ...] = ("sessions",)
     sessions: SessionCounts
-    inactive_limit: StrictInt
+    inactive_limit: NonNegativeControlInteger
 
     @field_validator("uptime_seconds", mode="before")
     @classmethod
@@ -42,14 +52,14 @@ class SessionResponse(_FrozenModel):
 
     id: str
     state: Literal["active", "idle", "failed"]
-    active_requests: StrictInt
-    requests: StrictInt
+    active_requests: NonNegativeControlInteger
+    requests: NonNegativeControlInteger
     client_model: str
     model: str
     provider: str
     transport: str
     effort: str
-    context_window: StrictInt | None
+    context_window: PositiveControlInteger | None
     first_seen: datetime
     last_seen: datetime
     elapsed_seconds: float

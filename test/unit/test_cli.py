@@ -16,6 +16,7 @@ from wcwidth import wcswidth
 from typer.testing import CliRunner
 
 from claude_code_proxy import cli as cli_module
+import claude_code_proxy.control.socket as socket_module
 from claude_code_proxy.cli import app
 from claude_code_proxy.config import Settings
 from claude_code_proxy.control.client import (
@@ -188,6 +189,7 @@ def test_bare_app_shows_help_successfully() -> None:
         ["proxy", "--port", "0"],
         ["proxy", "--port", "65536"],
         ["proxy", "--session-limit", "-1"],
+        ["proxy", "--session-limit", str(2**63)],
     ],
 )
 def test_invalid_command_or_option_exits_two(arguments: list[str]) -> None:
@@ -246,6 +248,34 @@ def test_proxy_uses_environment_settings_and_calls_startup_in_order(
     ]
 
 
+def test_proxy_reports_non_linux_control_socket_guidance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    configured = settings(
+        tmp_path, control_socket_path=tmp_path / "not-created" / "control.sock"
+    )
+    monkeypatch.setattr(
+        cli_module.Settings,
+        "from_environment",
+        classmethod(lambda cls: configured),
+    )
+    monkeypatch.setattr(socket_module.sys, "platform", "darwin")
+    monkeypatch.setattr(cli_module, "configure_logging", lambda: None)
+    monkeypatch.setattr(
+        cli_module,
+        "create_runtime",
+        lambda value: pytest.fail("runtime created on unsupported platform"),
+    )
+
+    result = runner.invoke(app, ["proxy"])
+
+    assert result.exit_code == 1
+    assert "secure control socket requires Linux" in result.stderr
+    assert "use Docker on other platforms" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not configured.control_socket_path.parent.exists()
+
+
 @pytest.mark.parametrize(
     ("arguments", "field", "expected"),
     [
@@ -253,6 +283,7 @@ def test_proxy_uses_environment_settings_and_calls_startup_in_order(
         (["--port", "4123"], "proxy_port", 4123),
         (["--socket", "/cli/control.sock"], "control_socket_path", Path("/cli/control.sock")),
         (["--session-limit", "0"], "session_retention_limit", 0),
+        (["--session-limit", str(2**63 - 1)], "session_retention_limit", 2**63 - 1),
     ],
 )
 def test_proxy_cli_options_override_environment_settings(
@@ -905,6 +936,50 @@ def test_ps_client_errors_exit_one_and_close_context(
         assert "docker compose exec proxy claude-code-proxy ps" in result.stderr
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        IncompatibleProtocol("protocol version 2 is incompatible\nforged"),
+        IncompatibleProtocol("missing sessions capability\x1b\u202e\ud800"),
+    ],
+)
+def test_ps_incompatible_protocol_reports_safe_socket_and_guidance(
+    error: IncompatibleProtocol, tmp_path: Path
+) -> None:
+    socket_path = tmp_path / "chosen\n\u202e.sock"
+    FakeClient.error = error
+
+    result = runner.invoke(
+        app, ["ps", "--socket", str(socket_path)]
+    )
+
+    assert result.exit_code == 1
+    assert "Incompatible control API" in result.stderr
+    assert str(tmp_path) in result.stderr
+    assert "chosen\\x0a\\u202e.sock" in result.stderr
+    assert "protocol version" in result.stderr or "sessions capability" in result.stderr
+    assert "forged" in result.stderr or "\\x1b\\u202e\\ud800" in result.stderr
+    assert "source: start `claude-code-proxy proxy`" in result.stderr
+    assert "docker compose exec proxy claude-code-proxy ps" in result.stderr
+    assert "\nforged" not in result.stderr
+    assert "\x1b" not in result.stderr
+    assert "\u202e" not in result.stderr
+    assert "\ud800" not in result.stderr
+    result.stderr.encode("utf-8", errors="strict")
+
+
+def test_ps_generic_control_error_has_no_incompatibility_guidance() -> None:
+    FakeClient.error = ControlError("Control API returned HTTP 500")
+
+    result = runner.invoke(app, ["ps"])
+
+    assert result.exit_code == 1
+    assert "HTTP 500" in result.stderr
+    assert "Incompatible" not in result.stderr
+    assert "claude-code-proxy proxy" not in result.stderr
+    assert "docker compose exec" not in result.stderr
+
+
 def test_ps_closes_client_context_on_success() -> None:
     result = runner.invoke(app, ["ps"])
 
@@ -920,6 +995,7 @@ def test_module_adapter_and_console_script_declaration() -> None:
 
     assert main_module.app is app
     assert metadata["project"]["scripts"]["claude-code-proxy"] == "claude_code_proxy.cli:app"
+    assert "Operating System :: POSIX :: Linux" in metadata["project"]["classifiers"]
     assert "typer>=0.21.1" in metadata["project"]["dependencies"]
     assert "wcwidth>=0.2.13" in metadata["project"]["dependencies"]
 
@@ -1100,6 +1176,20 @@ def test_ps_subprocess_rejects_coerced_wire_types(
     assert expected in completed.stderr
     assert completed.stdout == ""
     assert "Traceback" not in completed.stderr
+
+
+@pytest.mark.parametrize(
+    "arguments", [["--help"], ["proxy", "--help"], ["ps", "--help"]]
+)
+def test_help_is_available_on_non_linux(
+    arguments: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(socket_module.sys, "platform", "darwin")
+
+    result = runner.invoke(app, arguments)
+
+    assert result.exit_code == 0
+    assert "Usage" in result.stdout
 
 
 @pytest.mark.parametrize("command", ["proxy", "ps"])

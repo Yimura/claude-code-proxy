@@ -12,7 +12,12 @@ from claude_code_proxy.domain.models import (
 from claude_code_proxy.logging import (
     RequestLogContext,
     SessionIdentity,
+    configure_logging,
     effective_effort,
+    log_provider_failure,
+    log_session_started,
+    log_stream_failure,
+    log_unexpected_failure,
     observe_stream,
     palette_index,
     session_identity,
@@ -31,6 +36,17 @@ def make_context(identity: SessionIdentity | None = None) -> RequestLogContext:
         provider="fake",
         effort="high",
     )
+
+
+def test_configure_logging_exposes_readiness_info_and_keeps_uvicorn_quiet():
+    configure_logging()
+
+    assert logging.getLogger(
+        "claude_code_proxy.logging.readiness"
+    ).isEnabledFor(logging.INFO)
+    assert not logging.getLogger("uvicorn").isEnabledFor(logging.INFO)
+    assert not logging.getLogger("uvicorn.access").isEnabledFor(logging.INFO)
+    assert not logging.getLogger("uvicorn.error").isEnabledFor(logging.INFO)
 
 
 def test_palette_index_is_stable_and_bounded():
@@ -81,6 +97,59 @@ def test_no_color_disables_identity_color():
 )
 def test_effective_effort(policy, expected):
     assert effective_effort(policy) == expected
+
+
+def test_untrusted_log_context_escapes_record_and_terminal_controls(caplog):
+    hostile = "field\n\r\t\x1b\x85\u2028\u2029\u202e\ud800"
+    context = RequestLogContext(
+        session=SessionIdentity("safe", "[session safe]", True),
+        method=hostile,
+        endpoint=hostile,
+        original_model=hostile,
+        upstream_model=hostile,
+        provider=hostile,
+        effort=hostile,
+    )
+
+    with caplog.at_level(logging.INFO):
+        log_session_started(context)
+        log_provider_failure(context, 503)
+        log_stream_failure(
+            context,
+            StreamError(error_type=hostile, provider=hostile),
+        )
+        log_unexpected_failure(context, hostile)
+
+    rendered = caplog.text
+    for token in (
+        "\\x0a",
+        "\\x0d",
+        "\\x09",
+        "\\x1b",
+        "\\x85",
+        "\\u2028",
+        "\\u2029",
+        "\\u202e",
+        "\\ud800",
+    ):
+        assert token in rendered
+    for control in ("\r", "\t", "\x1b", "\x85", "\u2028", "\u2029", "\u202e", "\ud800"):
+        assert control not in rendered
+    assert "field\n" not in rendered
+    rendered.encode("utf-8", errors="strict")
+
+
+def test_application_generated_session_ansi_is_preserved(caplog):
+    context = make_context(
+        SessionIdentity("abcdef123456", "[session \x1b[96mabcdef123456\x1b[0m]", True)
+    )
+
+    with caplog.at_level(
+        logging.INFO, logger="claude_code_proxy.logging.session"
+    ):
+        log_session_started(context)
+
+    assert "\x1b[96mabcdef123456\x1b[0m" in caplog.records[-1].getMessage()
 
 
 async def iter_events(events):

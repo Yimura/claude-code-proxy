@@ -10,7 +10,9 @@ from typing import Literal
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .limits import MAX_CONTROL_INTEGER
 from .reasoning import MappingEntry, parse_model_mappings
+from .text_safety import log_text
 
 logger = logging.getLogger(__name__)
 OpenAITransport = Literal["litellm", "codex"]
@@ -22,7 +24,7 @@ class ModelDefinition(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     target: str
-    context_window: int | None = Field(strict=True, gt=0)
+    context_window: int | None = Field(strict=True, gt=0, le=MAX_CONTROL_INTEGER)
 
     @model_validator(mode="after")
     def validate_target(self) -> "ModelDefinition":
@@ -135,8 +137,11 @@ def _session_retention_limit_from_environment() -> int:
         raise ValueError(
             "SESSION_RETENTION_LIMIT must be a non-negative integer"
         ) from error
-    if limit < 0:
-        raise ValueError("SESSION_RETENTION_LIMIT must be a non-negative integer")
+    if not 0 <= limit <= MAX_CONTROL_INTEGER:
+        raise ValueError(
+            "SESSION_RETENTION_LIMIT must be between 0 and "
+            f"{MAX_CONTROL_INTEGER}"
+        )
     return limit
 
 
@@ -211,7 +216,10 @@ def load_model_mapping(path: Path) -> ModelConfig:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        logger.warning("Model mapping file not found at %s, using defaults", path)
+        logger.warning(
+            "Model mapping file not found at %s, using defaults",
+            log_text(str(path)),
+        )
         return ModelConfig(
             models=DEFAULT_MODEL_CONFIG.models.copy(),
             tiers=DEFAULT_MODEL_CONFIG.tiers.copy(),

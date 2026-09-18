@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import httpx
+from pydantic import ValidationError
 import pytest
 
 from claude_code_proxy.control import client as client_module
@@ -15,6 +16,7 @@ from claude_code_proxy.control.client import (
     ControlUnavailable,
     IncompatibleProtocol,
 )
+from claude_code_proxy.control.schemas import HealthResponse, SessionResponse
 
 
 SOCKET_PATH = Path("/run/user/1000/claude-code-proxy/control.sock")
@@ -155,6 +157,33 @@ def test_health_rejects_out_of_range_numeric_fields(
             client.health()
 
     assert str(raised.value) == "Control API returned an invalid health response"
+
+
+def test_control_schemas_enforce_strict_signed_64_integer_fields() -> None:
+    maximum = 2**63 - 1
+    health = health_payload(
+        pid=maximum,
+        sessions={"active": maximum, "retained": maximum},
+        inactive_limit=maximum,
+    )
+    observed = session_payload()
+    observed.update({
+        "active_requests": maximum,
+        "requests": maximum,
+        "context_window": maximum,
+    })
+
+    assert HealthResponse.model_validate(health).pid == maximum
+    assert SessionResponse.model_validate(observed).context_window == maximum
+    for field, payload in (
+        ("pid", health_payload(pid=maximum + 1)),
+        ("inactive_limit", health_payload(inactive_limit=maximum + 1)),
+    ):
+        with pytest.raises(ValidationError, match=field):
+            HealthResponse.model_validate(payload)
+    observed["context_window"] = maximum + 1
+    with pytest.raises(ValidationError, match="context_window"):
+        SessionResponse.model_validate(observed)
 
 
 def test_health_accepts_signed_64_maximum_integer_fields() -> None:
@@ -563,6 +592,18 @@ def test_sessions_maps_utc_conversion_overflow_to_safe_error(
 
     assert str(raised.value) == "Control API returned an invalid sessions response"
     assert "date value out of range" not in str(raised.value)
+
+
+def test_health_404_is_incompatible_protocol_not_generic_http_error() -> None:
+    transport = RecordingTransport(
+        lambda request: httpx.Response(
+            404, json={"detail": "Not Found"}, request=request
+        )
+    )
+
+    with ControlClient(SOCKET_PATH, transport=transport) as client:
+        with pytest.raises(IncompatibleProtocol, match="health endpoint.*404"):
+            client.health()
 
 
 @pytest.mark.parametrize("version", [True, 1.0, "1", 2])

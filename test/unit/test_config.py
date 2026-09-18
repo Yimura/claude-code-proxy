@@ -1,4 +1,5 @@
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -138,14 +139,33 @@ def test_settings_rejects_invalid_proxy_port(monkeypatch, value, message):
         Settings.from_environment()
 
 
-@pytest.mark.parametrize("value", ["not-an-integer", "-1"])
-def test_settings_rejects_invalid_session_retention_limit(monkeypatch, value):
+def test_session_retention_accepts_signed_64_maximum(monkeypatch):
+    maximum = 2**63 - 1
+    monkeypatch.setenv("SESSION_RETENTION_LIMIT", str(maximum))
+
+    assert Settings.from_environment().session_retention_limit == maximum
+
+
+def test_session_retention_rejects_above_signed_64_maximum(monkeypatch):
+    monkeypatch.setenv("SESSION_RETENTION_LIMIT", str(2**63))
+
+    with pytest.raises(ValueError, match="between 0 and 9223372036854775807"):
+        Settings.from_environment()
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("not-an-integer", "must be a non-negative integer"),
+        ("-1", "must be between 0 and 9223372036854775807"),
+    ],
+)
+def test_settings_rejects_invalid_session_retention_limit(
+    monkeypatch, value, message
+):
     monkeypatch.setenv("SESSION_RETENTION_LIMIT", value)
 
-    with pytest.raises(
-        ValueError,
-        match="SESSION_RETENTION_LIMIT must be a non-negative integer",
-    ):
+    with pytest.raises(ValueError, match=message):
         Settings.from_environment()
 
 
@@ -257,12 +277,34 @@ def test_loads_required_model_definitions(tmp_path):
     assert config.mappings["opus"] == MappingEntry(model="sol", effort="high")
 
 
+def test_missing_mapping_path_is_safely_encoded_in_log(caplog, tmp_path):
+    path = tmp_path / "missing\n\x1b\u202e.json"
+
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.config"):
+        load_model_mapping(path)
+
+    assert "missing\\x0a\\x1b\\u202e.json" in caplog.text
+    assert "missing\n" not in caplog.text
+    assert "\x1b" not in caplog.text
+    assert "\u202e" not in caplog.text
+
+
 def test_mapping_file_requires_models_object(tmp_path):
     path = tmp_path / "mapping.json"
     path.write_text(json.dumps({"tiers": {}, "mappings": {}}))
 
     with pytest.raises(ValueError, match="models"):
         load_model_mapping(path)
+
+
+def test_model_context_window_enforces_signed_64_range():
+    maximum = 2**63 - 1
+
+    assert ModelDefinition(
+        target="openai/model", context_window=maximum
+    ).context_window == maximum
+    with pytest.raises(ValueError, match="less than or equal"):
+        ModelDefinition(target="openai/model", context_window=maximum + 1)
 
 
 @pytest.mark.parametrize(

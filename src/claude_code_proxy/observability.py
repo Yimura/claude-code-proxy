@@ -12,6 +12,9 @@ import time
 from typing import Literal
 import uuid
 
+from .limits import MAX_CONTROL_INTEGER
+from .text_safety import scalar_text
+
 SessionState = Literal["active", "idle", "failed"]
 SessionResult = Literal["completed", "failed"]
 SessionFilters = Mapping[str, Sequence[str]]
@@ -30,6 +33,16 @@ class SessionMetadata:
     transport: str
     effort: str
     context_window: int | None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "client_model",
+            "upstream_model",
+            "provider",
+            "transport",
+            "effort",
+        ):
+            object.__setattr__(self, name, scalar_text(getattr(self, name)))
 
 
 @dataclass(frozen=True)
@@ -111,8 +124,14 @@ class SessionRegistry:
         wall_clock: Callable[[], datetime] | None = None,
         monotonic_clock: Callable[[], float] | None = None,
     ) -> None:
-        if inactive_limit < 0:
-            raise ValueError("inactive_limit must be non-negative")
+        if (
+            type(inactive_limit) is not int
+            or not 0 <= inactive_limit <= MAX_CONTROL_INTEGER
+        ):
+            raise ValueError(
+                "inactive_limit must be an integer between 0 and "
+                f"{MAX_CONTROL_INTEGER}"
+            )
         self._inactive_limit = inactive_limit
         self._secret = secrets.token_bytes(32) if secret is None else secret
         self._wall_clock = wall_clock or (lambda: datetime.now(UTC))
@@ -130,7 +149,7 @@ class SessionRegistry:
         normalized = identifier.strip()
         return hmac.new(
             self._secret,
-            normalized.encode(),
+            normalized.encode(errors="surrogatepass"),
             hashlib.sha256,
         ).hexdigest()
 
