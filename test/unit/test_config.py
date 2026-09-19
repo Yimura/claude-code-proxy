@@ -95,6 +95,7 @@ def test_settings_rejects_invalid_openai_transport(monkeypatch):
 
 def test_settings_uses_runtime_defaults(monkeypatch):
     for name in (
+        "OPENAI_TRANSPORT",
         "PROXY_HOST",
         "PROXY_PORT",
         "CONTROL_SOCKET_PATH",
@@ -104,6 +105,7 @@ def test_settings_uses_runtime_defaults(monkeypatch):
 
     settings = Settings.from_environment()
 
+    assert settings.openai_transport == "litellm"
     assert settings.proxy_host == "0.0.0.0"
     assert settings.proxy_port == 8082
     assert settings.control_socket_path is None

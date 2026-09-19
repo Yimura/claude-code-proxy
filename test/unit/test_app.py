@@ -1,4 +1,5 @@
 import importlib
+import logging
 import sys
 
 import pytest
@@ -6,6 +7,7 @@ import pytest
 import claude_code_proxy.app as app_module
 import claude_code_proxy.runtime as runtime_module
 from claude_code_proxy.config import Settings
+from claude_code_proxy.providers.codex.auth import CodexAccountIdentity
 
 
 def settings(tmp_path, transport="litellm"):
@@ -26,6 +28,11 @@ def settings(tmp_path, transport="litellm"):
 class FakeAuth:
     instances = []
     failure = None
+    identity = CodexAccountIdentity(
+        account_id="account-123",
+        masked_email="j***@crimson7.io",
+        source="opencode.db",
+    )
 
     def __init__(self, data_dir):
         self.data_dir = data_dir
@@ -36,6 +43,7 @@ class FakeAuth:
         self.initialize_calls += 1
         if self.failure is not None:
             raise self.failure
+        return self.identity
 
     async def get_auth(self):
         return "access", "account"
@@ -72,6 +80,26 @@ async def test_codex_transport_initializes_auth_once_during_startup(
     assert runtime.codex_auth.initialize_calls == 1
 
 
+async def test_codex_startup_reports_identity_before_lifespan_yields(
+    tmp_path, monkeypatch, caplog
+):
+    monkeypatch.setattr(runtime_module, "CodexAuth", FakeAuth)
+    runtime = runtime_module.create_runtime(settings(tmp_path, "codex"))
+    application = app_module.create_app(runtime)
+    caplog.clear()
+
+    with caplog.at_level(
+        logging.INFO, logger="claude_code_proxy.logging.readiness"
+    ):
+        async with application.router.lifespan_context(application):
+            assert [record.getMessage() for record in caplog.records] == [
+                "OpenAI transport: codex",
+                "OpenCode account: j***@crimson7.io [account-123] (opencode.db)",
+                "To use another account, stop the proxy, switch the active OpenAI "
+                "account in OpenCode, and restart.",
+            ]
+
+
 async def test_litellm_transport_does_not_initialize_codex_auth(
     tmp_path, monkeypatch
 ):
@@ -83,7 +111,26 @@ async def test_litellm_transport_does_not_initialize_codex_auth(
         assert runtime.codex_auth.initialize_calls == 0
 
 
-async def test_codex_auth_failure_aborts_startup(tmp_path, monkeypatch):
+async def test_litellm_startup_reports_transport_without_codex_identity(
+    tmp_path, monkeypatch, caplog
+):
+    monkeypatch.setattr(runtime_module, "CodexAuth", FakeAuth)
+    runtime = runtime_module.create_runtime(settings(tmp_path, "litellm"))
+    application = app_module.create_app(runtime)
+    caplog.clear()
+
+    with caplog.at_level(
+        logging.INFO, logger="claude_code_proxy.logging.readiness"
+    ):
+        async with application.router.lifespan_context(application):
+            assert [record.getMessage() for record in caplog.records] == [
+                "OpenAI transport: litellm"
+            ]
+
+    assert runtime.codex_auth.initialize_calls == 0
+
+
+async def test_codex_auth_failure_aborts_startup(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(runtime_module, "CodexAuth", FakeAuth)
     FakeAuth.failure = RuntimeError("credentials unavailable")
     runtime = runtime_module.create_runtime(settings(tmp_path, "codex"))
@@ -94,6 +141,10 @@ async def test_codex_auth_failure_aborts_startup(tmp_path, monkeypatch):
             pytest.fail("startup must not enter application lifespan")
 
     assert runtime.codex_auth.initialize_calls == 1
+    assert not any(
+        record.name == "claude_code_proxy.logging.readiness"
+        for record in caplog.records
+    )
 
 
 def test_importing_app_does_not_construct_runtime_or_expose_application(

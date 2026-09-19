@@ -118,6 +118,26 @@ Model selection belongs in `model_mapping.json`. Environment variables configure
 
 Proxy startup uses LiteLLM's bundled model-cost metadata and does not refresh it over HTTP by default. The application sets `LITELLM_LOCAL_MODEL_COST_MAP=True` only when the variable is absent, so an explicit operator value is preserved. LiteLLM 1.101 recognizes only the case-insensitive literal `true` as local-only; set the variable explicitly to `False` to opt into LiteLLM's startup refresh, optionally from `LITELLM_MODEL_COST_MAP_URL`.
 
+### Startup transport and Codex account
+
+Before the public endpoint accepts requests, startup logs the effective OpenAI transport. When `OPENAI_TRANSPORT` is unset, the summary confirms the default:
+
+```text
+OpenAI transport: litellm
+```
+
+Codex startup resolves OpenCode authentication first, then reports the selected account and credential source:
+
+```text
+OpenAI transport: codex
+OpenCode account: j***@crimson7.io [account-123] (opencode.db)
+To use another account, stop the proxy, switch the active OpenAI account in OpenCode, and restart.
+```
+
+The email comes from a profile claim marked `email_verified` in the selected OpenCode access token and is masked before leaving the authentication component. If that claim is missing, malformed, or unverified, startup reports the non-secret account ID instead. Sources are `opencode.db` for the active OpenAI database credential and `auth.json` for the fallback credential. Startup output never includes a full email address, access token, refresh token, complete credential record, or unmasked token claims.
+
+To switch accounts, stop the proxy, select the intended active OpenAI account in OpenCode, and restart the proxy. The proxy caches the resolved credential for the running process and does not switch accounts itself.
+
 ### Conflicting choices
 
 | Choose one | Do not combine with | Why |

@@ -19,6 +19,7 @@ from claude_code_proxy.logging import (
     configure_logging,
     effective_effort,
     log_provider_failure,
+    log_startup_summary,
     log_session_started,
     log_stream_failure,
     log_unexpected_failure,
@@ -26,6 +27,7 @@ from claude_code_proxy.logging import (
     palette_index,
     session_identity,
 )
+from claude_code_proxy.providers.codex.auth import CodexAccountIdentity
 from claude_code_proxy.reasoning import ReasoningPolicy
 
 
@@ -87,6 +89,57 @@ def test_client_identity_from_headers_normalizes_blank_and_orphan_parent():
 
     assert blank == ClientIdentity()
     assert orphan == ClientIdentity()
+
+def test_startup_summary_reports_litellm_transport(caplog):
+    with caplog.at_level(
+        logging.INFO, logger="claude_code_proxy.logging.readiness"
+    ):
+        log_startup_summary("litellm")
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "OpenAI transport: litellm"
+    ]
+
+
+def test_startup_summary_reports_safe_codex_identity_and_switch_guidance(caplog):
+    identity = CodexAccountIdentity(
+        account_id="account-123",
+        masked_email="j***@crimson7.io",
+        source="opencode.db",
+    )
+
+    with caplog.at_level(
+        logging.INFO, logger="claude_code_proxy.logging.readiness"
+    ):
+        log_startup_summary("codex", identity)
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "OpenAI transport: codex",
+        "OpenCode account: j***@crimson7.io [account-123] (opencode.db)",
+        "To use another account, stop the proxy, switch the active OpenAI "
+        "account in OpenCode, and restart.",
+    ]
+
+
+def test_startup_summary_falls_back_to_encoded_account_id(caplog):
+    identity = CodexAccountIdentity(
+        account_id="account\n\x1b\u202e",
+        masked_email=None,
+        source="auth.json",
+    )
+
+    with caplog.at_level(
+        logging.INFO, logger="claude_code_proxy.logging.readiness"
+    ):
+        log_startup_summary("codex", identity)
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "OpenAI transport: codex",
+        "OpenCode account: account\\x0a\\x1b\\u202e (auth.json)",
+        "To use another account, stop the proxy, switch the active OpenAI "
+        "account in OpenCode, and restart.",
+    ]
+
 
 def test_configure_logging_exposes_readiness_info_and_keeps_uvicorn_quiet():
     configure_logging()
