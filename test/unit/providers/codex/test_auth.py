@@ -1,13 +1,21 @@
 import asyncio
+import base64
 import json
 import sqlite3
 import threading
 
 import pytest
 
-from claude_code_proxy.providers.codex.auth import CodexAuth
+from claude_code_proxy.providers.codex.auth import CodexAccountIdentity, CodexAuth
 
 NOW = 1_700_000_000
+
+
+def access_token(email: str, *, verified: bool = True) -> str:
+    profile = {"email": email, "email_verified": verified}
+    payload = json.dumps({"https://api.openai.com/profile": profile}).encode()
+    encoded = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    return f"e30.{encoded}.signature"
 
 
 def write_json(path, expires, access="access", refresh="refresh", account_id="account"):
@@ -25,7 +33,13 @@ def write_json(path, expires, access="access", refresh="refresh", account_id="ac
     )
 
 
-def write_database(path, expires):
+def write_database(
+    path,
+    expires,
+    *,
+    access="db-access",
+    account_id="db-account",
+):
     with sqlite3.connect(path) as connection:
         connection.execute(
             "CREATE TABLE credential (id INTEGER, integration_id TEXT, active INTEGER, value TEXT, time_updated INTEGER)"
@@ -35,10 +49,10 @@ def write_database(path, expires):
             (
                 json.dumps(
                     {
-                        "access": "db-access",
+                        "access": access,
                         "refresh": "db-refresh",
                         "expires": expires,
-                        "metadata": {"accountID": "db-account"},
+                        "metadata": {"accountID": account_id},
                     }
                 ),
             ),
@@ -75,14 +89,127 @@ async def wait_until(predicate, timeout=1):
     await asyncio.wait_for(wait_for_predicate(), timeout=timeout)
 
 
-async def test_database_credential_takes_precedence(tmp_path):
-    write_json(tmp_path / "auth.json", (NOW + 3600) * 1000)
-    write_database(tmp_path / "opencode.db", (NOW + 3600) * 1000)
+async def test_json_initialize_returns_safe_account_identity(tmp_path):
+    write_json(
+        tmp_path / "auth.json",
+        (NOW + 3600) * 1000,
+        access=access_token("jane.doe@crimson7.io"),
+        account_id="account-123",
+    )
     auth = CodexAuth(tmp_path, clock=lambda: NOW)
 
-    await auth.initialize()
+    identity = await auth.initialize()
 
-    assert await auth.get_auth() == ("db-access", "db-account")
+    assert identity == CodexAccountIdentity(
+        account_id="account-123",
+        masked_email="j***@crimson7.io",
+        source="auth.json",
+    )
+    assert "jane.doe" not in repr(identity)
+
+
+async def test_initialize_ignores_oversized_profile_email(tmp_path):
+    write_json(
+        tmp_path / "auth.json",
+        (NOW + 3600) * 1000,
+        access=access_token(f"a@{'x' * 400}"),
+    )
+    auth = CodexAuth(tmp_path, clock=lambda: NOW)
+
+    identity = await auth.initialize()
+
+    assert identity.masked_email is None
+
+
+async def test_database_credential_takes_precedence(tmp_path):
+    write_json(tmp_path / "auth.json", (NOW + 3600) * 1000)
+    write_database(
+        tmp_path / "opencode.db",
+        (NOW + 3600) * 1000,
+        access=access_token("database.owner@crimson7.io"),
+    )
+    auth = CodexAuth(tmp_path, clock=lambda: NOW)
+
+    identity = await auth.initialize()
+
+    assert identity == CodexAccountIdentity(
+        account_id="db-account",
+        masked_email="d***@crimson7.io",
+        source="opencode.db",
+    )
+    assert await auth.get_auth() == (
+        access_token("database.owner@crimson7.io"),
+        "db-account",
+    )
+
+
+async def test_database_identity_uses_only_active_account(tmp_path):
+    path = tmp_path / "opencode.db"
+    write_database(
+        path,
+        (NOW + 3600) * 1000,
+        access=access_token("active.owner@crimson7.io"),
+        account_id="active-account",
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO credential VALUES (2, 'openai', 0, ?, 0)",
+            (
+                json.dumps({
+                    "access": access_token("inactive.owner@crimson7.io"),
+                    "refresh": "inactive-refresh",
+                    "expires": (NOW + 3600) * 1000,
+                    "metadata": {"accountID": "inactive-account"},
+                }),
+            ),
+        )
+    auth = CodexAuth(tmp_path, clock=lambda: NOW)
+
+    identity = await auth.initialize()
+
+    assert identity.account_id == "active-account"
+    assert identity.masked_email == "a***@crimson7.io"
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        access_token("owner@crimson7.io", verified=False),
+        "not-a-jwt",
+    ],
+)
+async def test_initialize_falls_back_when_profile_email_is_not_trusted(
+    tmp_path, token
+):
+    write_json(tmp_path / "auth.json", (NOW + 3600) * 1000, access=token)
+    auth = CodexAuth(tmp_path, clock=lambda: NOW)
+
+    identity = await auth.initialize()
+
+    assert identity.masked_email is None
+    assert identity.account_id == "account"
+
+
+async def test_refreshed_access_token_supplies_startup_identity(tmp_path):
+    class RefreshedResponse(Response):
+        def json(self):
+            return {
+                "access_token": access_token("rotated.owner@crimson7.io"),
+                "expires_in": 3600,
+                "refresh_token": "new-refresh",
+            }
+
+    write_json(tmp_path / "auth.json", NOW * 1000)
+    auth = CodexAuth(tmp_path, Client(RefreshedResponse()), lambda: NOW)
+
+    identity = await auth.initialize()
+
+    assert identity == CodexAccountIdentity(
+        account_id="account",
+        masked_email="r***@crimson7.io",
+        source="auth.json",
+    )
+    assert "new-refresh" not in repr(identity)
 
 
 async def test_json_fallback_and_cache_avoid_second_read(tmp_path):

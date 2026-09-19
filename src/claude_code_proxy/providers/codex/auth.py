@@ -1,18 +1,33 @@
 """Codex OAuth credential discovery, refresh, persistence, and caching."""
 
 import asyncio
+import base64
+import binascii
+from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
 import sqlite3
 import time
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_AUTH_URL = "https://auth.openai.com/oauth/token"
 FRESHNESS_WINDOW_MS = 60_000
+_PROFILE_CLAIM = "https://api.openai.com/profile"
+_MAX_DISPLAY_EMAIL_LENGTH = 320
+_SOURCE_LABELS = {"db": "opencode.db", "json": "auth.json"}
+
+
+@dataclass(frozen=True)
+class CodexAccountIdentity:
+    """Redacted account metadata approved for startup reporting."""
+
+    account_id: str
+    masked_email: str | None
+    source: Literal["opencode.db", "auth.json"]
 
 
 class CodexAuth:
@@ -20,7 +35,12 @@ class CodexAuth:
         self._data_dir = data_dir
         self._client = client
         self._clock = clock
-        self._cache: dict[str, Any] = {"access": None, "expires": 0, "account_id": None}
+        self._cache: dict[str, Any] = {
+            "access": None,
+            "expires": 0,
+            "account_id": None,
+            "source": None,
+        }
         self._operation_lock = asyncio.Lock()
         self._inflight: asyncio.Task[tuple[str, str]] | None = None
         self._inflight_rejected: str | None = None
@@ -28,8 +48,14 @@ class CodexAuth:
         self._rejected_accesses: set[str] = set()
         self._recovery_active = asyncio.Event()
 
-    async def initialize(self) -> None:
+    async def initialize(self) -> CodexAccountIdentity:
         await self._resolve()
+        source = _SOURCE_LABELS[self._cache["source"]]
+        return CodexAccountIdentity(
+            account_id=self._cache["account_id"],
+            masked_email=_masked_email(self._cache["access"]),
+            source=source,
+        )
 
     async def get_auth(self) -> tuple[str, str]:
         if self._recovery_active.is_set():
@@ -163,6 +189,7 @@ class CodexAuth:
                             "access": credential["access"],
                             "expires": credential["expires"],
                             "account_id": credential["account_id"],
+                            "source": credential.get("source"),
                         }
                     if rejected_access is not None:
                         self._rejected_accesses.discard(rejected_access)
@@ -281,3 +308,35 @@ class CodexAuth:
             if new_refresh:
                 value["refresh"] = new_refresh
             connection.execute("UPDATE credential SET value = ?, time_updated = ? WHERE id = ?", (json.dumps(value), int(self._clock() * 1000), row[0]))
+
+
+def _masked_email(access_token: str) -> str | None:
+    claims = _jwt_claims(access_token)
+    profile = claims.get(_PROFILE_CLAIM)
+    if not isinstance(profile, dict) or profile.get("email_verified") is not True:
+        return None
+    email = profile.get("email")
+    if (
+        not isinstance(email, str)
+        or len(email) > _MAX_DISPLAY_EMAIL_LENGTH
+        or email.count("@") != 1
+    ):
+        return None
+    local, domain = email.split("@")
+    if not local or not domain or email != email.strip():
+        return None
+    return f"{local[0]}***@{domain}"
+
+
+def _jwt_claims(access_token: str) -> dict[str, Any]:
+    parts = access_token.split(".")
+    if len(parts) != 3 or not parts[1]:
+        return {}
+    payload = parts[1].encode("ascii")
+    payload += b"=" * (-len(payload) % 4)
+    try:
+        decoded = base64.b64decode(payload, altchars=b"-_", validate=True)
+        claims = json.loads(decoded)
+    except (UnicodeError, ValueError, binascii.Error):
+        return {}
+    return claims if isinstance(claims, dict) else {}

@@ -1,11 +1,14 @@
 """Application logging configuration and request correlation."""
 
+from __future__ import annotations
+
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 import hashlib
 import logging
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 import uuid
 
 from .domain.models import ClientIdentity, StreamError, StreamEvent
@@ -13,6 +16,9 @@ from .observability import SessionRegistry
 from .providers.base import ProviderError
 from .reasoning import ReasoningPolicy
 from .text_safety import log_text
+
+if TYPE_CHECKING:
+    from .providers.codex.auth import CodexAccountIdentity
 
 SESSION_HEADER = "x-claude-code-session-id"
 AGENT_HEADER = "x-claude-code-agent-id"
@@ -196,6 +202,30 @@ def configure_logging() -> None:
     readiness_logger.setLevel(logging.INFO)
     for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
         logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def log_startup_summary(
+    transport: str, identity: CodexAccountIdentity | None = None
+) -> None:
+    """Report safe OpenAI startup metadata before public requests can run."""
+    readiness_logger.info("OpenAI transport: %s", log_text(transport))
+    if identity is None:
+        return
+    account_id = log_text(identity.account_id)
+    source = log_text(identity.source)
+    if identity.masked_email is None:
+        readiness_logger.info("OpenCode account: %s (%s)", account_id, source)
+    else:
+        readiness_logger.info(
+            "OpenCode account: %s [%s] (%s)",
+            log_text(identity.masked_email),
+            account_id,
+            source,
+        )
+    readiness_logger.info(
+        "To use another account, stop the proxy, switch the active OpenAI "
+        "account in OpenCode, and restart."
+    )
 
 
 def log_proxy_ready(host: str, port: int, socket_path: Path) -> None:

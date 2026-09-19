@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from .api.routes import build_router
-from .logging import request_logging_middleware
+from .logging import log_startup_summary, request_logging_middleware
 from .runtime import RuntimeServices, create_runtime
 
 
@@ -14,8 +14,10 @@ def create_app(runtime: RuntimeServices | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
+        identity = None
         if runtime.settings.openai_transport == "codex":
-            await runtime.codex_auth.initialize()
+            identity = await runtime.codex_auth.initialize()
+        log_startup_summary(runtime.settings.openai_transport, identity)
         yield
 
     application = FastAPI(lifespan=lifespan)
