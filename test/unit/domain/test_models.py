@@ -74,6 +74,24 @@ def test_token_usage_availability_does_not_change_protocol_equality() -> None:
     assert observed == unavailable
 
 
+def test_token_usage_unavailable_marks_no_fields_observed() -> None:
+    usage = TokenUsage.unavailable()
+
+    assert usage == TokenUsage(0, 0)
+    assert usage.observed_fields == frozenset()
+
+
+def test_token_usage_copies_and_validates_explicit_observed_fields() -> None:
+    fields = {"input_tokens"}
+    usage = TokenUsage(0, 0, observed_fields=fields)
+
+    fields.add("output_tokens")
+
+    assert usage.observed_fields == frozenset({"input_tokens"})
+    with pytest.raises(ValueError, match="unknown usage fields"):
+        TokenUsage(0, 0, observed_fields={"input_token"})
+
+
 def test_redacted_thinking_block_is_immutable():
     block = RedactedThinkingBlock("codex-reasoning-v1:data")
     assert block.data == "codex-reasoning-v1:data"

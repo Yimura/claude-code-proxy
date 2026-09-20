@@ -71,7 +71,7 @@ def parse_tool_result_content(content: Any) -> str:
 
 @dataclass
 class _LiteLLMStreamState:
-    usage: TokenUsage = field(default_factory=lambda: TokenUsage(0, 0))
+    usage: TokenUsage = field(default_factory=lambda: TokenUsage.unavailable())
     stop_reason: str = "end_turn"
     finish_seen: bool = False
     slots: set[str] = field(default_factory=set)

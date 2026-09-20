@@ -122,7 +122,7 @@ def _convert_tool_choice(choice, tools):
 class CodexEventTranslator:
     tool_slots: dict[int, str] = field(default_factory=dict)
     tool_arguments: dict[int, str] = field(default_factory=dict)
-    usage: TokenUsage = field(default_factory=lambda: TokenUsage(0, 0))
+    usage: TokenUsage = field(default_factory=lambda: TokenUsage.unavailable())
     stop_reason: str = "end_turn"
     completed: bool = False
 
@@ -234,7 +234,7 @@ def response_from_events(request: CompletionRequest, events: list[StreamEvent]) 
     text_segments: list[list[str]] = []
     tools: dict[str, dict[str, Any]] = {}
     order: list[tuple[str, int | str | RedactedThinkingBlock]] = []
-    complete = StreamComplete("end_turn", TokenUsage(0, 0))
+    complete = StreamComplete("end_turn", TokenUsage.unavailable())
     for event in events:
         if isinstance(event, TextDelta):
             if not order or order[-1][0] != "text":

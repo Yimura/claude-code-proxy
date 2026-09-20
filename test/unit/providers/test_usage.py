@@ -110,7 +110,10 @@ def test_invalid_counts_are_ignored(invalid):
 
 
 def test_missing_usage_returns_zero_totals():
-    assert normalize_usage(None) == TokenUsage(0, 0)
+    usage = normalize_usage(None)
+
+    assert usage == TokenUsage(0, 0)
+    assert usage.observed_fields == frozenset()
 
 
 def test_normalize_usage_marks_only_raw_fields_as_observed() -> None:
@@ -127,8 +130,27 @@ def test_normalize_usage_marks_only_raw_fields_as_observed() -> None:
     })
 
 
-def test_normalize_usage_keeps_missing_usage_unavailable() -> None:
-    usage = normalize_usage(None)
+def test_litellm_usage_without_cache_details_marks_only_totals_observed() -> None:
+    usage = normalize_usage(Usage(
+        prompt_tokens=4,
+        completion_tokens=2,
+        total_tokens=6,
+    ))
 
-    assert usage == TokenUsage(0, 0)
+    assert usage.observed_fields == frozenset({"input_tokens", "output_tokens"})
+
+
+@pytest.mark.parametrize(
+    ("raw_usage", "unavailable_field"),
+    [
+        ({"input_tokens_details": {"cached_tokens": 4}}, "cache_read_input_tokens"),
+        ({"output_tokens_details": {"reasoning_tokens": 2}}, "thinking_tokens"),
+    ],
+)
+def test_detail_usage_requires_observed_aggregate_total(
+    raw_usage, unavailable_field
+) -> None:
+    usage = normalize_usage(raw_usage)
+
     assert usage.observed_fields == frozenset()
+    assert unavailable_field not in usage.observed_fields

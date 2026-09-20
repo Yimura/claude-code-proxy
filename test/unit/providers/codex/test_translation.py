@@ -190,6 +190,20 @@ def test_event_translator_maps_text_tools_usage_and_stop():
     assert translator.finish() == StreamComplete("tool_use", TokenUsage(4, 2))
 
 
+def test_event_translator_without_usage_marks_fields_unavailable():
+    translator = CodexEventTranslator()
+
+    assert translator.usage.observed_fields == frozenset()
+    translator.feed("response.completed", {"status": "completed"})
+    assert translator.finish().usage.observed_fields == frozenset()
+
+
+def test_response_from_events_without_completion_marks_fields_unavailable():
+    response = response_from_events(request(), [])
+
+    assert response.usage.observed_fields == frozenset()
+
+
 def test_response_failed_excludes_message_and_preserves_scalar_code():
     events = CodexEventTranslator().feed(
         "response.failed",

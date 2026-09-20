@@ -298,6 +298,17 @@ async def test_stream_returns_semantic_text_events(settings):
 
 
 @pytest.mark.asyncio
+async def test_stream_without_usage_marks_fields_unavailable(settings):
+    client = FakeClient(chunks=[
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ])
+
+    events = [event async for event in LiteLLMProvider(settings, client).stream(request())]
+
+    assert events[-1].usage.observed_fields == frozenset()
+
+
+@pytest.mark.asyncio
 async def test_stream_replaces_cumulative_detailed_usage(settings):
     client = FakeClient(chunks=[
         {

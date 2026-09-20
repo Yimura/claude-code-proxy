@@ -74,7 +74,10 @@ def normalize_usage(usage: object) -> TokenUsage:
         cache_read, cache_read_observed = _first_observed_count(
             usage, ("_cache_read_input_tokens",)
         )
-    if cache_read_observed:
+        cache_read_observed = bool(
+            cache_read_observed and cache_read is not None and cache_read > 0
+        )
+    if cache_read_observed and input_observed:
         observed_fields.add("cache_read_input_tokens")
 
     cache_creation, cache_creation_observed = _first_observed_count(
@@ -93,7 +96,12 @@ def normalize_usage(usage: object) -> TokenUsage:
         cache_creation, cache_creation_observed = _first_observed_count(
             usage, ("_cache_creation_input_tokens",)
         )
-    if cache_creation_observed:
+        cache_creation_observed = bool(
+            cache_creation_observed
+            and cache_creation is not None
+            and cache_creation > 0
+        )
+    if cache_creation_observed and input_observed:
         observed_fields.add("cache_creation_input_tokens")
 
     thinking_tokens, thinking_observed = _first_observed_count(
@@ -103,7 +111,7 @@ def normalize_usage(usage: object) -> TokenUsage:
         thinking_tokens, thinking_observed = _first_observed_count(
             usage, ("reasoning_tokens",)
         )
-    if thinking_observed:
+    if thinking_observed and output_observed:
         observed_fields.add("thinking_tokens")
 
     inclusive_input = inclusive_input or 0
