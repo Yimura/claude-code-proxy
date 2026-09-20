@@ -435,6 +435,39 @@ def test_id_filter_uses_case_insensitive_public_id_prefix() -> None:
     ]
 
 
+def test_session_id_filter_hashes_raw_id_for_exact_lookup() -> None:
+    clock = Clock()
+    sessions, ids = make_filter_registry(clock)
+
+    assert [
+        item.id
+        for item in sessions.snapshots({"session_id": ["  idle-row  "]})
+    ] == [ids["idle"]]
+    assert sessions.snapshots({"session_id": ["missing-row"]}) == []
+    assert sessions.snapshots({"session_id": ["IDLE-ROW"]}) == []
+
+
+def test_session_id_filter_combines_with_public_filters() -> None:
+    clock = Clock()
+    sessions, ids = make_filter_registry(clock)
+
+    assert [
+        item.id
+        for item in sessions.snapshots(
+            {
+                "session_id": ["idle-row"],
+                "effort": ["medium"],
+            }
+        )
+    ] == [ids["idle"]]
+    assert sessions.snapshots(
+        {
+            "session_id": ["idle-row"],
+            "effort": ["low"],
+        }
+    ) == []
+
+
 def test_filter_values_or_within_key_and_across_keys() -> None:
     clock = Clock()
     sessions, ids = make_filter_registry(clock)
@@ -459,6 +492,7 @@ def test_filter_values_or_within_key_and_across_keys() -> None:
         {"   ": ["value"]},
         {"state": []},
         {"state": "active"},
+        {"session_id": ["   "]},
     ],
 )
 def test_invalid_filters_are_rejected(filters) -> None:

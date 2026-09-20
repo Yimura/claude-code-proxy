@@ -284,6 +284,7 @@ async def test_sessions_preserve_registry_order_and_one_capture_time() -> None:
     ("entry", "expected_name"),
     [
         ("id={id_prefix}", "idle"),
+        ("session_id=raw-idle", "idle"),
         ("state=FAILED", "failed"),
         ("provider=VERTEX", "idle"),
         ("transport=CODEX", "active"),
@@ -309,6 +310,29 @@ async def test_sessions_support_each_filter_key(
     assert [item["id"] for item in response.json()["sessions"]] == [
         ids[expected_name]
     ]
+
+
+async def test_session_id_filter_never_returns_raw_id() -> None:
+    sessions, ids = filtered_registry()
+    app = create_control_app(
+        sessions,
+        started_at=datetime(2026, 1, 1, tzinfo=UTC),
+        application_version="1.0",
+        pid=1,
+    )
+
+    raw_id = "raw-idle"
+    response = await request(
+        app,
+        "/v1/sessions",
+        [("filter", f"session_id={raw_id}")],
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["sessions"]] == [
+        ids["idle"]
+    ]
+    assert raw_id not in response.text
 
 
 async def test_repeated_filter_key_is_or_and_different_keys_are_and() -> None:
@@ -388,6 +412,27 @@ async def test_filter_entry_length_accepts_256_and_rejects_257_characters() -> N
     assert accepted.json()["sessions"] == []
     assert len(exactly_257) == 257
     assert rejected.status_code == 422
+
+
+async def test_invalid_session_id_filter_does_not_echo_raw_value() -> None:
+    sessions, _ = filtered_registry()
+    app = create_control_app(
+        sessions,
+        started_at=datetime(2026, 1, 1, tzinfo=UTC),
+        application_version="1.0",
+        pid=1,
+    )
+    raw_id = "sensitive-session-" + "x" * 240
+
+    response = await request(
+        app,
+        "/v1/sessions",
+        [("filter", f"session_id={raw_id}")],
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Invalid session filter"}
+    assert raw_id not in response.text
 
 
 async def test_exactly_32_filter_entries_are_accepted() -> None:

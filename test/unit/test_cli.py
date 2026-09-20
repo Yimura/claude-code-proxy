@@ -638,6 +638,8 @@ def test_ps_normalizes_and_forwards_filters_in_order(tmp_path: Path) -> None:
             "--filter",
             "model = opus",
             "--filter",
+            "session_id = raw-session",
+            "--filter",
             "state=idle",
         ],
     )
@@ -646,6 +648,7 @@ def test_ps_normalizes_and_forwards_filters_in_order(tmp_path: Path) -> None:
     assert FakeClient.instances[0].filters == (
         "state=active",
         "model=opus",
+        "session_id=raw-session",
         "state=idle",
     )
 

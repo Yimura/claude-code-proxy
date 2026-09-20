@@ -8,7 +8,6 @@ import os
 from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import StringConstraints
 
 from ..observability import (
     AmbiguousSessionId,
@@ -27,16 +26,17 @@ _DISTRIBUTION_NAME = "anthropic-proxy"
 _MAX_FILTER_ENTRIES = 32
 _MAX_FILTER_ENTRY_LENGTH = 256
 _SUPPORTED_FILTERS = frozenset(
-    {"id", "state", "provider", "transport", "model", "effort"}
+    {
+        "id",
+        "session_id",
+        "state",
+        "provider",
+        "transport",
+        "model",
+        "effort",
+    }
 )
-_FilterEntry = Annotated[
-    str,
-    StringConstraints(max_length=_MAX_FILTER_ENTRY_LENGTH),
-]
-_FilterQuery = Annotated[
-    list[_FilterEntry] | None,
-    Query(max_length=_MAX_FILTER_ENTRIES),
-]
+_FilterQuery = Annotated[list[str] | None, Query()]
 
 
 @dataclass(frozen=True)

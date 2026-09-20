@@ -80,11 +80,12 @@ From the same source environment, inspect the running process over its local Uni
 ```bash
 uv run claude-code-proxy ps
 uv run claude-code-proxy ps --filter state=active --filter provider=openai
+uv run claude-code-proxy ps --filter session_id=abc123 --format json
 uv run claude-code-proxy ps --format json
 uv run claude-code-proxy ps --no-trunc
 ```
 
-Filters use `key=value` and may be repeated. Repeated values for one key are alternatives, while different keys are combined. Supported keys are `id`, `state`, `provider`, `transport`, `model`, and `effort`; ID values may be unambiguous prefixes. Output defaults to a table, `--format json` returns the complete structured rows, and `--no-trunc` preserves full session and model values in table output. Source commands automatically select a socket under `XDG_RUNTIME_DIR` or another private runtime fallback. Use `--socket PATH` to override the socket for one command, or set `CONTROL_SOCKET_PATH` to an absolute socket path whose private parent directory already exists.
+Filters use `key=value` and may be repeated. Repeated values for one key are alternatives, while different keys are combined. Supported keys are `id`, `session_id`, `state`, `provider`, `transport`, `model`, and `effort`. `id` accepts an unambiguous prefix of the opaque public ID. `session_id` accepts an exact raw client session ID, hashes it internally, and returns only the matching opaque row; the raw value remains transient private-control input and is never included in registry snapshots or command output. Output defaults to a table, `--format json` returns the complete structured rows, and `--no-trunc` preserves full session and model values in table output. Source commands automatically select a socket under `XDG_RUNTIME_DIR` or another private runtime fallback. Use `--socket PATH` to override the socket for one command, or set `CONTROL_SOCKET_PATH` to an absolute socket path whose private parent directory already exists.
 
 Each row has a safe, opaque, process-local hashed session ID. States are `active` while one or more requests are running, `idle` after the latest request completes, and `failed` after the latest request fails. Rows and their latest metadata are retained in memory only until the proxy process restarts; they are not prompt history. By default the registry retains the 1,000 most recently inactive logical rows, while active rows are never evicted.
 
