@@ -596,7 +596,7 @@ def test_metric_aggregate_validates_values_counts_and_partial_state() -> None:
     with pytest.raises(FrozenInstanceError):
         partial.value = 2  # type: ignore[misc]
 
-    for value in (True, -1, math.nan, math.inf, MAX_CONTROL_INTEGER + 1):
+    for value in (True, -1, math.nan, math.inf, -math.inf):
         with pytest.raises(ValueError):
             MetricAggregate(value, 0, 0, 0)  # type: ignore[arg-type]
     for count in (True, -1, MAX_CONTROL_INTEGER + 1):
@@ -608,12 +608,12 @@ def test_metric_aggregate_validates_values_counts_and_partial_state() -> None:
             MetricAggregate(0, 0, 0, count)  # type: ignore[arg-type]
 
     boundary = MetricAggregate(
-        MAX_CONTROL_INTEGER,
+        MAX_CONTROL_INTEGER + 1,
         MAX_CONTROL_INTEGER,
         MAX_CONTROL_INTEGER,
         MAX_CONTROL_INTEGER,
     )
-    assert boundary.value == MAX_CONTROL_INTEGER
+    assert boundary.value == MAX_CONTROL_INTEGER + 1
 
 
 def test_aggregate_add_is_atomic_on_invalid_internal_measurement() -> None:
@@ -718,6 +718,72 @@ def test_overlapping_requests_capture_current_and_peak_concurrency() -> None:
     assert after.current_concurrency == 1
     assert after.peak_concurrency == 2
     assert after.active_requests[0].peak_concurrency == Measurement.observed(2)
+
+
+def test_terminal_pending_requests_are_not_live_or_concurrent() -> None:
+    session = SessionPerformance("session-1")
+    first = session_request(1)
+    second = session_request(2)
+
+    assert session.start(first) == 1
+    first.record_usage(TokenUsage(2, 1))
+    finish_request(first, 1)
+
+    pending = session.snapshot(2.5)
+    assert pending.requests == 1
+    assert pending.active_requests == ()
+    assert pending.current_concurrency == 0
+    assert pending.latest_request is None
+
+    assert session.start(second) == 1
+    live = session.snapshot(3.0)
+    assert [item.id for item in live.active_requests] == ["request-2"]
+    assert live.current_concurrency == 1
+    assert live.peak_concurrency == 1
+    assert live.active_requests[0].peak_concurrency == Measurement.observed(1)
+
+    second.record_usage(TokenUsage(3, 1))
+    finish_request(second, 2)
+    assert session.snapshot(4.0).current_concurrency == 0
+    assert session.add_finalized(first) is not None
+    assert session.add_finalized(second) is not None
+
+    finalized = session.snapshot(4.0)
+    assert finalized.current_concurrency == 0
+    assert finalized.active_requests == ()
+    assert finalized.requests == 2
+    assert finalized.outcomes == {"completed": 2}
+    assert finalized.input_tokens == MetricAggregate(5, 2, 0, 0)
+    assert [item.id for item in finalized.recent_requests] == [
+        "request-2",
+        "request-1",
+    ]
+
+
+def test_lifetime_aggregate_value_can_exceed_per_request_control_limit() -> None:
+    session = SessionPerformance("session-1")
+    first = session_request(1)
+    second = session_request(2)
+
+    for item, index, input_tokens in (
+        (first, 1, MAX_CONTROL_INTEGER),
+        (second, 2, 1),
+    ):
+        session.start(item)
+        item.record_usage(TokenUsage(input_tokens, 0))
+        finish_request(item, index)
+        assert session.add_finalized(item) is not None
+
+    snapshot = session.snapshot(4.0)
+    assert snapshot.input_tokens == MetricAggregate(
+        MAX_CONTROL_INTEGER + 1,
+        2,
+        0,
+        0,
+    )
+    assert snapshot.outcomes == {"completed": 2}
+    assert snapshot.current_concurrency == 0
+    assert len(snapshot.recent_requests) == 2
 
 
 def test_duplicate_start_is_rejected_without_mutation() -> None:

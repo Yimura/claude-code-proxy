@@ -110,7 +110,7 @@ class MetricAggregate:
     not_applicable_samples: int
 
     def __post_init__(self) -> None:
-        _validate_observed_value(self.value)
+        _validate_aggregate_value(self.value)
         for name in (
             "observed_samples",
             "unavailable_samples",
@@ -173,6 +173,15 @@ class _Aggregate:
             self._unavailable_samples,
             self._not_applicable_samples,
         )
+
+
+def _validate_aggregate_value(value: object) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("aggregate value requires a finite non-negative number")
+    if value < 0:
+        raise ValueError("aggregate value requires a finite non-negative number")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("aggregate value requires a finite non-negative number")
 
 
 def _validate_observed_value(value: object) -> None:
@@ -512,7 +521,7 @@ class SessionPerformance:
 
     __slots__ = (
         "_session_id",
-        "_active",
+        "_pending",
         "_recent",
         "_requests",
         "_outcomes",
@@ -523,7 +532,7 @@ class SessionPerformance:
     def __init__(self, session_id: str, history_limit: int = 20) -> None:
         self._session_id = _require_safe_identifier("session_id", session_id)
         _require_positive_control_integer("history_limit", history_limit)
-        self._active: dict[str, RequestPerformance] = {}
+        self._pending: dict[str, RequestPerformance] = {}
         self._recent: deque[RequestPerformanceSnapshot] = deque(
             maxlen=history_limit
         )
@@ -538,12 +547,13 @@ class SessionPerformance:
         if request.is_terminal:
             raise ValueError("request must be active when started")
         request_id = _require_safe_identifier("request_id", request.request_id)
-        if request_id in self._active:
-            raise ValueError("duplicate active request ID")
+        if request_id in self._pending:
+            raise ValueError("duplicate pending request ID")
         requests = _increment_control_integer("requests", self._requests)
-        self._active[request_id] = request
-        concurrency = len(self._active)
-        for active in self._active.values():
+        self._pending[request_id] = request
+        live = self._live_requests()
+        concurrency = len(live)
+        for active in live:
             active.set_concurrency(concurrency)
         self._requests = requests
         self._peak_concurrency = max(self._peak_concurrency, concurrency)
@@ -554,8 +564,8 @@ class SessionPerformance:
     ) -> RequestPerformanceSnapshot | None:
         if request.session_id != self._session_id:
             return None
-        active = self._active.get(request.request_id)
-        if active is not request:
+        pending = self._pending.get(request.request_id)
+        if pending is not request:
             return None
         if not request.is_terminal:
             raise ValueError("request must be terminal before finalization")
@@ -565,11 +575,18 @@ class SessionPerformance:
             "outcome count", self._outcomes.get(outcome, 0)
         )
         aggregates = self._updated_aggregates(snapshot)
-        del self._active[request.request_id]
+        del self._pending[request.request_id]
         self._recent.appendleft(snapshot)
         self._outcomes[outcome] = outcome_count
         self._aggregates = aggregates
         return snapshot
+
+    def _live_requests(self) -> tuple[RequestPerformance, ...]:
+        return tuple(
+            request
+            for request in self._pending.values()
+            if not request.is_terminal
+        )
 
     def _updated_aggregates(
         self, snapshot: RequestPerformanceSnapshot
@@ -585,7 +602,7 @@ class SessionPerformance:
         sampled = _require_finite_time("snapshot time", now)
         active = tuple(
             sorted(
-                (request.snapshot(sampled) for request in self._active.values()),
+                (request.snapshot(sampled) for request in self._live_requests()),
                 key=lambda item: (item.started_at, item.id),
                 reverse=True,
             )
