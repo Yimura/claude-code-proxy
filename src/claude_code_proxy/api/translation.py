@@ -85,6 +85,7 @@ from ..domain.models import (
     ToolUseEnd,
     ToolUseStart,
 )
+from ..failures import FailureCategory, FailureDiagnostic, FailureStage
 from .schemas import (
     ContentBlockRedactedThinking as ApiRedactedThinkingBlock,
     ContentBlockText as ApiTextBlock,
@@ -170,8 +171,14 @@ async def serialize_stream(
                 break
             try:
                 frames = state.consume(event)
-            except ValueError as error:
-                stream_error = StreamError(diagnostic=str(error))
+            except ValueError:
+                stream_error = StreamError(
+                    diagnostic=FailureDiagnostic(
+                        FailureCategory.TRANSLATION,
+                        FailureStage.CLIENT_TRANSLATION,
+                        "invalid_event_sequence",
+                    )
+                )
                 _notify_stream_error(on_error, stream_error)
                 for frame in state.error(stream_error):
                     yield frame
@@ -183,7 +190,11 @@ async def serialize_stream(
             pending_event = asyncio.ensure_future(anext(iterator))
 
         stream_error = StreamError(
-            diagnostic="stream ended without terminal outcome"
+            diagnostic=FailureDiagnostic(
+                FailureCategory.TRANSLATION,
+                FailureStage.CLIENT_TRANSLATION,
+                "missing_terminal",
+            )
         )
         _notify_stream_error(on_error, stream_error)
         for frame in state.error(stream_error):

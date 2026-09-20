@@ -242,14 +242,14 @@ def _record_context(raw_request: Request, context: RequestLogContext) -> None:
 def _log_provider_error(
     raw_request: Request, context: RequestLogContext, error: ProviderError
 ) -> None:
-    log_provider_failure(context, error.status_code)
+    log_provider_failure(context, error)
     setattr(raw_request.state, FAILURE_LOGGED, True)
 
 
 def _log_unexpected_error(
     raw_request: Request, context: RequestLogContext, error: Exception
 ) -> None:
-    log_unexpected_failure(context, type(error).__name__)
+    log_unexpected_failure(context, error)
     setattr(raw_request.state, FAILURE_LOGGED, True)
 
 

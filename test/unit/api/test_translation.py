@@ -118,6 +118,7 @@ from claude_code_proxy.domain.models import (
     ToolUseEnd,
     ToolUseStart,
 )
+from claude_code_proxy.failures import FailureCategory, FailureDiagnostic, FailureStage
 
 
 async def event_source(*events):
@@ -694,7 +695,11 @@ async def test_serialize_stream_reports_synthesized_state_error():
 
     assert event_names(frames)[-1] == "error"
     assert len(errors) == 1
-    assert errors[0].diagnostic == "stream completed with open tool blocks"
+    assert errors[0].diagnostic == FailureDiagnostic(
+        FailureCategory.TRANSLATION,
+        FailureStage.CLIENT_TRANSLATION,
+        "invalid_event_sequence",
+    )
 
 
 @pytest.mark.asyncio
@@ -715,7 +720,11 @@ async def test_serialize_stream_reports_synthesized_eof_error():
 
     assert event_names(frames)[-1] == "error"
     assert len(errors) == 1
-    assert errors[0].diagnostic == "stream ended without terminal outcome"
+    assert errors[0].diagnostic == FailureDiagnostic(
+        FailureCategory.TRANSLATION,
+        FailureStage.CLIENT_TRANSLATION,
+        "missing_terminal",
+    )
 
 
 @pytest.mark.asyncio
@@ -729,7 +738,15 @@ async def test_serialize_stream_does_not_report_upstream_error_as_synthesized():
         frame
         async for frame in serialize_stream(
             normalized,
-            event_source(StreamError(diagnostic="upstream failed")),
+            event_source(
+                StreamError(
+                    diagnostic=FailureDiagnostic(
+                        FailureCategory.UPSTREAM_HTTP,
+                        FailureStage.RESPONSE,
+                        "http_error",
+                    )
+                )
+            ),
             on_error=errors.append,
         )
     ]

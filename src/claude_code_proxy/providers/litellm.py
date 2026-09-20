@@ -2,6 +2,7 @@
 
 import asyncio
 from copy import deepcopy
+from dataclasses import dataclass, field
 import json
 import logging
 import os
@@ -19,7 +20,19 @@ from ..domain.models import (
     StreamStart, TextBlock, TextDelta, TokenUsage, ToolInputDelta, ToolResultBlock,
     ToolUseBlock, ToolUseEnd, ToolUseStart,
 )
-from .base import ProviderError, protocol_error, stream_error_from_exception
+from ..failures import (
+    FailureCategory,
+    FailureDiagnostic,
+    FailureStage,
+    unexpected_failure_diagnostic,
+)
+from .base import (
+    ProviderError,
+    protocol_error,
+    public_error,
+    scalar_provider_code,
+    stream_error_from_exception,
+)
 from .usage import normalize_usage
 
 logger = logging.getLogger(__name__)
@@ -54,6 +67,55 @@ def parse_tool_result_content(content: Any) -> str:
     if isinstance(content, dict):
         return content.get("text", json.dumps(content))
     return str(content)
+
+
+@dataclass
+class _LiteLLMStreamState:
+    usage: TokenUsage = field(default_factory=lambda: TokenUsage(0, 0))
+    stop_reason: str = "end_turn"
+    finish_seen: bool = False
+    slots: set[str] = field(default_factory=set)
+    terminal_error: StreamError | None = None
+
+    def feed(self, chunk) -> tuple:
+        data = chunk if isinstance(chunk, dict) else chunk.model_dump()
+        raw_usage = data.get("usage")
+        if raw_usage is not None:
+            self.usage = normalize_usage(raw_usage)
+
+        events = []
+        for choice in data.get("choices", []):
+            delta = choice.get("delta") or {}
+            if delta.get("content"):
+                events.append(TextDelta(delta["content"]))
+            for index, call in enumerate(delta.get("tool_calls") or []):
+                slot = str(call.get("index", index))
+                function = call.get("function") or {}
+                if slot not in self.slots:
+                    self.slots.add(slot)
+                    events.append(
+                        ToolUseStart(
+                            slot,
+                            call.get("id")
+                            or f"toolu_{uuid.uuid4().hex[:24]}",
+                            function.get("name", ""),
+                        )
+                    )
+                if function.get("arguments"):
+                    events.append(ToolInputDelta(slot, function["arguments"]))
+            finish = choice.get("finish_reason")
+            if finish:
+                self.finish_seen = True
+                self.stop_reason = {
+                    "length": "max_tokens",
+                    "tool_calls": "tool_use",
+                }.get(finish, "end_turn")
+        return tuple(events)
+
+    def completion_events(self) -> tuple:
+        events = [ToolUseEnd(slot) for slot in sorted(self.slots)]
+        events.append(StreamComplete(self.stop_reason, self.usage))
+        return tuple(events)
 
 
 class LiteLLMProvider:
@@ -182,12 +244,29 @@ class LiteLLMProvider:
 
     async def complete(self, request: CompletionRequest) -> CompletionResponse:
         try:
-            response = await asyncio.to_thread(self._client.completion, **self.build_request(request, stream=False))
-            return self._normalize_response(response, request)
+            payload = self.build_request(request, stream=False)
+        except Exception as error:
+            raise self._translation_error(
+                error, "request_translation_failed"
+            ) from error
+
+        try:
+            response = await asyncio.to_thread(self._client.completion, **payload)
         except ProviderError:
             raise
         except Exception as error:
-            raise self._provider_error(error) from error
+            raise self._provider_error(
+                error,
+                stage=FailureStage.REQUEST,
+                code="provider_invocation_failed",
+            ) from error
+
+        try:
+            return self._normalize_response(response, request)
+        except Exception as error:
+            raise self._translation_error(
+                error, "response_translation_failed"
+            ) from error
 
     def _normalize_response(self, response, request):
         data = response if isinstance(response, dict) else response.model_dump() if hasattr(response, "model_dump") else response
@@ -218,64 +297,198 @@ class LiteLLMProvider:
         )
 
     async def stream(self, request: CompletionRequest):
-        usage = TokenUsage(0, 0)
-        stop_reason = "end_turn"
-        finish_seen = False
-        slots = set()
         try:
-            upstream = await self._client.acompletion(**self.build_request(request, stream=True))
-            yield StreamStart()
+            payload = self.build_request(request, stream=True)
+        except Exception as error:
+            error = self._translation_error(error, "request_translation_failed")
+            yield stream_error_from_exception(error, provider=self.name)
+            return
+
+        try:
+            upstream = await self._client.acompletion(**payload)
+        except ProviderError as error:
+            yield stream_error_from_exception(error, provider=self.name)
+            return
+        except Exception as error:
+            error = self._provider_error(
+                error,
+                stage=FailureStage.REQUEST,
+                code="provider_invocation_failed",
+            )
+            yield stream_error_from_exception(error, provider=self.name)
+            return
+
+        try:
             iterator = aiter(upstream)
+        except Exception as error:
+            error = self._translation_error(
+                error, "stream_initialization_failed"
+            )
+            yield stream_error_from_exception(error, provider=self.name)
+            return
+
+        state = _LiteLLMStreamState()
+        external_exit = False
+        try:
+            yield StreamStart()
             try:
                 async for chunk in iterator:
-                    data = chunk if isinstance(chunk, dict) else chunk.model_dump()
-                    raw_usage = data.get("usage")
-                    if raw_usage is not None:
-                        usage = normalize_usage(raw_usage)
-                    for choice in data.get("choices", []):
-                        delta = choice.get("delta") or {}
-                        if delta.get("content"):
-                            yield TextDelta(delta["content"])
-                        for index, call in enumerate(delta.get("tool_calls") or []):
-                            slot = str(call.get("index", index))
-                            function = call.get("function") or {}
-                            if slot not in slots:
-                                slots.add(slot)
-                                yield ToolUseStart(slot, call.get("id") or f"toolu_{uuid.uuid4().hex[:24]}", function.get("name", ""))
-                            if function.get("arguments"):
-                                yield ToolInputDelta(slot, function["arguments"])
-                        finish = choice.get("finish_reason")
-                        if finish:
-                            finish_seen = True
-                            stop_reason = {"length": "max_tokens", "tool_calls": "tool_use"}.get(finish, "end_turn")
-            finally:
-                close = getattr(iterator, "aclose", None)
-                if close is not None:
-                    await close()
-            if not finish_seen:
-                yield protocol_error(
-                    "LiteLLM stream ended without finish_reason", provider="litellm"
+                    try:
+                        events = state.feed(chunk)
+                    except Exception as error:
+                        error = self._translation_error(
+                            error, "stream_chunk_translation_failed"
+                        )
+                        state.terminal_error = stream_error_from_exception(
+                            error, provider=self.name
+                        )
+                        break
+                    for event in events:
+                        yield event
+            except ProviderError as error:
+                state.terminal_error = stream_error_from_exception(
+                    error, provider=self.name
                 )
-                return
-            for slot in sorted(slots):
-                yield ToolUseEnd(slot)
-            yield StreamComplete(stop_reason, usage)
+            except Exception as error:
+                error = self._provider_error(
+                    error,
+                    stage=FailureStage.STREAM,
+                    code="stream_failed",
+                )
+                state.terminal_error = stream_error_from_exception(
+                    error, provider=self.name
+                )
+        except (GeneratorExit, asyncio.CancelledError):
+            external_exit = True
+            raise
+        finally:
+            await self._close_stream_iterator(iterator, state, external_exit)
+
+        if state.terminal_error is not None:
+            yield state.terminal_error
+            return
+        if not state.finish_seen:
+            yield protocol_error("missing_finish_reason", provider=self.name)
+            return
+        for event in state.completion_events():
+            yield event
+
+    async def _close_stream_iterator(
+        self,
+        iterator,
+        state: _LiteLLMStreamState,
+        external_exit: bool,
+    ) -> None:
+        try:
+            close = getattr(iterator, "aclose", None)
+            if close is not None:
+                await close()
+        except (GeneratorExit, asyncio.CancelledError):
+            raise
         except Exception as error:
-            provider_error = self._provider_error(error)
-            yield stream_error_from_exception(
-                provider_error, provider="litellm", expose_message=True
+            if external_exit or state.terminal_error is not None:
+                return
+            error = self._provider_error(
+                error,
+                stage=FailureStage.STREAM,
+                code="stream_cleanup_failed",
+            )
+            state.terminal_error = stream_error_from_exception(
+                error, provider=self.name
             )
 
     async def count_tokens(self, request: CompletionRequest) -> int:
-        payload = self.build_request(request, stream=False)
+        try:
+            payload = self.build_request(request, stream=False)
+        except Exception as error:
+            raise self._translation_error(
+                error, "token_count_request_translation_failed"
+            ) from error
+
         counter = getattr(self._client, "token_counter", None)
         if counter is None:
             return 1000
         arguments = {"model": payload["model"], "messages": payload["messages"]}
         if request.model.startswith("openai/") and self._settings.openai_base_url:
             arguments["api_base"] = self._settings.openai_base_url
-        return await asyncio.to_thread(counter, **arguments)
+        try:
+            return await asyncio.to_thread(counter, **arguments)
+        except ProviderError:
+            raise
+        except Exception as error:
+            raise self._provider_error(
+                error,
+                stage=FailureStage.REQUEST,
+                code="token_count_failed",
+            ) from error
 
     @staticmethod
-    def _provider_error(error):
-        return ProviderError(str(getattr(error, "message", error)), provider="litellm", status_code=getattr(error, "status_code", 500) or 500)
+    def _translation_error(error: Exception, code: str) -> ProviderError:
+        return ProviderError(
+            "Internal server error",
+            provider="litellm",
+            status_code=500,
+            diagnostic=unexpected_failure_diagnostic(
+                error,
+                category=FailureCategory.TRANSLATION,
+                stage=FailureStage.PROVIDER_TRANSLATION,
+                code=code,
+            ),
+        )
+
+    @staticmethod
+    def _provider_error(
+        error: Exception,
+        *,
+        stage: FailureStage,
+        code: str,
+    ) -> ProviderError:
+        status_code = getattr(error, "status_code", None)
+        if not isinstance(status_code, int) or isinstance(status_code, bool):
+            status_code = None
+
+        category = FailureCategory.INTERNAL
+        local_code = code
+        if isinstance(error, litellm.AuthenticationError):
+            category = FailureCategory.AUTHENTICATION
+            status_code = status_code or 401
+            local_code = "authentication_error"
+        elif isinstance(error, litellm.PermissionDeniedError):
+            category = FailureCategory.AUTHENTICATION
+            status_code = status_code or 403
+            local_code = "permission_denied"
+        elif isinstance(error, litellm.Timeout):
+            category = FailureCategory.TRANSPORT
+            status_code = 504
+            local_code = "timeout"
+        elif isinstance(error, litellm.APIConnectionError):
+            category = FailureCategory.TRANSPORT
+            status_code = 503
+            local_code = "transport_error"
+        elif isinstance(error, litellm.APIError) or status_code is not None:
+            category = FailureCategory.UPSTREAM_HTTP
+            status_code = status_code or 502
+            local_code = "upstream_http_error"
+        else:
+            status_code = 500
+
+        _, message = public_error(status_code)
+        if category == FailureCategory.INTERNAL:
+            diagnostic = unexpected_failure_diagnostic(
+                error,
+                stage=stage,
+                code=local_code,
+            )
+        else:
+            diagnostic = FailureDiagnostic(
+                category,
+                stage,
+                local_code,
+                scalar_provider_code(getattr(error, "code", None)),
+            )
+        return ProviderError(
+            message,
+            provider="litellm",
+            status_code=status_code,
+            diagnostic=diagnostic,
+        )

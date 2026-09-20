@@ -22,6 +22,8 @@ from ...domain.models import (
     ToolUseEnd,
     ToolUseStart,
 )
+from ...failures import FailureCategory, FailureDiagnostic, FailureStage
+from ..base import scalar_provider_code
 from ..usage import normalize_usage
 from .identity import CodexIdentity
 from .reasoning import decode_reasoning, encode_reasoning
@@ -145,14 +147,23 @@ class CodexEventTranslator:
             return ()
         if event_type == "response.failed":
             response = data.get("response", data)
-            error = response.get("error") or {}
-            message = error.get("message") or "Codex request failed"
-            code = error.get("code") or "unknown_error"
+            if not isinstance(response, dict):
+                response = {}
+            error = response.get("error")
+            if not isinstance(error, dict):
+                error = {}
+            provider_code = scalar_provider_code(error.get("code"))
+            if provider_code is None:
+                provider_code = scalar_provider_code(error.get("type"))
             return (
                 StreamError(
-                    message=message,
                     provider="codex",
-                    diagnostic=f"{code}: {message}",
+                    diagnostic=FailureDiagnostic(
+                        FailureCategory.PROVIDER_PROTOCOL,
+                        FailureStage.STREAM,
+                        "response_failed",
+                        provider_code,
+                    ),
                 ),
             )
         return ()

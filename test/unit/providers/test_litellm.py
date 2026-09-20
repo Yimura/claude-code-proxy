@@ -1,10 +1,16 @@
 import asyncio
 from dataclasses import replace
+import logging
 from pathlib import Path
+import re
 
+import httpx
+import litellm
 import pytest
 from litellm.types.utils import Usage as LiteLLMUsage
 
+from claude_code_proxy.api.schemas import MessagesRequest
+from claude_code_proxy.api.translation import normalize_request, serialize_stream
 from claude_code_proxy.config import Settings
 from claude_code_proxy.domain.models import (
     ClientIdentity, CompletionRequest,
@@ -24,6 +30,17 @@ from claude_code_proxy.domain.models import (
     ToolUseEnd,
     ToolUseStart,
 )
+from claude_code_proxy.failures import (
+    FailureCategory,
+    FailureDiagnostic,
+    FailureStage,
+)
+from claude_code_proxy.logging import (
+    RequestLogContext,
+    SessionIdentity,
+    log_stream_failure,
+)
+from claude_code_proxy.providers.base import ProviderError
 from claude_code_proxy.providers.litellm import LiteLLMProvider, clean_gemini_schema
 from claude_code_proxy.reasoning import OutputConfig, ReasoningPolicy, ThinkingConfig
 
@@ -41,6 +58,35 @@ def settings():
         openai_transport="litellm",
         opencode_data_dir=Path("/auth"),
         model_mapping_path=Path("mapping.json"),
+    )
+
+
+def assert_failure_evidence(
+    diagnostic,
+    category,
+    stage,
+    code,
+    exception_type,
+):
+    assert diagnostic.category == category
+    assert diagnostic.stage == stage
+    assert diagnostic.code == code
+    assert diagnostic.exception_type == exception_type
+    assert re.fullmatch(
+        r"claude_code_proxy\.providers\.litellm:[^:]+:\d+",
+        diagnostic.location,
+    )
+
+
+def log_context():
+    return RequestLogContext(
+        session=SessionIdentity("session", "[session session]", False),
+        method="POST",
+        endpoint="/v1/messages",
+        original_model="claude",
+        upstream_model="openai/gpt-5.6-sol",
+        provider="litellm",
+        effort="default",
     )
 
 
@@ -304,9 +350,18 @@ async def test_stream_requires_upstream_finish_reason(settings):
 
     events = [event async for event in LiteLLMProvider(settings, client).stream(request())]
 
-    assert events[:2] == [StreamStart(), TextDelta("partial")]
-    assert isinstance(events[-1], StreamError)
-    assert events[-1].message == "Internal server error"
+    assert events == [
+        StreamStart(),
+        TextDelta("partial"),
+        StreamError(
+            provider="litellm",
+            diagnostic=FailureDiagnostic(
+                FailureCategory.PROVIDER_PROTOCOL,
+                FailureStage.STREAM,
+                "missing_finish_reason",
+            ),
+        ),
+    ]
 
 
 class PlainUpstream:
@@ -373,6 +428,40 @@ class ClosableClient(FakeClient):
         return self.upstream
 
 
+class RaisingUpstream:
+    def __init__(
+        self,
+        error=StopAsyncIteration(),
+        chunks=(),
+        close_error=None,
+        block=False,
+    ):
+        self.error = error
+        self.chunks = iter(chunks)
+        self.close_error = close_error
+        self.block = block
+        self.waiting = asyncio.Event()
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self.chunks)
+        except StopIteration:
+            pass
+        if self.block:
+            self.waiting.set()
+            await asyncio.Event().wait()
+        raise self.error
+
+    async def aclose(self):
+        self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
+
+
 @pytest.mark.asyncio
 async def test_closing_provider_stream_closes_upstream_iterator(settings):
     upstream = ClosableUpstream()
@@ -386,25 +475,722 @@ async def test_closing_provider_stream_closes_upstream_iterator(settings):
     assert upstream.closed is True
 
 
-class FailingClient(FakeClient):
-    async def acompletion(self, **kwargs):
-        raise RuntimeError("requested model is unavailable")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            litellm.Timeout("secret timeout", "model", "openai"),
+            StreamError(
+                error_type="timeout_error",
+                message="Request timed out",
+                status_code=504,
+                provider="litellm",
+                diagnostic=FailureDiagnostic(
+                    FailureCategory.TRANSPORT,
+                    FailureStage.STREAM,
+                    "timeout",
+                ),
+            ),
+        ),
+        (
+            RuntimeError("secret iterator failure"),
+            StreamError(
+                status_code=500,
+                provider="litellm",
+                diagnostic=FailureDiagnostic(
+                    FailureCategory.INTERNAL,
+                    FailureStage.STREAM,
+                    "stream_failed",
+                ),
+            ),
+        ),
+    ],
+)
+async def test_iteration_failure_closes_before_emitting_terminal_error(
+    settings, error, expected
+):
+    upstream = RaisingUpstream(error=error)
+    stream = LiteLLMProvider(settings, ClosableClient(upstream)).stream(request())
+
+    assert await anext(stream) == StreamStart()
+    terminal = await anext(stream)
+
+    if isinstance(error, RuntimeError):
+        assert terminal.status_code == expected.status_code
+        assert terminal.provider == expected.provider
+        assert_failure_evidence(
+            terminal.diagnostic,
+            FailureCategory.INTERNAL,
+            FailureStage.STREAM,
+            "stream_failed",
+            "RuntimeError",
+        )
+    else:
+        assert terminal == expected
+    assert upstream.closed is True
+    assert "secret" not in repr(terminal)
 
 
 @pytest.mark.asyncio
-async def test_stream_exception_preserves_useful_provider_message(settings):
-    events = [event async for event in LiteLLMProvider(settings, FailingClient()).stream(request())]
+async def test_iteration_provider_error_is_preserved_after_cleanup(settings):
+    diagnostic = FailureDiagnostic(
+        FailureCategory.UPSTREAM_HTTP,
+        FailureStage.STREAM,
+        "upstream_stream_failed",
+    )
+    upstream = RaisingUpstream(
+        error=ProviderError(
+            "Safe provider failure",
+            provider="upstream",
+            status_code=429,
+            diagnostic=diagnostic,
+        )
+    )
+    stream = LiteLLMProvider(settings, ClosableClient(upstream)).stream(request())
+
+    assert await anext(stream) == StreamStart()
+    terminal = await anext(stream)
+
+    assert terminal == StreamError(
+        error_type="rate_limit_error",
+        message="Safe provider failure",
+        status_code=429,
+        provider="upstream",
+        diagnostic=diagnostic,
+    )
+    assert upstream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_natural_eof_cleanup_failure_becomes_structured_error(settings):
+    upstream = RaisingUpstream(close_error=RuntimeError("secret close failure"))
+
+    events = [
+        event
+        async for event in LiteLLMProvider(
+            settings, ClosableClient(upstream)
+        ).stream(request())
+    ]
+
+    assert events[0] == StreamStart()
+    assert len(events) == 2
+    assert events[1].status_code == 500
+    assert events[1].provider == "litellm"
+    assert_failure_evidence(
+        events[1].diagnostic,
+        FailureCategory.INTERNAL,
+        FailureStage.STREAM,
+        "stream_cleanup_failed",
+        "RuntimeError",
+    )
+    assert upstream.closed is True
+    assert "secret close failure" not in repr(events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cleanup_error", "expected"),
+    [
+        (
+            litellm.Timeout("secret cleanup timeout", "model", "openai"),
+            StreamError(
+                error_type="timeout_error",
+                message="Request timed out",
+                status_code=504,
+                provider="litellm",
+                diagnostic=FailureDiagnostic(
+                    FailureCategory.TRANSPORT,
+                    FailureStage.STREAM,
+                    "timeout",
+                ),
+            ),
+        ),
+        (
+            litellm.APIConnectionError(
+                "secret cleanup connection", "openai", "model"
+            ),
+            StreamError(
+                status_code=503,
+                provider="litellm",
+                diagnostic=FailureDiagnostic(
+                    FailureCategory.TRANSPORT,
+                    FailureStage.STREAM,
+                    "transport_error",
+                ),
+            ),
+        ),
+    ],
+)
+async def test_typed_cleanup_failure_preserves_typed_semantics(
+    settings, cleanup_error, expected
+):
+    upstream = RaisingUpstream(close_error=cleanup_error)
+
+    events = [
+        event
+        async for event in LiteLLMProvider(
+            settings, ClosableClient(upstream)
+        ).stream(request())
+    ]
+
+    assert events == [StreamStart(), expected]
+    assert upstream.closed is True
+    assert "secret" not in repr(events)
+
+
+@pytest.mark.asyncio
+async def test_primary_provider_error_wins_over_cleanup_failure(settings):
+    primary = provider_failure()
+    upstream = RaisingUpstream(
+        error=primary,
+        close_error=RuntimeError("secret cleanup failure"),
+    )
+
+    events = [
+        event
+        async for event in LiteLLMProvider(
+            settings, ClosableClient(upstream)
+        ).stream(request())
+    ]
+
+    assert events == [
+        StreamStart(),
+        StreamError(
+            error_type="rate_limit_error",
+            message="Safe provider failure",
+            status_code=429,
+            provider="upstream",
+            diagnostic=primary.diagnostic,
+        ),
+    ]
+    assert upstream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_primary_timeout_wins_over_cleanup_failure(settings):
+    upstream = RaisingUpstream(
+        error=litellm.Timeout("secret timeout", "model", "openai"),
+        close_error=RuntimeError("secret cleanup failure"),
+    )
+
+    events = [
+        event
+        async for event in LiteLLMProvider(
+            settings, ClosableClient(upstream)
+        ).stream(request())
+    ]
+
+    assert events[-1].diagnostic == FailureDiagnostic(
+        FailureCategory.TRANSPORT,
+        FailureStage.STREAM,
+        "timeout",
+    )
+    assert events[-1].status_code == 504
+    assert upstream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_primary_translation_failure_wins_over_cleanup_failure(settings):
+    upstream = RaisingUpstream(
+        chunks=[object()],
+        close_error=RuntimeError("secret cleanup failure"),
+    )
+
+    events = [
+        event
+        async for event in LiteLLMProvider(
+            settings, ClosableClient(upstream)
+        ).stream(request())
+    ]
+
+    assert_failure_evidence(
+        events[-1].diagnostic,
+        FailureCategory.TRANSLATION,
+        FailureStage.PROVIDER_TRANSLATION,
+        "stream_chunk_translation_failed",
+        "AttributeError",
+    )
+    assert upstream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_cancellation_propagates(settings):
+    upstream = RaisingUpstream(close_error=asyncio.CancelledError())
+
+    with pytest.raises(asyncio.CancelledError):
+        async for _ in LiteLLMProvider(
+            settings, ClosableClient(upstream)
+        ).stream(request()):
+            pass
+
+    assert upstream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_successful_terminal_event_is_emitted_after_cleanup(settings):
+    upstream = RaisingUpstream(
+        chunks=[{"choices": [{"delta": {}, "finish_reason": "stop"}]}]
+    )
+    stream = LiteLLMProvider(settings, ClosableClient(upstream)).stream(request())
+
+    assert await anext(stream) == StreamStart()
+    terminal = await anext(stream)
+
+    assert terminal == StreamComplete("end_turn", TokenUsage(0, 0))
+    assert upstream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_external_close_is_not_replaced_by_cleanup_failure(settings):
+    upstream = RaisingUpstream(
+        chunks=[
+            {
+                "choices": [
+                    {"delta": {"content": "partial"}, "finish_reason": None}
+                ]
+            }
+        ],
+        close_error=RuntimeError("secret close failure"),
+        block=True,
+    )
+    stream = LiteLLMProvider(settings, ClosableClient(upstream)).stream(request())
+
+    assert await anext(stream) == StreamStart()
+    assert await anext(stream) == TextDelta("partial")
+
+    await stream.aclose()
+
+    assert upstream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_cancellation_is_not_replaced_by_cleanup_failure(settings):
+    upstream = RaisingUpstream(
+        close_error=RuntimeError("secret close failure"),
+        block=True,
+    )
+    stream = LiteLLMProvider(settings, ClosableClient(upstream)).stream(request())
+    assert await anext(stream) == StreamStart()
+    pending = asyncio.create_task(anext(stream))
+    await upstream.waiting.wait()
+
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    assert upstream.closed is True
+
+
+class FailingClient(FakeClient):
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+
+    def completion(self, **kwargs):
+        raise self.error
+
+    async def acompletion(self, **kwargs):
+        raise self.error
+
+    def token_counter(self, **kwargs):
+        raise self.error
+
+
+def provider_failure():
+    return ProviderError(
+        "Safe provider failure",
+        provider="upstream",
+        status_code=429,
+        diagnostic=FailureDiagnostic(
+            FailureCategory.UPSTREAM_HTTP,
+            FailureStage.REQUEST,
+            "upstream_failure",
+        ),
+    )
+
+
+def _http_response(status_code):
+    return httpx.Response(
+        status_code,
+        request=httpx.Request("POST", "https://provider.example/v1/messages"),
+    )
+
+
+def _typed_litellm_errors():
+    authentication = litellm.AuthenticationError(
+        "secret auth detail", "openai", "model"
+    )
+    permission = litellm.PermissionDeniedError(
+        "secret permission detail", "openai", "model", _http_response(403)
+    )
+    timeout = litellm.Timeout("secret timeout detail", "model", "openai")
+    connection = litellm.APIConnectionError(
+        "secret connection detail", "openai", "model"
+    )
+    status = litellm.APIError(529, "secret upstream detail", "openai", "model")
+    status.code = "provider-overloaded"
+    return [
+        (
+            authentication,
+            401,
+            "Authentication failed",
+            FailureDiagnostic(
+                FailureCategory.AUTHENTICATION,
+                FailureStage.REQUEST,
+                "authentication_error",
+            ),
+        ),
+        (
+            permission,
+            403,
+            "Permission denied",
+            FailureDiagnostic(
+                FailureCategory.AUTHENTICATION,
+                FailureStage.REQUEST,
+                "permission_denied",
+            ),
+        ),
+        (
+            timeout,
+            504,
+            "Request timed out",
+            FailureDiagnostic(
+                FailureCategory.TRANSPORT,
+                FailureStage.REQUEST,
+                "timeout",
+            ),
+        ),
+        (
+            connection,
+            503,
+            "Internal server error",
+            FailureDiagnostic(
+                FailureCategory.TRANSPORT,
+                FailureStage.REQUEST,
+                "transport_error",
+            ),
+        ),
+        (
+            status,
+            529,
+            "Overloaded",
+            FailureDiagnostic(
+                FailureCategory.UPSTREAM_HTTP,
+                FailureStage.REQUEST,
+                "upstream_http_error",
+                "provider-overloaded",
+            ),
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_complete_preserves_provider_error(settings):
+    error = provider_failure()
+
+    with pytest.raises(ProviderError) as caught:
+        await LiteLLMProvider(settings, FailingClient(error)).complete(request())
+
+    assert caught.value is error
+
+
+@pytest.mark.asyncio
+async def test_stream_invocation_preserves_provider_error(settings):
+    error = provider_failure()
+
+    events = [
+        event
+        async for event in LiteLLMProvider(
+            settings, FailingClient(error)
+        ).stream(request())
+    ]
 
     assert events == [
         StreamError(
-            error_type="api_error",
-            message="requested model is unavailable",
-            status_code=500,
-            retryable=True,
-            provider="litellm",
-            diagnostic="requested model is unavailable",
+            error_type="rate_limit_error",
+            message="Safe provider failure",
+            status_code=429,
+            provider="upstream",
+            diagnostic=error.diagnostic,
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_preserves_provider_error(settings):
+    error = provider_failure()
+
+    with pytest.raises(ProviderError) as caught:
+        await LiteLLMProvider(settings, FailingClient(error)).count_tokens(
+            request()
+        )
+
+    assert caught.value is error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "status_code", "message", "diagnostic"),
+    _typed_litellm_errors(),
+)
+async def test_stream_classifies_typed_invocation_errors(
+    settings, error, status_code, message, diagnostic
+):
+    events = [
+        event
+        async for event in LiteLLMProvider(
+            settings, FailingClient(error)
+        ).stream(request())
+    ]
+
+    assert events == [
+        StreamError(
+            error_type={
+                401: "authentication_error",
+                403: "permission_error",
+                504: "timeout_error",
+                529: "overloaded_error",
+            }.get(status_code, "api_error"),
+            message=message,
+            status_code=status_code,
+            retryable=status_code >= 500,
+            provider="litellm",
+            diagnostic=diagnostic,
+        )
+    ]
+    assert events[0].diagnostic.exception_type is None
+    assert events[0].diagnostic.location is None
+    assert "secret" not in repr(events)
+
+
+@pytest.mark.asyncio
+async def test_stream_unknown_invocation_error_is_internal_and_safe(
+    settings, caplog
+):
+    events = [
+        event
+        async for event in LiteLLMProvider(
+            settings, FailingClient(RuntimeError("secret model detail"))
+        ).stream(request())
+    ]
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.status_code == 500
+    assert event.provider == "litellm"
+    assert event.diagnostic.category == FailureCategory.INTERNAL
+    assert event.diagnostic.stage == FailureStage.REQUEST
+    assert event.diagnostic.code == "provider_invocation_failed"
+    assert event.diagnostic.exception_type == "RuntimeError"
+    assert re.fullmatch(
+        r"claude_code_proxy\.providers\.litellm:stream:\d+",
+        event.diagnostic.location,
+    )
+    assert "secret model detail" not in repr(events)
+
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
+        log_stream_failure(log_context(), event)
+
+    rendered = caplog.records[-1].getMessage()
+    assert "exception=RuntimeError" in rendered
+    assert re.search(
+        r"location=claude_code_proxy\.providers\.litellm:stream:\d+",
+        rendered,
+    )
+    assert "secret model detail" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_unexpected_error_code_is_excluded_from_logs_and_client(
+    settings, caplog
+):
+    marker = "ACCESS_TOKEN_MUST_NOT_LEAK"
+    error = RuntimeError("secret model detail")
+    error.code = marker
+    events = [
+        event
+        async for event in LiteLLMProvider(
+            settings, FailingClient(error)
+        ).stream(request())
+    ]
+    event = events[0]
+
+    assert event.diagnostic.category == FailureCategory.INTERNAL
+    assert event.diagnostic.code == "provider_invocation_failed"
+    assert event.diagnostic.provider_code is None
+    assert marker not in repr(event)
+
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
+        log_stream_failure(log_context(), event)
+    assert marker not in caplog.records[-1].getMessage()
+
+    normalized = normalize_request(
+        MessagesRequest(model="model", max_tokens=10, messages=[])
+    )
+
+    async def event_source():
+        yield event
+
+    frames = [
+        frame async for frame in serialize_stream(normalized, event_source())
+    ]
+    assert marker not in "".join(frames)
+    assert "secret model detail" not in "".join(frames)
+
+
+@pytest.mark.asyncio
+async def test_complete_request_build_failure_is_translation_error(
+    settings, monkeypatch
+):
+    provider = LiteLLMProvider(settings, FakeClient())
+
+    def fail_build(*args, **kwargs):
+        raise RuntimeError("secret build detail")
+
+    monkeypatch.setattr(provider, "build_request", fail_build)
+
+    with pytest.raises(ProviderError) as caught:
+        await provider.complete(request())
+
+    assert_failure_evidence(
+        caught.value.diagnostic,
+        FailureCategory.TRANSLATION,
+        FailureStage.PROVIDER_TRANSLATION,
+        "request_translation_failed",
+        "RuntimeError",
+    )
+    assert "secret build detail" not in repr(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_stream_request_build_failure_is_translation_error(
+    settings, monkeypatch
+):
+    provider = LiteLLMProvider(settings, FakeClient())
+
+    def fail_build(*args, **kwargs):
+        raise RuntimeError("secret build detail")
+
+    monkeypatch.setattr(provider, "build_request", fail_build)
+
+    events = [event async for event in provider.stream(request())]
+
+    assert len(events) == 1
+    assert events[0].status_code == 500
+    assert events[0].provider == "litellm"
+    assert_failure_evidence(
+        events[0].diagnostic,
+        FailureCategory.TRANSLATION,
+        FailureStage.PROVIDER_TRANSLATION,
+        "request_translation_failed",
+        "RuntimeError",
+    )
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_request_build_failure_is_translation_error(
+    settings, monkeypatch
+):
+    provider = LiteLLMProvider(settings, FakeClient())
+
+    def fail_build(*args, **kwargs):
+        raise RuntimeError("secret build detail")
+
+    monkeypatch.setattr(provider, "build_request", fail_build)
+
+    with pytest.raises(ProviderError) as caught:
+        await provider.count_tokens(request())
+
+    assert_failure_evidence(
+        caught.value.diagnostic,
+        FailureCategory.TRANSLATION,
+        FailureStage.PROVIDER_TRANSLATION,
+        "token_count_request_translation_failed",
+        "RuntimeError",
+    )
+
+
+@pytest.mark.asyncio
+async def test_complete_response_normalization_failure_is_translation_error(settings):
+    with pytest.raises(ProviderError) as caught:
+        await LiteLLMProvider(settings, FakeClient(response=object())).complete(
+            request()
+        )
+
+    assert str(caught.value) == "Internal server error"
+    assert_failure_evidence(
+        caught.value.diagnostic,
+        FailureCategory.TRANSLATION,
+        FailureStage.PROVIDER_TRANSLATION,
+        "response_translation_failed",
+        "AttributeError",
+    )
+
+
+@pytest.mark.asyncio
+async def test_stream_response_initialization_failure_is_translation_error(settings):
+    class NonIterableClient(FakeClient):
+        async def acompletion(self, **kwargs):
+            return object()
+
+    events = [
+        event
+        async for event in LiteLLMProvider(
+            settings, NonIterableClient()
+        ).stream(request())
+    ]
+
+    assert len(events) == 1
+    assert events[0].status_code == 500
+    assert events[0].provider == "litellm"
+    assert_failure_evidence(
+        events[0].diagnostic,
+        FailureCategory.TRANSLATION,
+        FailureStage.PROVIDER_TRANSLATION,
+        "stream_initialization_failed",
+        "TypeError",
+    )
+
+
+@pytest.mark.asyncio
+async def test_stream_chunk_translation_failure_is_structured(settings):
+    events = [
+        event
+        async for event in LiteLLMProvider(
+            settings, FakeClient(chunks=[object()])
+        ).stream(request())
+    ]
+
+    assert events[0] == StreamStart()
+    assert len(events) == 2
+    assert events[1].status_code == 500
+    assert events[1].provider == "litellm"
+    assert_failure_evidence(
+        events[1].diagnostic,
+        FailureCategory.TRANSLATION,
+        FailureStage.PROVIDER_TRANSLATION,
+        "stream_chunk_translation_failed",
+        "AttributeError",
+    )
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_failure_has_distinct_stage_and_safe_message(settings):
+    with pytest.raises(ProviderError) as caught:
+        await LiteLLMProvider(
+            settings, FailingClient(RuntimeError("secret tokenizer detail"))
+        ).count_tokens(request())
+
+    assert str(caught.value) == "Internal server error"
+    assert_failure_evidence(
+        caught.value.diagnostic,
+        FailureCategory.INTERNAL,
+        FailureStage.REQUEST,
+        "token_count_failed",
+        "RuntimeError",
+    )
+    assert "secret tokenizer detail" not in repr(caught.value)
 
 
 @pytest.mark.asyncio

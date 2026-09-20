@@ -1,42 +1,84 @@
 """Shared provider contract and errors."""
 
 from collections.abc import AsyncIterator
+import math
 from typing import Protocol
+
 from ..domain.models import CompletionRequest, CompletionResponse, StreamError, StreamEvent
+from ..failures import (
+    FailureCategory,
+    FailureDiagnostic,
+    FailureStage,
+    retryable_status,
+    unexpected_failure_diagnostic,
+)
 
 
 class ProviderError(Exception):
-    def __init__(self, message: str, *, provider: str, status_code: int = 500) -> None:
+    """A provider failure whose exception message is safe to return to clients."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str,
+        status_code: int = 500,
+        diagnostic: FailureDiagnostic | None = None,
+    ) -> None:
         super().__init__(message)
         self.provider = provider
         self.status_code = status_code
+        self.diagnostic = diagnostic
 
 
 class UnsupportedOperationError(ProviderError):
     pass
 
 
-def stream_error_from_exception(
-    error: Exception, *, provider: str, expose_message: bool = False
-) -> StreamError:
-    status_code = getattr(error, "status_code", None)
-    error_type, default_message = _public_error(status_code)
-    message = str(error) if expose_message else default_message
+def stream_error_from_exception(error: Exception, *, provider: str) -> StreamError:
+    if isinstance(error, ProviderError):
+        status_code = error.status_code
+        error_type, _ = public_error(status_code)
+        return StreamError(
+            error_type=error_type,
+            message=str(error),
+            status_code=status_code,
+            retryable=retryable_status(status_code),
+            provider=error.provider,
+            diagnostic=error.diagnostic or _provider_error_fallback(status_code),
+        )
+
+    status_code = _status_code(error)
+    error_type, message = public_error(status_code)
     return StreamError(
         error_type=error_type,
         message=message,
         status_code=status_code,
-        retryable=status_code is None or status_code == 429 or status_code >= 500,
+        retryable=retryable_status(status_code),
         provider=provider,
-        diagnostic=str(error),
+        diagnostic=unexpected_failure_diagnostic(
+            error, stage=FailureStage.STREAM
+        ),
     )
 
 
-def protocol_error(detail: str, *, provider: str | None = None) -> StreamError:
-    return StreamError(provider=provider, diagnostic=detail)
+def protocol_error(
+    code: str,
+    *,
+    provider: str | None = None,
+    stage: FailureStage = FailureStage.STREAM,
+) -> StreamError:
+    return StreamError(
+        provider=provider,
+        diagnostic=FailureDiagnostic(
+            FailureCategory.PROVIDER_PROTOCOL,
+            stage,
+            code,
+        ),
+    )
 
 
-def _public_error(status_code: int | None) -> tuple[str, str]:
+def public_error(status_code: int | None) -> tuple[str, str]:
     known_errors = {
         400: ("invalid_request_error", "Invalid request"),
         401: ("authentication_error", "Authentication failed"),
@@ -54,6 +96,34 @@ def _public_error(status_code: int | None) -> tuple[str, str]:
     if status_code is not None and 400 <= status_code < 500:
         return "invalid_request_error", "Invalid request"
     return "api_error", "Internal server error"
+
+
+def scalar_provider_code(value: object) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float) and math.isfinite(value):
+        return str(value)
+    return None
+
+
+def _provider_error_fallback(status_code: int | None) -> FailureDiagnostic:
+    category = (
+        FailureCategory.UPSTREAM_HTTP
+        if status_code is not None
+        else FailureCategory.INTERNAL
+    )
+    return FailureDiagnostic(category, FailureStage.STREAM, "provider_error")
+
+
+def _status_code(error: Exception) -> int | None:
+    status_code = getattr(error, "status_code", None)
+    if isinstance(status_code, int) and not isinstance(status_code, bool):
+        return status_code
+    return None
 
 
 class Provider(Protocol):
