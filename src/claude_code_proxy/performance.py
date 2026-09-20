@@ -91,10 +91,14 @@ class Measurement:
 def _validate_observed_value(value: object) -> None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError("observed measurement requires a finite non-negative number")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError("observed measurement requires a non-negative integer")
+        if value > MAX_CONTROL_INTEGER:
+            raise ValueError("observed measurement integer exceeds the control limit")
+        return
     if value < 0 or not math.isfinite(value):
         raise ValueError("observed measurement requires a finite non-negative number")
-    if isinstance(value, int) and value > MAX_CONTROL_INTEGER:
-        raise ValueError("observed measurement integer exceeds the control limit")
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,17 +243,23 @@ class RequestPerformance:
     def record_usage(self, usage: TokenUsage) -> None:
         if self._is_terminal:
             return
-        self._input_tokens = _usage_measurement(usage, "input_tokens")
+        input_tokens = _usage_measurement(usage, "input_tokens")
         if self._operation == "count_tokens":
+            self._input_tokens = input_tokens
             return
-        self._output_tokens = _usage_measurement(usage, "output_tokens")
-        self._cache_read_tokens = _usage_measurement(
+        output_tokens = _usage_measurement(usage, "output_tokens")
+        cache_read_tokens = _usage_measurement(
             usage, "cache_read_input_tokens"
         )
-        self._cache_creation_tokens = _usage_measurement(
+        cache_creation_tokens = _usage_measurement(
             usage, "cache_creation_input_tokens"
         )
-        self._reasoning_tokens = _usage_measurement(usage, "thinking_tokens")
+        reasoning_tokens = _usage_measurement(usage, "thinking_tokens")
+        self._input_tokens = input_tokens
+        self._output_tokens = output_tokens
+        self._cache_read_tokens = cache_read_tokens
+        self._cache_creation_tokens = cache_creation_tokens
+        self._reasoning_tokens = reasoning_tokens
 
     def mark_retries_supported(self) -> None:
         if not self._is_terminal and self._retries is None:
@@ -291,12 +301,15 @@ class RequestPerformance:
         finished = _require_finite_time(
             "finished_monotonic", finished_monotonic
         )
+        effective_failure = failure if failure is not None else self._failure
+        if outcome != "failed" and effective_failure is not None:
+            raise ValueError("non-failed outcome cannot retain a failure diagnostic")
         self._outcome = outcome
         self._finished_at = finished_at
         self._finished_monotonic = finished
         if self._upstream_started is not None and self._upstream_finished is None:
             self._upstream_finished = finished
-        self._failure = failure if failure is not None else self._failure
+        self._failure = effective_failure
         return True
 
     def snapshot(self, now: float) -> RequestPerformanceSnapshot:
@@ -406,9 +419,13 @@ def _require_utc_datetime(name: str, value: datetime) -> None:
 def _require_finite_time(name: str, value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be finite")
-    if not math.isfinite(value):
+    try:
+        sampled = float(value)
+    except (OverflowError, ValueError):
+        raise ValueError(f"{name} must be finite") from None
+    if not math.isfinite(sampled):
         raise ValueError(f"{name} must be finite")
-    return float(value)
+    return sampled
 
 
 def _require_positive_control_integer(name: str, value: object) -> None:

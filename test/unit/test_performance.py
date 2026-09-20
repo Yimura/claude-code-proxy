@@ -62,7 +62,16 @@ def test_measurement_distinguishes_zero_unavailable_and_not_applicable() -> None
 
 @pytest.mark.parametrize(
     "value",
-    [True, -1, -0.1, math.nan, math.inf, -math.inf, MAX_CONTROL_INTEGER + 1],
+    [
+        True,
+        -1,
+        -0.1,
+        math.nan,
+        math.inf,
+        -math.inf,
+        MAX_CONTROL_INTEGER + 1,
+        10**1000,
+    ],
 )
 def test_measurement_rejects_invalid_observed_values(value: object) -> None:
     with pytest.raises(ValueError, match="observed measurement"):
@@ -237,6 +246,38 @@ def test_stream_complete_records_only_selectively_observed_usage() -> None:
     assert snapshot.reasoning_tokens == Measurement.unavailable()
 
 
+def test_usage_update_is_atomic_when_a_later_metric_is_invalid() -> None:
+    performance = request()
+    performance.record_usage(TokenUsage(7, 5, 2, 3, thinking_tokens=1))
+    before = performance.snapshot(10.0)
+    malformed = TokenUsage(
+        input_tokens=99,
+        output_tokens=MAX_CONTROL_INTEGER + 1,
+        observed_fields=frozenset({"input_tokens", "output_tokens"}),
+    )
+
+    with pytest.raises(ValueError, match="observed measurement"):
+        performance.record_usage(malformed)
+
+    assert performance.snapshot(10.0) == before
+
+
+def test_count_tokens_usage_rejection_preserves_prior_input() -> None:
+    performance = request("count_tokens")
+    performance.record_usage(TokenUsage(7, 0))
+    before = performance.snapshot(10.0)
+    malformed = TokenUsage(
+        input_tokens=10**1000,
+        output_tokens=0,
+        observed_fields=frozenset({"input_tokens"}),
+    )
+
+    with pytest.raises(ValueError, match="observed measurement"):
+        performance.record_usage(malformed)
+
+    assert performance.snapshot(10.0) == before
+
+
 def test_stream_error_retains_only_safe_diagnostic() -> None:
     diagnostic = FailureDiagnostic(
         FailureCategory.UPSTREAM_HTTP,
@@ -386,6 +427,53 @@ def test_finish_is_idempotent_and_freezes_first_terminal_state() -> None:
     assert snapshot.failure is first_failure
 
 
+def test_completed_rejects_explicit_failure_without_mutation() -> None:
+    diagnostic = FailureDiagnostic(
+        FailureCategory.INTERNAL,
+        FailureStage.ROUTE,
+        "unexpected_failure",
+    )
+    performance = request()
+    before = performance.snapshot(10.0)
+
+    with pytest.raises(ValueError, match="non-failed outcome"):
+        performance.finish("completed", STARTED, 10.0, diagnostic)
+
+    assert performance.snapshot(10.0) == before
+
+
+def test_completed_rejects_prior_stream_failure_without_mutation() -> None:
+    diagnostic = FailureDiagnostic(
+        FailureCategory.UPSTREAM_HTTP,
+        FailureStage.STREAM,
+        "provider_error",
+    )
+    performance = request()
+    performance.observe_stream_event(StreamError(diagnostic=diagnostic), 10.0)
+    before = performance.snapshot(10.0)
+
+    with pytest.raises(ValueError, match="non-failed outcome"):
+        performance.finish("completed", STARTED, 10.0)
+
+    assert performance.snapshot(10.0) == before
+
+
+@pytest.mark.parametrize("outcome", ["cancelled", "client_disconnected"])
+def test_other_nonfailed_outcomes_reject_diagnostics(outcome: str) -> None:
+    diagnostic = FailureDiagnostic(
+        FailureCategory.INTERNAL,
+        FailureStage.ROUTE,
+        "unexpected_failure",
+    )
+    performance = request()
+    before = performance.snapshot(10.0)
+
+    with pytest.raises(ValueError, match="non-failed outcome"):
+        performance.finish(outcome, STARTED, 10.0, diagnostic)  # type: ignore[arg-type]
+
+    assert performance.snapshot(10.0) == before
+
+
 @pytest.mark.parametrize("outcome", ["active", "unknown"])
 def test_finish_rejects_non_terminal_outcomes(outcome: str) -> None:
     with pytest.raises(ValueError, match="terminal outcome"):
@@ -396,6 +484,31 @@ def test_finish_rejects_non_terminal_outcomes(outcome: str) -> None:
 def test_constructor_rejects_non_finite_monotonic_time(invalid: float) -> None:
     with pytest.raises(ValueError, match="started_monotonic"):
         RequestPerformance("id", "session", "messages", STARTED, invalid, 1)
+
+
+def test_constructor_rejects_huge_monotonic_integer_as_value_error() -> None:
+    with pytest.raises(ValueError, match="started_monotonic"):
+        RequestPerformance("id", "session", "messages", STARTED, 10**1000, 1)
+
+
+def test_snapshot_rejects_huge_time_as_value_error_without_mutation() -> None:
+    performance = request()
+    before = performance.snapshot(10.0)
+
+    with pytest.raises(ValueError, match="snapshot time"):
+        performance.snapshot(10**1000)
+
+    assert performance.snapshot(10.0) == before
+
+
+def test_finish_rejects_huge_time_as_value_error_without_mutation() -> None:
+    performance = request()
+    before = performance.snapshot(10.0)
+
+    with pytest.raises(ValueError, match="finished_monotonic"):
+        performance.finish("completed", STARTED, 10**1000)
+
+    assert performance.snapshot(10.0) == before
 
 
 @pytest.mark.parametrize(
