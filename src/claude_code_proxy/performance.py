@@ -1,8 +1,11 @@
 """Provider-neutral request performance measurements and reduction."""
 
+from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import math
+from types import MappingProxyType
 from typing import Literal, TypeAlias
 
 from .domain.models import (
@@ -54,6 +57,15 @@ _REASONING_CONTINUATIONS = frozenset({
     "not_applicable",
     "unavailable",
 })
+_AGGREGATE_METRICS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_creation_tokens",
+    "reasoning_tokens",
+    "tool_calls",
+    "retries",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +98,81 @@ class Measurement:
 
     def model_value(self) -> dict[str, str | int | float | None]:
         return {"status": self.status, "value": self.value}
+
+
+@dataclass(frozen=True, slots=True)
+class MetricAggregate:
+    """Summarize lifetime coverage and total value for one metric."""
+
+    value: int | float
+    observed_samples: int
+    unavailable_samples: int
+    not_applicable_samples: int
+
+    def __post_init__(self) -> None:
+        _validate_observed_value(self.value)
+        for name in (
+            "observed_samples",
+            "unavailable_samples",
+            "not_applicable_samples",
+        ):
+            _require_control_integer(name, getattr(self, name), minimum=0)
+
+    @property
+    def partial(self) -> bool:
+        return self.unavailable_samples > 0
+
+
+class _Aggregate:
+    """Accumulate measurements without exposing mutable state."""
+
+    __slots__ = (
+        "_value",
+        "_observed_samples",
+        "_unavailable_samples",
+        "_not_applicable_samples",
+    )
+
+    def __init__(self, initial: MetricAggregate | None = None) -> None:
+        source = initial or MetricAggregate(0, 0, 0, 0)
+        self._value = source.value
+        self._observed_samples = source.observed_samples
+        self._unavailable_samples = source.unavailable_samples
+        self._not_applicable_samples = source.not_applicable_samples
+
+    def add(self, measurement: Measurement) -> None:
+        value = self._value
+        observed = self._observed_samples
+        unavailable = self._unavailable_samples
+        not_applicable = self._not_applicable_samples
+        if measurement.status == "observed":
+            _validate_observed_value(measurement.value)
+            assert measurement.value is not None
+            value += measurement.value
+            observed = _increment_control_integer("observed samples", observed)
+        elif measurement.status == "unavailable":
+            unavailable = _increment_control_integer(
+                "unavailable samples", unavailable
+            )
+        elif measurement.status == "not_applicable":
+            not_applicable = _increment_control_integer(
+                "not applicable samples", not_applicable
+            )
+        else:
+            raise ValueError("invalid measurement status")
+        updated = MetricAggregate(value, observed, unavailable, not_applicable)
+        self._value = updated.value
+        self._observed_samples = updated.observed_samples
+        self._unavailable_samples = updated.unavailable_samples
+        self._not_applicable_samples = updated.not_applicable_samples
+
+    def snapshot(self) -> MetricAggregate:
+        return MetricAggregate(
+            self._value,
+            self._observed_samples,
+            self._unavailable_samples,
+            self._not_applicable_samples,
+        )
 
 
 def _validate_observed_value(value: object) -> None:
@@ -124,6 +211,27 @@ class RequestPerformanceSnapshot:
     peak_concurrency: Measurement
     reasoning_continuation: ReasoningContinuation
     failure: FailureDiagnostic | None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionPerformanceSnapshot:
+    """Immutable summary of active, recent, and lifetime session metrics."""
+
+    session_id: str
+    requests: int
+    active_requests: tuple[RequestPerformanceSnapshot, ...]
+    recent_requests: tuple[RequestPerformanceSnapshot, ...]
+    outcomes: Mapping[str, int]
+    input_tokens: MetricAggregate
+    output_tokens: MetricAggregate
+    cache_read_tokens: MetricAggregate
+    cache_creation_tokens: MetricAggregate
+    reasoning_tokens: MetricAggregate
+    tool_calls: MetricAggregate
+    retries: MetricAggregate
+    current_concurrency: int
+    peak_concurrency: int
+    latest_request: RequestPerformanceSnapshot | None
 
 
 class RequestPerformance:
@@ -182,6 +290,24 @@ class RequestPerformance:
         self._retries: int | None = None
         self._peak_concurrency = initial_concurrency
         self._failure: FailureDiagnostic | None = None
+
+    @property
+    def request_id(self) -> str:
+        return self._request_id
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    @property
+    def is_terminal(self) -> bool:
+        return self._is_terminal
+
+    def final_snapshot(self) -> RequestPerformanceSnapshot:
+        if not self._is_terminal:
+            raise ValueError("final snapshot requires a terminal request")
+        assert self._finished_monotonic is not None
+        return self.snapshot(self._finished_monotonic)
 
     def _initialize_metrics(self, operation: OperationKind) -> None:
         self._input_tokens = Measurement.unavailable()
@@ -381,6 +507,114 @@ class RequestPerformance:
         return Measurement.observed(self._retries)
 
 
+class SessionPerformance:
+    """Reduce request snapshots into bounded history and lifetime metrics."""
+
+    __slots__ = (
+        "_session_id",
+        "_active",
+        "_recent",
+        "_requests",
+        "_outcomes",
+        "_aggregates",
+        "_peak_concurrency",
+    )
+
+    def __init__(self, session_id: str, history_limit: int = 20) -> None:
+        self._session_id = _require_safe_identifier("session_id", session_id)
+        _require_positive_control_integer("history_limit", history_limit)
+        self._active: dict[str, RequestPerformance] = {}
+        self._recent: deque[RequestPerformanceSnapshot] = deque(
+            maxlen=history_limit
+        )
+        self._requests = 0
+        self._outcomes: dict[str, int] = {}
+        self._aggregates = {name: _Aggregate() for name in _AGGREGATE_METRICS}
+        self._peak_concurrency = 0
+
+    def start(self, request: RequestPerformance) -> int:
+        if request.session_id != self._session_id:
+            raise ValueError("request session does not match session")
+        if request.is_terminal:
+            raise ValueError("request must be active when started")
+        request_id = _require_safe_identifier("request_id", request.request_id)
+        if request_id in self._active:
+            raise ValueError("duplicate active request ID")
+        requests = _increment_control_integer("requests", self._requests)
+        self._active[request_id] = request
+        concurrency = len(self._active)
+        for active in self._active.values():
+            active.set_concurrency(concurrency)
+        self._requests = requests
+        self._peak_concurrency = max(self._peak_concurrency, concurrency)
+        return concurrency
+
+    def add_finalized(
+        self, request: RequestPerformance
+    ) -> RequestPerformanceSnapshot | None:
+        if request.session_id != self._session_id:
+            return None
+        active = self._active.get(request.request_id)
+        if active is not request:
+            return None
+        if not request.is_terminal:
+            raise ValueError("request must be terminal before finalization")
+        snapshot = request.final_snapshot()
+        outcome = snapshot.outcome
+        outcome_count = _increment_control_integer(
+            "outcome count", self._outcomes.get(outcome, 0)
+        )
+        aggregates = self._updated_aggregates(snapshot)
+        del self._active[request.request_id]
+        self._recent.appendleft(snapshot)
+        self._outcomes[outcome] = outcome_count
+        self._aggregates = aggregates
+        return snapshot
+
+    def _updated_aggregates(
+        self, snapshot: RequestPerformanceSnapshot
+    ) -> dict[str, _Aggregate]:
+        updated: dict[str, _Aggregate] = {}
+        for name in _AGGREGATE_METRICS:
+            aggregate = _Aggregate(self._aggregates[name].snapshot())
+            aggregate.add(getattr(snapshot, name))
+            updated[name] = aggregate
+        return updated
+
+    def snapshot(self, now: float) -> SessionPerformanceSnapshot:
+        sampled = _require_finite_time("snapshot time", now)
+        active = tuple(
+            sorted(
+                (request.snapshot(sampled) for request in self._active.values()),
+                key=lambda item: (item.started_at, item.id),
+                reverse=True,
+            )
+        )
+        recent = tuple(self._recent)
+        latest = recent[0] if recent else (active[0] if active else None)
+        aggregates = {
+            name: aggregate.snapshot()
+            for name, aggregate in self._aggregates.items()
+        }
+        return SessionPerformanceSnapshot(
+            session_id=self._session_id,
+            requests=self._requests,
+            active_requests=active,
+            recent_requests=recent,
+            outcomes=MappingProxyType(dict(self._outcomes)),
+            input_tokens=aggregates["input_tokens"],
+            output_tokens=aggregates["output_tokens"],
+            cache_read_tokens=aggregates["cache_read_tokens"],
+            cache_creation_tokens=aggregates["cache_creation_tokens"],
+            reasoning_tokens=aggregates["reasoning_tokens"],
+            tool_calls=aggregates["tool_calls"],
+            retries=aggregates["retries"],
+            current_concurrency=len(active),
+            peak_concurrency=self._peak_concurrency,
+            latest_request=latest,
+        )
+
+
 def _is_semantic_event(event: StreamEvent) -> bool:
     if isinstance(event, TextDelta):
         return bool(event.text)
@@ -428,11 +662,24 @@ def _require_finite_time(name: str, value: object) -> float:
     return sampled
 
 
-def _require_positive_control_integer(name: str, value: object) -> None:
-    if type(value) is not int or not 1 <= value <= MAX_CONTROL_INTEGER:
+def _require_safe_identifier(name: str, value: object) -> str:
+    if not isinstance(value, str) or not value.strip() or not value.isprintable():
+        raise ValueError(f"{name} must be a nonblank printable string")
+    return value
+
+
+def _require_control_integer(
+    name: str, value: object, *, minimum: int
+) -> None:
+    if type(value) is not int or not minimum <= value <= MAX_CONTROL_INTEGER:
         raise ValueError(
-            f"{name} must be an integer between 1 and {MAX_CONTROL_INTEGER}"
+            f"{name} must be an integer between {minimum} and "
+            f"{MAX_CONTROL_INTEGER}"
         )
+
+
+def _require_positive_control_integer(name: str, value: object) -> None:
+    _require_control_integer(name, value, minimum=1)
 
 
 def _increment_control_integer(name: str, value: int) -> int:
