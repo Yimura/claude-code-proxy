@@ -32,7 +32,15 @@ if TYPE_CHECKING:
 _MAX_FILTERS = 32
 _MAX_FILTER_LENGTH = 256
 _SUPPORTED_FILTERS = frozenset(
-    {"id", "state", "provider", "transport", "model", "effort"}
+    {
+        "id",
+        "session_id",
+        "state",
+        "provider",
+        "transport",
+        "model",
+        "effort",
+    }
 )
 _MODEL_DISPLAY_LENGTH = 24
 _EFFORT_DISPLAY_LENGTH = 12

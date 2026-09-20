@@ -21,7 +21,15 @@ SessionResult = Literal["completed", "failed"]
 SessionFilters = Mapping[str, Sequence[str]]
 
 _FILTER_FIELDS = frozenset(
-    {"id", "state", "provider", "transport", "model", "effort"}
+    {
+        "id",
+        "session_id",
+        "state",
+        "provider",
+        "transport",
+        "model",
+        "effort",
+    }
 )
 
 
@@ -347,7 +355,17 @@ class SessionRegistry:
             ]
 
         if normalized_filters is not None:
-            snapshots = _filter_snapshots(snapshots, normalized_filters)
+            session_ids = normalized_filters.get("session_id")
+            exact_ids = (
+                {self.public_id(value) for value in session_ids}
+                if session_ids is not None
+                else None
+            )
+            snapshots = _filter_snapshots(
+                snapshots,
+                normalized_filters,
+                exact_ids,
+            )
         return sorted(snapshots, key=lambda item: item.last_seen, reverse=True)
 
     def counts(self) -> tuple[int, int]:
@@ -478,7 +496,10 @@ def _validate_filters(
             raise InvalidSessionFilter(f"filter {key!r} requires a sequence of values")
         entries = tuple(values)
         invalid_value = any(
-            not isinstance(value, str) or not value for value in entries
+            not isinstance(value, str)
+            or not value
+            or (key == "session_id" and not value.strip())
+            for value in entries
         )
         if not entries or invalid_value:
             raise InvalidSessionFilter(
@@ -491,14 +512,17 @@ def _validate_filters(
 def _filter_snapshots(
     snapshots: list[SessionSnapshot],
     filters: dict[str, tuple[str, ...]],
+    exact_ids: set[str] | None,
 ) -> list[SessionSnapshot]:
     selected_ids = _resolve_id_filters(snapshots, filters.get("id"))
     matches = snapshots
     if selected_ids is not None:
         matches = [item for item in matches if item.id in selected_ids]
+    if exact_ids is not None:
+        matches = [item for item in matches if item.id in exact_ids]
 
     for key, values in filters.items():
-        if key == "id":
+        if key in {"id", "session_id"}:
             continue
         accepted = {value.casefold() for value in values}
         matches = [
