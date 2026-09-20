@@ -24,6 +24,11 @@ from claude_code_proxy.domain.models import (
     TokenUsage,
     ToolUseStart,
 )
+from claude_code_proxy.failures import (
+    FailureCategory,
+    FailureDiagnostic,
+    FailureStage,
+)
 from claude_code_proxy.logging import (
     RequestLogContext,
     SessionIdentity,
@@ -431,7 +436,19 @@ def test_repeated_session_logs_new_only_once(caplog):
 
 
 def test_provider_error_logs_once_without_success(caplog):
-    provider = Provider(ProviderError("busy", provider="fake", status_code=429))
+    provider = Provider(
+        ProviderError(
+            "Rate limit exceeded",
+            provider="fake",
+            status_code=429,
+            diagnostic=FailureDiagnostic(
+                FailureCategory.UPSTREAM_HTTP,
+                FailureStage.RESPONSE,
+                "rate_limit",
+                provider_code="rate_limit_exceeded",
+            ),
+        )
+    )
     with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
         response = client(provider).post(
             "/v1/messages",
@@ -440,8 +457,14 @@ def test_provider_error_logs_once_without_success(caplog):
         )
     assert response.status_code == 429
     assert caplog.text.count("provider request failed") == 1
+    assert "category=upstream_http" in caplog.text
+    assert "stage=response" in caplog.text
+    assert "code=rate_limit" in caplog.text
+    assert "provider_code=rate_limit_exceeded" in caplog.text
     assert "status=429" in caplog.text
-    assert "busy" not in caplog.text
+    assert "Rate limit exceeded" not in caplog.text
+    assert response.json() == {"detail": "Rate limit exceeded"}
+    assert "rate_limit_exceeded" not in response.text
     assert "200 OK" not in caplog.text
 
 
@@ -457,6 +480,9 @@ def test_token_count_provider_error_logs_once(caplog):
         )
     assert response.status_code == 503
     assert caplog.text.count("provider request failed") == 1
+    assert "category=upstream_http" in caplog.text
+    assert "stage=request" in caplog.text
+    assert "code=provider_error" in caplog.text
     assert "/v1/messages/count_tokens" in caplog.text
 
 
@@ -464,14 +490,19 @@ def test_unexpected_provider_exception_logs_once_and_propagates(caplog):
     provider = Provider(RuntimeError("secret response body"))
     with caplog.at_level(logging.ERROR, logger="claude_code_proxy.logging"):
         with pytest.raises(RuntimeError, match="secret response body"):
-            client(provider).post(
+            client(provider, with_middleware=True).post(
                 "/v1/messages",
                 headers={"x-claude-code-session-id": "abcdef123456"},
                 json=messages_payload(messages=[]),
             )
     assert caplog.text.count("unexpected request failure") == 1
-    assert "error=RuntimeError" in caplog.text
+    assert "category=internal" in caplog.text
+    assert "stage=route" in caplog.text
+    assert "code=unexpected_exception" in caplog.text
+    assert "exception=RuntimeError" in caplog.text
+    assert "location=claude_code_proxy.service:complete_prepared:" in caplog.text
     assert "secret response body" not in caplog.text
+    assert "/home/" not in caplog.text
 
 
 def test_stream_error_logs_once_and_returns_safe_sse(caplog):
@@ -480,7 +511,12 @@ def test_stream_error_logs_once_and_returns_safe_sse(caplog):
         message="Internal server error",
         retryable=True,
         provider="fake",
-        diagnostic="secret body",
+        diagnostic=FailureDiagnostic(
+            FailureCategory.UPSTREAM_HTTP,
+            FailureStage.STREAM,
+            "stream_http_error",
+            provider_code="SECRET_PROVIDER_CODE",
+        ),
     )
     provider = Provider(stream_events=[TextDelta("hello"), error])
     sessions = registry()
@@ -492,11 +528,17 @@ def test_stream_error_logs_once_and_returns_safe_sse(caplog):
         )
     assert response.status_code == 200
     assert caplog.text.count("provider stream failed") == 1
+    assert "category=upstream_http" in caplog.text
+    assert "stage=stream" in caplog.text
+    assert "code=stream_http_error" in caplog.text
+    assert "provider_code=SECRET_PROVIDER_CODE" in caplog.text
     assert "error=api_error" in caplog.text
     assert "retryable=True" in caplog.text
-    assert "secret body" not in caplog.text
     assert 'event: error' in response.text
     assert '"message": "Internal server error"' in response.text
+    assert "SECRET_PROVIDER_CODE" not in response.text
+    assert "upstream_http" not in response.text
+    assert "stream_http_error" not in response.text
     assert "message_stop" not in response.text
     assert "[DONE]" not in response.text
     snapshot = sessions.snapshots()[0]
@@ -525,6 +567,9 @@ def test_serializer_protocol_error_logs_once_and_finishes_failed(caplog):
     assert 'event: error' in response.text
     assert "[DONE]" not in response.text
     assert caplog.text.count("provider stream failed") == 1
+    assert "category=translation" in caplog.text
+    assert "stage=client_translation" in caplog.text
+    assert "code=invalid_event_sequence" in caplog.text
     snapshot = sessions.snapshots()[0]
     assert snapshot.active_requests == 0
     assert snapshot.last_result == "failed"
@@ -605,9 +650,13 @@ def test_stream_iterator_exception_becomes_safe_terminal_error(caplog):
 
     assert response.status_code == 200
     assert caplog.text.count("provider stream failed") == 1
+    assert "exception=RuntimeError" in caplog.text
+    assert "location=claude_code_proxy.service:_validated_stream:" in caplog.text
     assert "secret body" not in caplog.text
     assert 'event: error' in response.text
     assert '"message": "Internal server error"' in response.text
+    assert "RuntimeError" not in response.text
+    assert "claude_code_proxy.service" not in response.text
 
 
 def test_hello_probe_does_not_log_warning(caplog):
@@ -642,7 +691,9 @@ def test_validation_failure_logs_one_http_warning(caplog):
 
 
 def test_middleware_does_not_duplicate_route_provider_warning(caplog):
-    provider = Provider(ProviderError("busy", provider="fake", status_code=429))
+    provider = Provider(
+        ProviderError("Rate limit exceeded", provider="fake", status_code=429)
+    )
     with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
         response = client(provider, with_middleware=True).post(
             "/v1/messages",
@@ -1062,6 +1113,14 @@ def test_fallback_exception_log_uses_safe_id_without_registry_row(
     assert sessions.snapshots() == []
     assert raw_id not in caplog.text
     assert sessions.public_id(raw_id)[:12] in caplog.text
+    assert caplog.text.count("unexpected HTTP failure") == 1
+    assert "category=internal" in caplog.text
+    assert "stage=route" in caplog.text
+    assert "code=unexpected_exception" in caplog.text
+    assert "exception=RuntimeError" in caplog.text
+    assert "location=claude_code_proxy.api.routes:create_message:" in caplog.text
+    assert "pre-observation failure" not in caplog.text
+    assert "/home/" not in caplog.text
 
 
 class ConcurrentProvider(Provider):
@@ -1135,7 +1194,8 @@ def test_token_count_unexpected_exception_finishes_once_and_propagates(caplog):
             )
 
     assert caplog.text.count("unexpected request failure") == 1
-    assert "error=RuntimeError" in caplog.text
+    assert "exception=RuntimeError" in caplog.text
+    assert "location=claude_code_proxy.service:count_tokens_prepared:" in caplog.text
     assert "secret count failure" not in caplog.text
     snapshot = sessions.snapshots()[0]
     assert snapshot.active_requests == 0

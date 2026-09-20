@@ -4,7 +4,9 @@ from dataclasses import replace
 import pytest
 from claude_code_proxy.config import ModelConfig, ModelDefinition
 from claude_code_proxy.domain.models import ClientIdentity, CompletionRequest, CompletionResponse, Message, StreamComplete, StreamError, TextBlock, TextDelta, TokenUsage
+from claude_code_proxy.failures import FailureCategory, FailureDiagnostic, FailureStage
 from claude_code_proxy.model_mapping import ModelResolver
+from claude_code_proxy.providers.base import ProviderError
 from claude_code_proxy.reasoning import MappingEntry, ReasoningPolicy
 from claude_code_proxy.service import ProxyService
 
@@ -114,21 +116,62 @@ async def test_stream_converts_eof_without_terminal_to_protocol_error():
     events = await service_events(EventProvider([TextDelta("partial")]))
 
     assert events[0] == TextDelta("partial")
-    assert isinstance(events[-1], StreamError)
-    assert events[-1].error_type == "api_error"
+    assert events[-1] == StreamError(
+        provider="fake",
+        diagnostic=FailureDiagnostic(
+            FailureCategory.PROVIDER_PROTOCOL,
+            FailureStage.STREAM,
+            "missing_terminal_event",
+        ),
+    )
 
 
 @pytest.mark.asyncio
 async def test_stream_converts_raised_exception_to_safe_error():
     events = await service_events(EventProvider(error=RuntimeError("secret body")))
 
+    assert len(events) == 1
+    stream_error = events[0]
+    assert stream_error.error_type == "api_error"
+    assert stream_error.message == "Internal server error"
+    assert stream_error.retryable is True
+    assert stream_error.provider == "fake"
+    assert stream_error.diagnostic is not None
+    assert stream_error.diagnostic.category == FailureCategory.INTERNAL
+    assert stream_error.diagnostic.stage == FailureStage.STREAM
+    assert stream_error.diagnostic.code == "unexpected_exception"
+    assert stream_error.diagnostic.exception_type == "RuntimeError"
+    assert stream_error.diagnostic.location.startswith(
+        "claude_code_proxy.service:_validated_stream:"
+    )
+    assert "secret body" not in repr(events)
+
+
+@pytest.mark.asyncio
+async def test_stream_preserves_safe_provider_error_and_diagnostic():
+    diagnostic = FailureDiagnostic(
+        FailureCategory.TRANSPORT,
+        FailureStage.REQUEST,
+        "transport_error",
+    )
+    events = await service_events(
+        EventProvider(
+            error=ProviderError(
+                "Provider temporarily unavailable",
+                provider="upstream",
+                status_code=503,
+                diagnostic=diagnostic,
+            )
+        )
+    )
+
     assert events == [
         StreamError(
-            error_type="api_error",
-            message="Internal server error",
+            message="Provider temporarily unavailable",
+            status_code=503,
             retryable=True,
-            provider="fake",
-            diagnostic="secret body",
+            provider="upstream",
+            diagnostic=diagnostic,
         )
     ]
 

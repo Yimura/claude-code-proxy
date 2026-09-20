@@ -86,9 +86,7 @@ async def _validated_stream(
             if isinstance(event, (StreamComplete, StreamError)):
                 return
     except ProviderError as error:
-        yield stream_error_from_exception(
-            error, provider=provider, expose_message=True
-        )
+        yield stream_error_from_exception(error, provider=provider)
         return
     except Exception as error:
         yield stream_error_from_exception(error, provider=provider)
@@ -98,6 +96,4 @@ async def _validated_stream(
         if close is not None:
             await close()
 
-    yield protocol_error(
-        "provider stream ended without terminal outcome", provider=provider
-    )
+    yield protocol_error("missing_terminal_event", provider=provider)

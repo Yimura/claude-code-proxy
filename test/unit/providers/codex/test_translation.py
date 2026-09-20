@@ -5,10 +5,11 @@ from claude_code_proxy.api.schemas import MessagesRequest
 from claude_code_proxy.api.translation import normalize_request, to_api_response
 
 from claude_code_proxy.domain.models import (
-    ClientIdentity, CompletionRequest, Message, RedactedThinking, RedactedThinkingBlock, StreamComplete, TextBlock, TextDelta, TokenUsage,
+    ClientIdentity, CompletionRequest, Message, RedactedThinking, RedactedThinkingBlock, StreamComplete, StreamError, TextBlock, TextDelta, TokenUsage,
     ToolChoice, ToolDefinition, ToolInputDelta, ToolResultBlock, ToolUseBlock,
     ToolUseEnd, ToolUseStart,
 )
+from claude_code_proxy.failures import FailureCategory, FailureDiagnostic, FailureStage
 from claude_code_proxy.providers.codex.identity import CodexIdentity
 from claude_code_proxy.providers.codex.reasoning import decode_reasoning, encode_reasoning
 from claude_code_proxy.providers.codex.translation import CodexEventTranslator, build_request, response_from_events
@@ -188,6 +189,55 @@ def test_event_translator_maps_text_tools_usage_and_stop():
     assert events == [TextDelta("hello"), ToolUseStart("2", "call-1", "lookup"), ToolInputDelta("2", '{"q":"x"}'), ToolUseEnd("2")]
     assert translator.finish() == StreamComplete("tool_use", TokenUsage(4, 2))
 
+
+def test_response_failed_excludes_message_and_preserves_scalar_code():
+    events = CodexEventTranslator().feed(
+        "response.failed",
+        {
+            "response": {
+                "error": {
+                    "code": "server_error",
+                    "message": "secret upstream detail",
+                }
+            }
+        },
+    )
+
+    assert events == (
+        StreamError(
+            provider="codex",
+            diagnostic=FailureDiagnostic(
+                FailureCategory.PROVIDER_PROTOCOL,
+                FailureStage.STREAM,
+                "response_failed",
+                "server_error",
+            ),
+        ),
+    )
+    assert "secret upstream detail" not in repr(events)
+
+
+def test_response_failed_falls_back_to_scalar_type_only():
+    event = CodexEventTranslator().feed(
+        "response.failed",
+        {"error": {"code": {"unsafe": "value"}, "type": 503}},
+    )[0]
+
+    assert event.diagnostic == FailureDiagnostic(
+        FailureCategory.PROVIDER_PROTOCOL,
+        FailureStage.STREAM,
+        "response_failed",
+        "503",
+    )
+
+
+def test_response_failed_preserves_empty_scalar_code():
+    event = CodexEventTranslator().feed(
+        "response.failed",
+        {"error": {"code": "", "type": "must_not_replace"}},
+    )[0]
+
+    assert event.diagnostic.provider_code == ""
 
 
 def test_completion_maps_nested_cache_and_reasoning_usage():

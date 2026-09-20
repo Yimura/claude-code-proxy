@@ -11,11 +11,19 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 import uuid
 
+from .console_logging import SeverityFormatter as _SeverityFormatter
 from .domain.models import ClientIdentity, StreamError, StreamEvent
+from .failures import (
+    FailureCategory,
+    FailureDiagnostic,
+    FailureStage,
+    retryable_status,
+    unexpected_failure_diagnostic,
+)
 from .observability import SessionRegistry
 from .providers.base import ProviderError
 from .reasoning import ReasoningPolicy
-from .text_safety import log_text
+from .text_safety import bounded_log_token, log_text
 
 if TYPE_CHECKING:
     from .providers.codex.auth import CodexAccountIdentity
@@ -25,6 +33,7 @@ AGENT_HEADER = "x-claude-code-agent-id"
 PARENT_AGENT_HEADER = "x-claude-code-parent-agent-id"
 FAILURE_LOGGED = "failure_logged"
 REQUEST_LOG_CONTEXT = "request_log_context"
+DIAGNOSTIC_FIELD_MAX_LENGTH = 128
 SESSION_COLORS = (
     "\033[96m",
     "\033[94m",
@@ -55,17 +64,6 @@ class MessageFilter(logging.Filter):
         )
 
 
-class ColorizedFormatter(logging.Formatter):
-    green = "\033[92m"
-    reset = "\033[0m"
-    bold = "\033[1m"
-
-    def format(self, record):
-        if record.levelno == logging.DEBUG and "MODEL MAPPING" in str(record.msg):
-            return f"{self.bold}{self.green}{record.msg}{self.reset}"
-        return super().format(record)
-
-
 @dataclass(frozen=True)
 class SessionIdentity:
     label: str
@@ -91,17 +89,6 @@ class RequestLogContext:
     provider: str
     effort: str
     agent: AgentIdentity | None = None
-
-    def __post_init__(self) -> None:
-        for name in (
-            "method",
-            "endpoint",
-            "original_model",
-            "upstream_model",
-            "provider",
-            "effort",
-        ):
-            object.__setattr__(self, name, log_text(getattr(self, name)))
 
 
 def _nonblank_header(headers: Mapping[str, str], name: str) -> str | None:
@@ -193,11 +180,19 @@ def effective_effort(policy: ReasoningPolicy) -> str:
 
 
 def configure_logging() -> None:
+    root = logging.getLogger()
+    root.filters[:] = [
+        item for item in root.filters if not isinstance(item, MessageFilter)
+    ]
+    handler = logging.StreamHandler()
+    handler.addFilter(MessageFilter())
+    handler.setFormatter(_SeverityFormatter())
     logging.basicConfig(
-        level=logging.WARN,
-        format="%(asctime)s - %(levelname)s - %(message)s",
+        level=logging.WARN, handlers=[handler], force=True
     )
-    logging.getLogger().addFilter(MessageFilter())
+    root.filters[:] = [
+        item for item in root.filters if not isinstance(item, MessageFilter)
+    ]
     session_logger.setLevel(logging.INFO)
     readiness_logger.setLevel(logging.INFO)
     for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
@@ -250,12 +245,16 @@ def _request_fields(
     )
     return (
         correlation,
-        context.method,
-        context.endpoint,
-        context.original_model,
-        context.upstream_model,
-        context.provider,
-        context.effort,
+        log_text(context.method),
+        log_text(context.endpoint),
+        log_text(context.original_model),
+        log_text(context.upstream_model),
+        bounded_log_token(
+            context.provider, max_length=DIAGNOSTIC_FIELD_MAX_LENGTH
+        ),
+        bounded_log_token(
+            context.effort, max_length=DIAGNOSTIC_FIELD_MAX_LENGTH
+        ),
     )
 
 
@@ -273,58 +272,105 @@ def log_agent_started(context: RequestLogContext) -> None:
     )
 
 
-def log_provider_failure(context: RequestLogContext, status_code: int) -> None:
-    logger.warning(
-        "%s %s %s provider request failed status=%s model=%s upstream=%s "
-        "provider=%s effort=%s",
-        _correlation(context),
-        context.method,
-        context.endpoint,
-        status_code,
-        context.original_model,
-        context.upstream_model,
-        context.provider,
-        context.effort,
+def _structured_log_token(value: object) -> str:
+    return bounded_log_token(str(value), max_length=DIAGNOSTIC_FIELD_MAX_LENGTH)
+
+
+def _render_diagnostic(diagnostic: FailureDiagnostic) -> str:
+    fields = [
+        f"category={_structured_log_token(diagnostic.category)}",
+        f"stage={_structured_log_token(diagnostic.stage)}",
+        f"code={_structured_log_token(diagnostic.code)}",
+    ]
+    optional_fields = (
+        ("provider_code", diagnostic.provider_code),
+        ("exception", diagnostic.exception_type),
+        ("location", diagnostic.location),
+    )
+    fields.extend(
+        f"{name}={_structured_log_token(value)}"
+        for name, value in optional_fields
+        if value is not None
+    )
+    return " ".join(fields)
+
+
+def _provider_diagnostic(error: ProviderError) -> FailureDiagnostic:
+    return error.diagnostic or FailureDiagnostic(
+        FailureCategory.UPSTREAM_HTTP, FailureStage.REQUEST, "provider_error"
     )
 
 
-def log_stream_failure(
-    context: RequestLogContext, error: StreamError
-) -> None:
+def _stream_diagnostic(error: StreamError) -> FailureDiagnostic:
+    if error.diagnostic is not None:
+        return error.diagnostic
+    category = (
+        FailureCategory.UPSTREAM_HTTP
+        if error.status_code is not None
+        else FailureCategory.PROVIDER_PROTOCOL
+    )
+    return FailureDiagnostic(category, FailureStage.STREAM, "stream_error")
+
+
+def log_provider_failure(context: RequestLogContext, error: ProviderError) -> None:
     logger.warning(
-        "%s %s %s provider stream failed error=%s status=%s retryable=%s "
+        "%s %s %s provider request failed %s status=%s retryable=%s "
+        "model=%s upstream=%s "
+        "provider=%s effort=%s",
+        _correlation(context),
+        log_text(context.method),
+        log_text(context.endpoint),
+        _render_diagnostic(_provider_diagnostic(error)),
+        error.status_code,
+        retryable_status(error.status_code),
+        _structured_log_token(context.original_model),
+        _structured_log_token(context.upstream_model),
+        _structured_log_token(error.provider),
+        _structured_log_token(context.effort),
+    )
+
+
+def log_stream_failure(context: RequestLogContext, error: StreamError) -> None:
+    provider = _structured_log_token(error.provider or context.provider)
+    logger.warning(
+        "%s %s %s provider stream failed %s error=%s status=%s retryable=%s "
         "model=%s upstream=%s provider=%s effort=%s",
         _correlation(context),
-        context.method,
-        context.endpoint,
-        log_text(error.error_type),
+        log_text(context.method),
+        log_text(context.endpoint),
+        _render_diagnostic(_stream_diagnostic(error)),
+        _structured_log_token(error.error_type),
         error.status_code,
         error.retryable,
-        context.original_model,
-        context.upstream_model,
-        log_text(error.provider) if error.provider else context.provider,
-        context.effort,
+        _structured_log_token(context.original_model),
+        _structured_log_token(context.upstream_model),
+        provider,
+        _structured_log_token(context.effort),
     )
 
 
-def log_unexpected_failure(context: RequestLogContext, error_type: str) -> None:
+def log_unexpected_failure(
+    context: RequestLogContext,
+    error: Exception,
+    *, stage: FailureStage = FailureStage.ROUTE,
+) -> None:
+    diagnostic = unexpected_failure_diagnostic(error, stage=stage)
     logger.error(
-        "%s %s %s unexpected request failure error=%s model=%s upstream=%s "
-        "provider=%s effort=%s",
+        "%s %s %s unexpected request failure %s "
+        "model=%s upstream=%s provider=%s effort=%s",
         _correlation(context),
-        context.method,
-        context.endpoint,
-        log_text(error_type),
-        context.original_model,
-        context.upstream_model,
-        context.provider,
-        context.effort,
+        log_text(context.method),
+        log_text(context.endpoint),
+        _render_diagnostic(diagnostic),
+        _structured_log_token(context.original_model),
+        _structured_log_token(context.upstream_model),
+        _structured_log_token(context.provider),
+        _structured_log_token(context.effort),
     )
 
 
 def _fallback_context_identity(
-    request,
-    sessions: SessionRegistry,
+    request, sessions: SessionRegistry
 ) -> tuple[SessionIdentity, AgentIdentity | None]:
     identity = client_identity_from_headers(request.headers)
     raw_session = (identity.session_id or "").strip()
@@ -360,13 +406,13 @@ def log_http_failure(
             "%s %s %s HTTP request failed status=%s model=%s upstream=%s "
             "provider=%s effort=%s",
             _correlation(context),
-            context.method,
-            context.endpoint,
+            log_text(context.method),
+            log_text(context.endpoint),
             status_code,
-            context.original_model,
-            context.upstream_model,
-            context.provider,
-            context.effort,
+            _structured_log_token(context.original_model),
+            _structured_log_token(context.upstream_model),
+            _structured_log_token(context.provider),
+            _structured_log_token(context.effort),
         )
         return
 
@@ -381,20 +427,23 @@ def log_http_failure(
 
 
 def log_middleware_exception(
-    request, sessions: SessionRegistry, error_type: str
+    request, sessions: SessionRegistry, error: Exception
 ) -> None:
     context = getattr(request.state, REQUEST_LOG_CONTEXT, None)
     if context is not None:
-        log_unexpected_failure(context, error_type)
+        log_unexpected_failure(context, error)
         return
 
+    diagnostic = unexpected_failure_diagnostic(
+        error, stage=FailureStage.ROUTE
+    )
     session, agent = _fallback_context_identity(request, sessions)
     logger.error(
-        "%s %s %s unexpected HTTP failure error=%s",
+        "%s %s %s unexpected HTTP failure %s",
         _render_correlation(session, agent),
         log_text(request.method),
         log_text(request.url.path),
-        log_text(error_type),
+        _render_diagnostic(diagnostic),
     )
 
 
@@ -404,7 +453,7 @@ def request_logging_middleware(sessions: SessionRegistry):
             response = await call_next(request)
         except Exception as error:
             if not getattr(request.state, FAILURE_LOGGED, False):
-                log_middleware_exception(request, sessions, type(error).__name__)
+                log_middleware_exception(request, sessions, error)
                 setattr(request.state, FAILURE_LOGGED, True)
             raise
 
@@ -429,10 +478,10 @@ async def observe_stream(
                 log_stream_failure(context, event)
             yield event
     except ProviderError as error:
-        log_provider_failure(context, error.status_code)
+        log_provider_failure(context, error)
         raise
     except Exception as error:
-        log_unexpected_failure(context, type(error).__name__)
+        log_unexpected_failure(context, error, stage=FailureStage.STREAM)
         raise
     finally:
         close = getattr(iterator, "aclose", None)

@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias
 
+from ..failures import FailureDiagnostic
 from ..reasoning import OutputConfig, ReasoningPolicy, ThinkingConfig
 
 
@@ -154,7 +155,7 @@ class StreamError:
     status_code: int | None = None
     retryable: bool = True
     provider: str | None = None
-    diagnostic: str | None = None
+    diagnostic: FailureDiagnostic | None = None
 
 
 StreamEvent: TypeAlias = (

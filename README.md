@@ -92,6 +92,35 @@ The session registry excludes prompts and messages, system instructions, tool de
 
 The control app listens only on a local Unix socket and its routes are not added to the public TCP API. In Docker, that socket remains inside the container by default; use `docker compose exec proxy claude-code-proxy ps` to query it. A host-side CLI cannot access it unless you deliberately change the deployment.
 
+## Logging and Failure Diagnostics
+
+Console records use `timestamp - LEVEL - message`. Request records add an opaque, process-local `[session …]` or `[request …]` correlation label and, when present, an `[agent …]` label plus `parent=…`; request method, endpoint, client and upstream model names, provider, and effort provide operational context. These identifiers support correlation without recording prompt history or raw client session IDs.
+
+The textual severity is always present. With color enabled, only the severity token is styled and reset before the message: DEBUG is dim, INFO is plain, WARNING is bold yellow, and ERROR/CRITICAL are bold red. Session and agent identity labels retain their separate palette; each styled token is reset within its entry so color does not bleed into following text or records. The presence of `NO_COLOR` (regardless of its value) disables both severity and identity ANSI styling without changing the semantic text fields.
+
+Provider failure records use safe structured fields:
+
+- `category`: `authentication`, `transport`, `upstream_http`, `provider_protocol`, `translation`, or `internal`.
+- `stage`: `credentials`, `request`, `response`, `stream`, `provider_translation`, `client_translation`, or `route`.
+- `code`: a stable, application-local diagnostic code.
+- `provider_code`: optional provider error identity from an allowlisted scalar field.
+- `status` and `retryable`: normalized HTTP/retry context when applicable.
+- Unhandled exceptions captured at route or stream boundaries may additionally include only the exception class and an application-relative `module:function:line` location.
+
+For example, a plain-text server record can look like:
+
+```text
+2026-09-19 12:00:00,000 - WARNING - [session 4f2c9a8d1e03] POST /v1/messages provider request failed category=upstream_http stage=response code=http_error provider_code=rate_limit_exceeded status=429 retryable=True model=client-model upstream=provider-model provider=codex effort=high
+```
+
+Diagnostic tokens are control-character encoded and bounded; `provider_code` is never a license to log an arbitrary provider body. For Codex non-200 responses, enrichment requires Content-Encoding to be absent or `identity`, an ASCII-decimal Content-Length no greater than 4096 that exactly matches the raw bytes, UTF-8 JSON, a top-level object containing a nested `error` object, and a string, boolean, integer, or finite numeric `error.code`; `error.type` is the fallback and accepts the same scalar types. Otherwise `provider_code` is omitted and the body is never emitted.
+
+Application-managed request and provider diagnostic records exclude prompts/messages/system instructions; tool definitions, inputs, and results; request/response bodies; headers; access and refresh tokens; API keys; credentials; connection strings; encrypted reasoning; raw provider payloads; and exception messages, exception locals, and full exception traceback paths. Provider failures returned through the proxy's HTTP and SSE adapters use generic client messages; the structured diagnostic fields above are emitted only in server logs. Framework and dependency logs are outside this contract.
+
+Route middleware and provider/stream adapters coordinate exactly-once failure records at shared boundaries where the same failure propagates, but this boundary-level behavior is not a promise of global deduplication across processes, retries, or independently observed failures.
+
+This contract supports [OWASP ASVS 5.0.0](https://github.com/OWASP/ASVS/tree/v5.0.0) V16.1.1, V16.2.1, V16.2.5, V16.4.1, and V16.5.1, together with the OWASP [Logging Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html) and [Error Handling Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Error_Handling_Cheat_Sheet.html). This mapping is implementation guidance, not compliance certification; operators remain responsible for deployment-level log storage, access, transport, retention, monitoring, and review.
+
 ## Environment Variables
 
 Model selection belongs in `model_mapping.json`. Environment variables configure credentials, provider authentication, transport, and file locations.
