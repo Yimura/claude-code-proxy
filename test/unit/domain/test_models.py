@@ -54,6 +54,26 @@ def test_token_usage_defaults_cache_counts_to_zero():
     assert usage.cache_read_input_tokens == 0
 
 
+def test_token_usage_infers_directly_constructed_fields_as_observed() -> None:
+    usage = TokenUsage(4, 2, 1, 3, thinking_tokens=0)
+
+    assert usage.observed_fields == frozenset({
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "thinking_tokens",
+    })
+    assert "observed_fields" not in repr(usage)
+
+
+def test_token_usage_availability_does_not_change_protocol_equality() -> None:
+    observed = TokenUsage(0, 0)
+    unavailable = TokenUsage(0, 0, observed_fields=frozenset())
+
+    assert observed == unavailable
+
+
 def test_redacted_thinking_block_is_immutable():
     block = RedactedThinkingBlock("codex-reasoning-v1:data")
     assert block.data == "codex-reasoning-v1:data"

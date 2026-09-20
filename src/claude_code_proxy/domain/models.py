@@ -39,6 +39,13 @@ ContentBlock: TypeAlias = (
     TextBlock | ImageBlock | RedactedThinkingBlock | ToolUseBlock | ToolResultBlock
 )
 ResponseBlock: TypeAlias = TextBlock | RedactedThinkingBlock | ToolUseBlock
+UsageField: TypeAlias = Literal[
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "thinking_tokens",
+]
 
 
 @dataclass(frozen=True)
@@ -98,6 +105,23 @@ class TokenUsage:
     cache_creation_input_tokens: int = 0
     cache_read_input_tokens: int = 0
     thinking_tokens: int | None = None
+    observed_fields: frozenset[UsageField] | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        if self.observed_fields is not None:
+            return
+
+        observed_fields: set[UsageField] = {
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        }
+        if self.thinking_tokens is not None:
+            observed_fields.add("thinking_tokens")
+        object.__setattr__(self, "observed_fields", frozenset(observed_fields))
 
 
 @dataclass(frozen=True)

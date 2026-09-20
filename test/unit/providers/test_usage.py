@@ -111,3 +111,24 @@ def test_invalid_counts_are_ignored(invalid):
 
 def test_missing_usage_returns_zero_totals():
     assert normalize_usage(None) == TokenUsage(0, 0)
+
+
+def test_normalize_usage_marks_only_raw_fields_as_observed() -> None:
+    usage = normalize_usage({
+        "input_tokens": 10,
+        "output_tokens": 0,
+        "input_tokens_details": {"cached_tokens": 4},
+    })
+
+    assert usage.observed_fields == frozenset({
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+    })
+
+
+def test_normalize_usage_keeps_missing_usage_unavailable() -> None:
+    usage = normalize_usage(None)
+
+    assert usage == TokenUsage(0, 0)
+    assert usage.observed_fields == frozenset()

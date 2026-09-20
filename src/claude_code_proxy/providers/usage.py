@@ -3,7 +3,7 @@
 from collections.abc import Mapping
 from typing import Any
 
-from ..domain.models import TokenUsage
+from ..domain.models import TokenUsage, UsageField
 
 _MISSING = object()
 
@@ -23,12 +23,14 @@ def _count(value: Any) -> int | None:
     return value
 
 
-def _first_count(source: object, names: tuple[str, ...]) -> int | None:
+def _first_observed_count(
+    source: object, names: tuple[str, ...]
+) -> tuple[int | None, bool]:
     for name in names:
         count = _count(_value(source, name))
         if count is not None:
-            return count
-    return None
+            return count, True
+    return None, False
 
 
 def _first_value(source: object, names: tuple[str, ...]) -> object | None:
@@ -40,10 +42,20 @@ def _first_value(source: object, names: tuple[str, ...]) -> object | None:
 
 
 def normalize_usage(usage: object) -> TokenUsage:
-    inclusive_input = _first_count(usage, ("input_tokens", "prompt_tokens")) or 0
-    inclusive_output = _first_count(
+    observed_fields: set[UsageField] = set()
+
+    inclusive_input, input_observed = _first_observed_count(
+        usage, ("input_tokens", "prompt_tokens")
+    )
+    if input_observed:
+        observed_fields.add("input_tokens")
+
+    inclusive_output, output_observed = _first_observed_count(
         usage, ("output_tokens", "completion_tokens")
-    ) or 0
+    )
+    if output_observed:
+        observed_fields.add("output_tokens")
+
     input_details = _first_value(
         usage, ("input_tokens_details", "prompt_tokens_details")
     )
@@ -51,16 +63,25 @@ def normalize_usage(usage: object) -> TokenUsage:
         usage, ("output_tokens_details", "completion_tokens_details")
     )
 
-    cache_read = _first_count(usage, ("cache_read_input_tokens",))
-    if cache_read is None:
-        cache_read = _first_count(input_details, ("cached_tokens",))
-    if cache_read is None:
-        private_read = _first_count(usage, ("_cache_read_input_tokens",))
-        cache_read = private_read if private_read and private_read > 0 else 0
+    cache_read, cache_read_observed = _first_observed_count(
+        usage, ("cache_read_input_tokens",)
+    )
+    if not cache_read_observed:
+        cache_read, cache_read_observed = _first_observed_count(
+            input_details, ("cached_tokens",)
+        )
+    if not cache_read_observed:
+        cache_read, cache_read_observed = _first_observed_count(
+            usage, ("_cache_read_input_tokens",)
+        )
+    if cache_read_observed:
+        observed_fields.add("cache_read_input_tokens")
 
-    cache_creation = _first_count(usage, ("cache_creation_input_tokens",))
-    if cache_creation is None:
-        cache_creation = _first_count(
+    cache_creation, cache_creation_observed = _first_observed_count(
+        usage, ("cache_creation_input_tokens",)
+    )
+    if not cache_creation_observed:
+        cache_creation, cache_creation_observed = _first_observed_count(
             input_details,
             (
                 "cache_write_tokens",
@@ -68,17 +89,27 @@ def normalize_usage(usage: object) -> TokenUsage:
                 "cache_creation_input_tokens",
             ),
         )
-    if cache_creation is None:
-        private_creation = _first_count(
+    if not cache_creation_observed:
+        cache_creation, cache_creation_observed = _first_observed_count(
             usage, ("_cache_creation_input_tokens",)
         )
-        cache_creation = (
-            private_creation if private_creation and private_creation > 0 else 0
-        )
+    if cache_creation_observed:
+        observed_fields.add("cache_creation_input_tokens")
 
-    thinking_tokens = _first_count(output_details, ("reasoning_tokens",))
-    if thinking_tokens is None:
-        thinking_tokens = _first_count(usage, ("reasoning_tokens",))
+    thinking_tokens, thinking_observed = _first_observed_count(
+        output_details, ("reasoning_tokens",)
+    )
+    if not thinking_observed:
+        thinking_tokens, thinking_observed = _first_observed_count(
+            usage, ("reasoning_tokens",)
+        )
+    if thinking_observed:
+        observed_fields.add("thinking_tokens")
+
+    inclusive_input = inclusive_input or 0
+    inclusive_output = inclusive_output or 0
+    cache_read = cache_read or 0
+    cache_creation = cache_creation or 0
 
     cache_read = min(cache_read, inclusive_input)
     remaining = inclusive_input - cache_read
@@ -93,4 +124,5 @@ def normalize_usage(usage: object) -> TokenUsage:
         cache_creation_input_tokens=cache_creation,
         cache_read_input_tokens=cache_read,
         thinking_tokens=thinking_tokens,
+        observed_fields=frozenset(observed_fields),
     )
