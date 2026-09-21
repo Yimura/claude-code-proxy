@@ -169,14 +169,15 @@ class CodexProvider:
         request: CompletionRequest,
         telemetry: ProviderTelemetry | None = None,
     ):
-        try:
-            request = reconcile_codex_request(request)
+        if telemetry is not None:
             notify_telemetry(telemetry, "mark_retries_supported")
             notify_telemetry(
                 telemetry,
                 "set_reasoning_continuation",
                 reasoning_continuation_state(request),
             )
+        try:
+            request = reconcile_codex_request(request)
             identity = CodexIdentity.from_client(request.client_identity)
             return request, identity, build_request(request, identity)
         except Exception as error:
@@ -206,6 +207,8 @@ class CodexProvider:
                     json=payload,
                 )
                 async with response_context as response:
+                    if attempt > 0:
+                        notify_telemetry(telemetry, "record_retry")
                     try:
                         if response.status_code == 401 and attempt == 0:
                             retry_rejected = True
@@ -266,7 +269,6 @@ class CodexProvider:
                         error, provider=self.name
                     )
                     return
-                notify_telemetry(telemetry, "record_retry")
 
     async def _consume_response(self, response):
         translator = CodexEventTranslator()

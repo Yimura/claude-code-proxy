@@ -422,7 +422,6 @@ class LiteLLMProvider:
         request: CompletionRequest,
         telemetry: ProviderTelemetry | None = None,
     ) -> int:
-        _report_reasoning_continuation(request, telemetry)
         try:
             payload = self.build_request(request, stream=False)
         except Exception as error:

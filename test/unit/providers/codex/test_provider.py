@@ -19,6 +19,7 @@ from claude_code_proxy.domain.models import (
     TextDelta,
     TokenUsage,
     ToolResultBlock,
+    ToolUseBlock,
     ToolDefinition,
 )
 from claude_code_proxy.failures import (
@@ -175,6 +176,18 @@ class EnterFailureContext:
     async def __aenter__(self):
         self.entered = True
         raise self.error
+
+    async def __aexit__(self, *args):
+        pass
+
+
+class BlockingEnterContext:
+    def __init__(self):
+        self.waiting = asyncio.Event()
+
+    async def __aenter__(self):
+        self.waiting.set()
+        await asyncio.Event().wait()
 
     async def __aexit__(self, *args):
         pass
@@ -735,6 +748,55 @@ async def test_headerless_requests_receive_distinct_fallback_sessions():
     assert first["json"]["prompt_cache_key"] != second["json"]["prompt_cache_key"]
 
 
+async def test_stream_without_telemetry_does_not_classify_reasoning(
+    monkeypatch,
+):
+    def fail_classifier(*args, **kwargs):
+        raise RuntimeError("telemetry-only failure")
+
+    monkeypatch.setattr(
+        "claude_code_proxy.providers.codex.provider.reasoning_continuation_state",
+        fail_classifier,
+    )
+    Client.responses = [completed_response()]
+
+    events = await collect(CodexProvider(Auth(), Client))
+
+    assert events == [
+        StreamStart(),
+        StreamComplete("end_turn", TokenUsage(0, 0)),
+    ]
+
+
+async def test_stream_reports_original_request_before_reconciliation(
+    monkeypatch,
+):
+    telemetry = RecordingTelemetry()
+
+    def disable_reasoning(completion_request):
+        return replace(
+            completion_request,
+            reasoning=ReasoningPolicy(False, None),
+        )
+
+    monkeypatch.setattr(
+        "claude_code_proxy.providers.codex.provider.reconcile_codex_request",
+        disable_reasoning,
+    )
+    Client.responses = [completed_response()]
+
+    await collect(
+        CodexProvider(Auth(), Client),
+        request(reasoning=ReasoningPolicy(True, "high")),
+        telemetry=telemetry,
+    )
+
+    assert telemetry.calls == [
+        ("mark_retries_supported",),
+        ("set_reasoning_continuation", "expected"),
+    ]
+
+
 async def test_stream_reports_capability_then_reasoning_once():
     telemetry = RecordingTelemetry()
     Client.responses = [completed_response()]
@@ -772,7 +834,13 @@ async def test_stream_reports_restored_reasoning_without_carrier_content():
     completion_request = request(
         reasoning=ReasoningPolicy(True, "high"),
         messages=(
-            Message("assistant", (RedactedThinkingBlock(carrier),)),
+            Message(
+                "assistant",
+                (
+                    RedactedThinkingBlock(carrier),
+                    ToolUseBlock("call-1", "lookup", {}),
+                ),
+            ),
             Message("user", (ToolResultBlock("call-1", "done"),)),
         ),
     )
@@ -827,6 +895,12 @@ async def test_401_recovers_credentials_after_closing_response_and_retries_once(
         assert rejected.exited is True
         order.append("credentials_recovered")
 
+    class EnteredResponse(Response):
+        async def __aenter__(self):
+            response = await super().__aenter__()
+            order.append("response_entered")
+            return response
+
     class OrderedClient(Client):
         def stream(self, method, url, **kwargs):
             order.append("request_started")
@@ -841,7 +915,10 @@ async def test_401_recovers_credentials_after_closing_response_and_retries_once(
         recovered=("new-access", "account"),
         on_recover=recovered_after_close,
     )
-    OrderedClient.responses = [rejected, completed_response()]
+    OrderedClient.responses = [
+        rejected,
+        EnteredResponse(lines=completed_response().lines),
+    ]
 
     telemetry = OrderedTelemetry()
     events = await collect(
@@ -856,8 +933,9 @@ async def test_401_recovers_credentials_after_closing_response_and_retries_once(
     assert order == [
         "request_started",
         "credentials_recovered",
-        "retry_recorded",
         "request_started",
+        "response_entered",
+        "retry_recorded",
     ]
     assert events == [
         StreamStart(),
@@ -873,6 +951,23 @@ async def test_401_recovers_credentials_after_closing_response_and_retries_once(
         OrderedClient.requests[1][2]["headers"]["Authorization"]
         == "Bearer new-access"
     )
+
+
+async def test_cancel_before_second_response_entry_does_not_record_retry():
+    blocked = BlockingEnterContext()
+    Client.responses = [Response(status=401), blocked]
+    telemetry = RecordingTelemetry()
+    stream = CodexProvider(Auth(), Client).stream(
+        request(), telemetry=telemetry
+    )
+    pending = asyncio.create_task(anext(stream))
+    await blocked.waiting.wait()
+
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    assert ("record_retry",) not in telemetry.calls
 
 
 async def test_second_401_returns_authentication_error_without_stream_start():
@@ -1210,8 +1305,15 @@ async def test_initial_credential_failure_returns_safe_structured_error():
         )
     )
 
-    events = await collect(CodexProvider(auth, Client))
+    telemetry = RecordingTelemetry()
+    events = await collect(
+        CodexProvider(auth, Client), telemetry=telemetry
+    )
 
+    assert telemetry.calls == [
+        ("mark_retries_supported",),
+        ("set_reasoning_continuation", "not_applicable"),
+    ]
     assert Client.requests == []
     assert events == [
         StreamError(
@@ -1311,15 +1413,21 @@ async def test_transport_failures_are_safe_and_structured(
     assert "secret" not in repr(events)
 
 
-async def test_payload_build_failure_still_reports_adapter_facts(monkeypatch):
+@pytest.mark.parametrize(
+    "target",
+    ["reconcile_codex_request", "build_request"],
+)
+async def test_preparation_failure_still_reports_adapter_facts(
+    monkeypatch, target
+):
     telemetry = RecordingTelemetry()
 
-    def fail_build(*args, **kwargs):
+    def fail_preparation(*args, **kwargs):
         raise RuntimeError("sensitive carrier must not leak")
 
     monkeypatch.setattr(
-        "claude_code_proxy.providers.codex.provider.build_request",
-        fail_build,
+        f"claude_code_proxy.providers.codex.provider.{target}",
+        fail_preparation,
     )
 
     events = await collect(

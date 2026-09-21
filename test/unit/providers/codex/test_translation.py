@@ -73,8 +73,8 @@ def test_reasoning_continuation_is_restored_across_messages_and_blocks():
             Message(
                 "assistant",
                 (
-                    ToolUseBlock("call-1", "lookup", {}),
                     RedactedThinkingBlock(carrier),
+                    ToolUseBlock("call-1", "lookup", {}),
                 ),
             ),
             Message(
@@ -92,6 +92,97 @@ def test_reasoning_continuation_is_restored_across_messages_and_blocks():
     assert result == "restored"
     assert "sensitive-restored-state" not in repr(result)
     assert carrier not in repr(result)
+
+
+def test_reasoning_continuation_does_not_reuse_stale_carrier():
+    carrier = encode_reasoning("state-for-call-a", [])
+    prepared = request(
+        messages=(
+            Message(
+                "assistant",
+                (
+                    RedactedThinkingBlock(carrier),
+                    ToolUseBlock("call-a", "first", {}),
+                ),
+            ),
+            Message("user", (ToolResultBlock("call-a", "done"),)),
+            Message(
+                "assistant",
+                (ToolUseBlock("call-b", "second", {}),),
+            ),
+            Message("user", (ToolResultBlock("call-b", "done"),)),
+        )
+    )
+
+    assert reasoning_continuation_state(prepared) == "missing"
+
+
+def test_reasoning_continuation_requires_all_parallel_calls_restored():
+    carrier = encode_reasoning("state-for-second-call", [])
+    prepared = request(
+        messages=(
+            Message(
+                "assistant",
+                (
+                    ToolUseBlock("call-a", "first", {}),
+                    RedactedThinkingBlock(carrier),
+                    ToolUseBlock("call-b", "second", {}),
+                ),
+            ),
+            Message(
+                "user",
+                (
+                    ToolResultBlock("call-a", "first done"),
+                    ToolResultBlock("call-b", "second done"),
+                ),
+            ),
+        )
+    )
+
+    assert reasoning_continuation_state(prepared) == "missing"
+
+
+def test_reasoning_continuation_does_not_apply_carrier_after_call():
+    carrier = encode_reasoning("late-state", [])
+    prepared = request(
+        messages=(
+            Message(
+                "assistant",
+                (
+                    ToolUseBlock("call-a", "lookup", {}),
+                    RedactedThinkingBlock(carrier),
+                ),
+            ),
+            Message("user", (ToolResultBlock("call-a", "done"),)),
+        )
+    )
+
+    assert reasoning_continuation_state(prepared) == "missing"
+
+
+def test_reasoning_continuation_restores_parallel_calls_after_one_carrier():
+    carrier = encode_reasoning("parallel-state", [])
+    prepared = request(
+        messages=(
+            Message(
+                "assistant",
+                (
+                    RedactedThinkingBlock(carrier),
+                    ToolUseBlock("call-a", "first", {}),
+                    ToolUseBlock("call-b", "second", {}),
+                ),
+            ),
+            Message(
+                "user",
+                (
+                    ToolResultBlock("call-a", "first done"),
+                    ToolResultBlock("call-b", "second done"),
+                ),
+            ),
+        )
+    )
+
+    assert reasoning_continuation_state(prepared) == "restored"
 
 
 def test_reasoning_continuation_is_missing_without_valid_carrier():

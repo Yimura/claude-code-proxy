@@ -13,7 +13,7 @@ from claude_code_proxy.api.schemas import MessagesRequest
 from claude_code_proxy.api.translation import normalize_request, serialize_stream
 from claude_code_proxy.config import Settings
 from claude_code_proxy.domain.models import (
-    ClientIdentity, CompletionRequest,
+    ClientIdentity, CompletionRequest, CompletionResponse,
     ImageBlock,
     Message,
     StreamComplete,
@@ -225,19 +225,23 @@ async def invoke_provider_operation(
     provider, operation, completion_request, telemetry
 ):
     if operation == "complete":
-        await provider.complete(completion_request, telemetry=telemetry)
-        return
-    if operation == "stream":
-        async for _ in provider.stream(
+        return await provider.complete(
             completion_request, telemetry=telemetry
-        ):
-            pass
-        return
-    await provider.count_tokens(completion_request, telemetry=telemetry)
+        )
+    if operation == "stream":
+        return [
+            event
+            async for event in provider.stream(
+                completion_request, telemetry=telemetry
+            )
+        ]
+    return await provider.count_tokens(
+        completion_request, telemetry=telemetry
+    )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ["complete", "stream", "count_tokens"])
+@pytest.mark.parametrize("operation", ["complete", "stream"])
 @pytest.mark.parametrize(
     ("enabled", "expected"),
     [(True, "unavailable"), (False, "not_applicable"), (None, "not_applicable")],
@@ -269,7 +273,7 @@ async def test_operations_report_reasoning_state_once(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ["complete", "stream", "count_tokens"])
+@pytest.mark.parametrize("operation", ["complete", "stream"])
 async def test_operations_report_reasoning_before_translation_failure(
     settings, monkeypatch, operation
 ):
@@ -314,15 +318,46 @@ async def test_telemetry_callback_failure_does_not_change_provider_behavior(
     with caplog.at_level(
         logging.WARNING, logger="claude_code_proxy.performance"
     ):
-        await invoke_provider_operation(
+        result = await invoke_provider_operation(
             LiteLLMProvider(settings, client),
             operation,
             request(),
             FailingTelemetry(),
         )
 
-    assert caplog.records[-1].getMessage() == "telemetry callback failed"
+    if operation == "complete":
+        assert result == CompletionResponse(
+            "response-1",
+            "openai/gpt-5.6-sol",
+            (TextBlock("ok"),),
+            "end_turn",
+            TokenUsage.unavailable(),
+        )
+    elif operation == "stream":
+        assert result == [
+            StreamStart(),
+            StreamComplete("end_turn", TokenUsage.unavailable()),
+        ]
+    else:
+        assert result == 9
+
+    if operation == "count_tokens":
+        assert caplog.records == []
+    else:
+        assert caplog.records[-1].getMessage() == "telemetry callback failed"
     assert "sensitive callback failure" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_does_not_report_reasoning_continuation(settings):
+    telemetry = RecordingTelemetry()
+
+    result = await LiteLLMProvider(
+        settings, FakeClient(token_count=17)
+    ).count_tokens(request(), telemetry=telemetry)
+
+    assert result == 17
+    assert telemetry.calls == []
 
 
 @pytest.mark.asyncio
