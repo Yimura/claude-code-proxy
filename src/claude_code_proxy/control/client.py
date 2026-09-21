@@ -124,6 +124,7 @@ class ControlClient:
             params=params,
             missing_endpoint="performance",
             invalid_json_message=message,
+            suppress_invalid_json_cause=True,
         )
         try:
             return PerformanceListResponse.model_validate(payload)
@@ -202,6 +203,7 @@ class ControlClient:
         params: list[tuple[str, str]] | None = None,
         missing_endpoint: str | None = None,
         invalid_json_message: str = "Control API returned invalid JSON",
+        suppress_invalid_json_cause: bool = False,
     ) -> dict[str, Any]:
         self._ensure_open()
         try:
@@ -218,7 +220,9 @@ class ControlClient:
         try:
             payload = response.json()
         except (ValueError, RecursionError) as error:
-            raise ControlError(invalid_json_message) from None
+            if suppress_invalid_json_cause:
+                raise ControlError(invalid_json_message) from None
+            raise ControlError(invalid_json_message) from error
         if not isinstance(payload, dict):
             raise ControlError(invalid_json_message)
         return payload

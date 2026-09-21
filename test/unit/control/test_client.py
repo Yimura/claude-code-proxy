@@ -942,3 +942,27 @@ def test_metric_aggregate_requires_observation_for_positive_value() -> None:
     zero["value"] = 1
     with pytest.raises(ValidationError):
         MetricAggregateResponse.model_validate(zero)
+
+
+@pytest.mark.parametrize("method_name", ["health", "sessions"])
+def test_legacy_invalid_json_preserves_parser_cause(method_name: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if method_name == "sessions" and request.url.path == "/v1/health":
+            return httpx.Response(200, json=health_payload(), request=request)
+        return httpx.Response(
+            200,
+            content=b'{"secret":',
+            headers={"content-type": "application/json"},
+            request=request,
+        )
+
+    with ControlClient(
+        SOCKET_PATH,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(ControlError) as raised:
+            getattr(client, method_name)()
+
+    assert str(raised.value) == "Control API returned invalid JSON"
+    assert "secret" not in str(raised.value)
+    assert isinstance(raised.value.__cause__, json.JSONDecodeError)
