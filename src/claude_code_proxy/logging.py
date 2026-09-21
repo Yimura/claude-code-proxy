@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import math
@@ -626,6 +627,10 @@ class RequestLoggingMiddleware:
                 request, error, send_started
             )
             _invoke_state_finalizer(request, "failed", diagnostic)
+            raise
+        except asyncio.CancelledError:
+            outcome = await cancelled_request_outcome(request)
+            _invoke_state_finalizer(request, outcome)
             raise
         except Exception as error:
             diagnostic = self._record_exception(

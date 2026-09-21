@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from collections.abc import Callable
 
 import pytest
@@ -67,9 +68,11 @@ class RecordingRegistry(SessionRegistry):
         self.finish_calls: list[tuple[RequestOutcome, object]] = []
 
     def finish_with_status(self, handle, result, failure=None):
-        self.lifecycle_events.append(f"finish:{result}")
-        self.finish_calls.append((result, failure))
-        return super().finish_with_status(handle, result, failure)
+        finalized = super().finish_with_status(handle, result, failure)
+        if finalized.finalized:
+            self.lifecycle_events.append(f"finish:{result}")
+            self.finish_calls.append((result, failure))
+        return finalized
 
 
 def application(provider: Provider, sessions: SessionRegistry) -> FastAPI:
@@ -266,3 +269,55 @@ async def test_cancelled_provider_uses_shielded_disconnect_detection(
 
     assert [result for result, _ in sessions.finish_calls] == [expected]
     assert sessions.snapshots()[0].active_requests == 0
+
+
+@pytest.mark.parametrize(
+    ("performance_enabled", "logging_enabled"),
+    [(False, False), (True, False), (True, True)],
+)
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
+@pytest.mark.parametrize("failed_message", ["http.response.start", "http.response.body"])
+@pytest.mark.parametrize(
+    ("disconnected", "expected"),
+    [(True, "client_disconnected"), (False, "cancelled")],
+)
+async def test_send_cancellation_finalizes_from_disconnect_state(
+    caplog,
+    performance_enabled: bool,
+    logging_enabled: bool,
+    path: str,
+    failed_message: str,
+    disconnected: bool,
+    expected: RequestOutcome,
+) -> None:
+    events: list[str] = []
+    sessions = RecordingRegistry(
+        events,
+        performance_enabled=performance_enabled,
+        performance_logging_enabled=logging_enabled,
+    )
+    cancellation = asyncio.CancelledError()
+
+    async def send(message):
+        if message["type"] == failed_message:
+            raise cancellation
+
+    with caplog.at_level(logging.ERROR, logger="claude_code_proxy.logging"):
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await call_app(
+                application(Provider(), sessions),
+                path,
+                send,
+                disconnected=disconnected,
+            )
+
+    assert raised.value is cancellation
+    assert [result for result, _ in sessions.finish_calls] == [expected]
+    snapshot = sessions.snapshots()[0]
+    assert snapshot.active_requests == 0
+    assert snapshot.last_result == "failed"
+    if performance_enabled:
+        performance = sessions.performance_snapshots().sessions[0].performance
+        assert performance.current_concurrency == 0
+        assert performance.recent_requests[0].outcome == expected
+    assert "unexpected request failure" not in caplog.text
