@@ -14,7 +14,15 @@ import time
 from typing import cast
 
 import httpx
+from pydantic import TypeAdapter
 import pytest
+
+from claude_code_proxy.control.schemas import (
+    PerformanceEventResponse,
+    PerformanceListResponse,
+    PerformanceResetResponse,
+    PerformanceStreamEvent,
+)
 
 _STARTUP_TIMEOUT_SECONDS = 15.0
 _STARTUP_STABILITY_SECONDS = 0.5
@@ -625,6 +633,61 @@ def test_foreground_proxy_serves_isolated_public_and_control_planes(
         _assert_http_contract(running)
         _assert_ps_is_empty(tmp_path, executable, running)
         assert not fake_marker.exists(), "ambient PATH executable was invoked"
+        _assert_clean_shutdown(running)
+
+
+def test_performance_snapshot_and_events_stream_over_control_uds(
+    tmp_path: Path,
+) -> None:
+    mapping_path = tmp_path / "models.json"
+    _write_mapping(mapping_path)
+    (tmp_path / "home").mkdir()
+    executable = _cli_executable()
+    headers = {"x-claude-code-session-id": "stream-integration-session"}
+    body = {
+        "model": "claude-haiku",
+        "messages": [{"role": "user", "content": "count me"}],
+    }
+
+    with _proxy_process(tmp_path, mapping_path, executable) as running:
+        snapshot_response = _control_get(running.socket_path, "/v1/performance")
+        assert snapshot_response.status_code == 200
+        snapshot = PerformanceListResponse.model_validate(snapshot_response.json())
+
+        transport = httpx.HTTPTransport(uds=str(running.socket_path))
+        timeout = httpx.Timeout(2.0)
+        with httpx.Client(
+            transport=transport,
+            base_url="http://control",
+            timeout=timeout,
+            trust_env=False,
+        ) as control_client:
+            with control_client.stream("GET", "/v1/performance/events") as stream:
+                assert stream.status_code == 200
+                assert stream.headers["content-type"].startswith(
+                    "application/x-ndjson"
+                )
+                lines = stream.iter_lines()
+                reset = PerformanceResetResponse.model_validate_json(next(lines))
+                assert reset.sequence == snapshot.cursor
+
+                with httpx.Client(timeout=5.0, trust_env=False) as public_client:
+                    response = public_client.post(
+                        f"http://127.0.0.1:{running.port}/v1/messages/count_tokens",
+                        headers=headers,
+                        json=body,
+                    )
+                assert response.status_code == 200
+
+                streamed = TypeAdapter(PerformanceStreamEvent).validate_json(
+                    next(line for line in lines if line)
+                )
+                assert isinstance(streamed, PerformanceEventResponse)
+                assert streamed.sequence == reset.sequence + 1
+                assert streamed.process == reset.process
+
+        assert _control_get(running.socket_path, "/v1/health").status_code == 200
+        assert running.process.poll() is None
         _assert_clean_shutdown(running)
 
 
