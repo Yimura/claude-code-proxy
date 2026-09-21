@@ -6,6 +6,7 @@ import unicodedata
 
 TELEMETRY_MODEL_MAX_LENGTH = 256
 TELEMETRY_ATTRIBUTE_MAX_LENGTH = 64
+TELEMETRY_BLANK_TEXT = "<blank>"
 
 
 def scalar_text(value: str) -> str:
@@ -47,10 +48,9 @@ def retained_telemetry_text(value: str, *, max_length: int) -> str:
     """Return bounded printable telemetry text without splitting escapes."""
     if type(value) is not str:
         raise TypeError("telemetry text must be a string")
-    if not value.strip():
-        raise ValueError("telemetry text must be nonblank")
+    retained = TELEMETRY_BLANK_TEXT if not value.strip() else value
     return _bounded_log_value(
-        value,
+        retained,
         max_length=max_length,
         encode_atom=escaped_text_atom,
         exact_suffix=True,

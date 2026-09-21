@@ -114,12 +114,20 @@ def test_retained_text_encodes_atoms_and_truncates_without_splitting() -> None:
     assert not result.endswith(("\\", "\\x", "\\u", "\\U"))
 
 
-@pytest.mark.parametrize("value", [b"bytes", "", " \t\n"])
-def test_retained_text_requires_nonblank_str(value: object) -> None:
-    with pytest.raises((TypeError, ValueError)):
-        normalizer = getattr(text_safety, "retained_telemetry_text", None)
-        assert callable(normalizer)
-        normalizer(value, max_length=64)
+@pytest.mark.parametrize("value", ["", " \t\n"])
+def test_retained_text_uses_printable_sentinel_for_blank_strings(
+    value: str,
+) -> None:
+    normalizer = getattr(text_safety, "retained_telemetry_text", None)
+    assert callable(normalizer)
+    assert normalizer(value, max_length=64) == "<blank>"
+
+
+def test_retained_text_rejects_non_string_values() -> None:
+    normalizer = getattr(text_safety, "retained_telemetry_text", None)
+    assert callable(normalizer)
+    with pytest.raises(TypeError):
+        normalizer(b"bytes", max_length=64)
 
 
 async def test_large_metadata_is_bounded_in_every_retained_event() -> None:
@@ -231,3 +239,46 @@ async def test_public_control_and_watch_escape_model_without_routing_change() ->
     assert all(event.activity.client_model == expected for event in watched)
     assert all(event.activity.model == expected for event in watched)
     assert all(event.activity.client_model.isprintable() for event in watched)
+
+
+@pytest.mark.parametrize("performance_enabled", [False, True])
+@pytest.mark.parametrize("raw_model", ["", "   "])
+def test_blank_public_model_routes_with_safe_retained_sentinel(
+    performance_enabled: bool,
+    raw_model: str,
+) -> None:
+    provider = RecordingProvider()
+    sessions = SessionRegistry(
+        10,
+        secret=b"x" * 32,
+        performance_enabled=performance_enabled,
+        performance_logging_enabled=False,
+    )
+    public = TestClient(public_app(provider, sessions))
+
+    response = public.post(
+        "/v1/messages",
+        json={
+            "model": raw_model,
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    control = TestClient(
+        create_control_app(sessions, started_at=datetime.now(UTC))
+    )
+    inventory = control.get("/v1/sessions")
+
+    assert response.status_code == 200
+    assert provider.requests[0].original_model == raw_model
+    assert provider.requests[0].model == raw_model
+    assert sessions.snapshots()[0].client_model == "<blank>"
+    assert sessions.snapshots()[0].model == "<blank>"
+    assert inventory.status_code == 200
+    assert inventory.json()["sessions"][0]["client_model"] == "<blank>"
+    if performance_enabled:
+        performance = control.get("/v1/performance")
+        assert performance.status_code == 200
+        session = performance.json()["sessions"][0]["session"]
+        assert session["client_model"] == "<blank>"
+        assert session["model"] == "<blank>"
