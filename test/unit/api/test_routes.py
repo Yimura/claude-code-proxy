@@ -1,12 +1,14 @@
 import asyncio
-from datetime import UTC, datetime
 import json
 import logging
+from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
+from starlette.requests import ClientDisconnect
 
 import claude_code_proxy.api.routes as routes_module
 from claude_code_proxy import cli as cli_module
@@ -35,13 +37,14 @@ from claude_code_proxy.logging import (
     observe_stream,
     request_logging_middleware,
 )
+from claude_code_proxy.model_mapping import ModelResolver
 from claude_code_proxy.observability import (
     ObservationHandle,
     SessionMetadata,
     SessionRegistry,
     SessionResult,
 )
-from claude_code_proxy.model_mapping import ModelResolver
+from claude_code_proxy.performance import RequestOutcome
 from claude_code_proxy.providers.base import ProviderError
 from claude_code_proxy.reasoning import MappingEntry
 from claude_code_proxy.service import ProxyService
@@ -95,13 +98,18 @@ class Provider:
 class RecordingSessionRegistry(SessionRegistry):
     def __init__(self) -> None:
         super().__init__(100, secret=b"x" * 32)
-        self.finish_calls: list[tuple[ObservationHandle, SessionResult]] = []
+        self.finish_calls: list[tuple[ObservationHandle, RequestOutcome]] = []
+        self.finish_failures: list[FailureDiagnostic | None] = []
 
     def finish(
-        self, handle: ObservationHandle, result: SessionResult
-    ) -> None:
+        self,
+        handle: ObservationHandle,
+        result: RequestOutcome,
+        failure: FailureDiagnostic | None = None,
+    ):
         self.finish_calls.append((handle, result))
-        super().finish(handle, result)
+        self.finish_failures.append(failure)
+        return super().finish(handle, result, failure)
 
 
 def registry() -> RecordingSessionRegistry:
@@ -172,6 +180,13 @@ def test_hello_probe_returns_empty_success():
 
     assert response.status_code == 200
     assert response.content == b""
+
+
+def test_openapi_operation_ids_remain_compatible():
+    paths = client().get("/openapi.json").json()["paths"]
+
+    assert paths["/api/hello"]["head"]["operationId"] == "hello_api_hello_head"
+    assert paths["/"]["get"]["operationId"] == "root__get"
 
 
 def test_non_streaming_messages_return_anthropic_json():
@@ -570,6 +585,11 @@ def test_serializer_protocol_error_logs_once_and_finishes_failed(caplog):
     assert "category=translation" in caplog.text
     assert "stage=client_translation" in caplog.text
     assert "code=invalid_event_sequence" in caplog.text
+    performance = latest_performance(sessions)
+    assert performance.failure is not None
+    assert performance.failure.category == FailureCategory.TRANSLATION
+    assert performance.failure.stage == FailureStage.CLIENT_TRANSLATION
+    assert performance.failure.code == "invalid_event_sequence"
     snapshot = sessions.snapshots()[0]
     assert snapshot.active_requests == 0
     assert snapshot.last_result == "failed"
@@ -628,15 +648,21 @@ def test_premature_stream_eof_logs_once_and_finishes_failed(caplog):
     assert_finished_once(sessions, "failed")
 
 
-def test_successful_stream_has_no_completion_log(caplog):
+def test_successful_stream_has_performance_completion_log(caplog):
     with caplog.at_level(logging.INFO, logger="claude_code_proxy.logging"):
         response = client().post(
             "/v1/messages",
             json=messages_payload(stream=True, messages=[]),
         )
     assert response.status_code == 200
-    assert "completed" not in caplog.text
     assert "200 OK" not in caplog.text
+    performance = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("performance ")
+    ]
+    assert len(performance) == 1
+    assert "performance outcome=completed" in performance[0]
 
 
 def test_stream_iterator_exception_becomes_safe_terminal_error(caplog):
@@ -985,8 +1011,18 @@ def _session_exposure_surfaces(sessions, logs):
         control = control_client.get("/v1/sessions")
     assert control.status_code == 200
     parsed = SessionListResponse.model_validate(control.json())
+    async def journal_surface():
+        journal = sessions.events.subscribe(after=0)
+        try:
+            return repr(journal.replay)
+        finally:
+            journal.close()
+
+    journal_text = asyncio.run(journal_surface())
     return control, {
         "registry": repr(sessions.snapshots()[0]),
+        "performance": repr(sessions.performance_snapshots()),
+        "journal": journal_text,
         "control": control.text,
         "table": cli_module._render_sessions(
             parsed, cli_module.OutputFormat.TABLE, False
@@ -1051,6 +1087,10 @@ def test_sensitive_request_data_never_crosses_the_session_metadata_boundary(capl
     assert len(safe_id) == 64
     assert snapshot.id == safe_id
     assert safe_id in exposed_surfaces["registry"]
+    assert safe_id in exposed_surfaces["performance"]
+    assert safe_id in exposed_surfaces["journal"]
+    assert "input_tokens" in exposed_surfaces["performance"]
+    assert "input_tokens" in exposed_surfaces["journal"]
     assert safe_id in exposed_surfaces["control"]
     assert safe_id[:12] in exposed_surfaces["table"]
     assert safe_id in exposed_surfaces["full_table"]
@@ -1255,6 +1295,17 @@ def stream_context() -> RequestLogContext:
     )
 
 
+class DisconnectRequest:
+    def __init__(self, disconnected: bool) -> None:
+        self.disconnected = disconnected
+        self.state = SimpleNamespace()
+        self.checks = 0
+
+    async def is_disconnected(self) -> bool:
+        self.checks += 1
+        return self.disconnected
+
+
 def serialized_lifecycle_stream(
     events,
     sessions: RecordingSessionRegistry,
@@ -1276,7 +1327,11 @@ def serialized_lifecycle_stream(
         ),
     )
     return routes_module._record_stream_lifecycle(
-        serialized, sessions, observation
+        serialized,
+        DisconnectRequest(False),
+        context,
+        sessions,
+        observation,
     )
 
 
@@ -1295,7 +1350,7 @@ class ClosingEvents:
 
 
 @pytest.mark.asyncio
-async def test_stream_consumer_close_finishes_failed_exactly_once():
+async def test_stream_consumer_close_finishes_disconnected_exactly_once():
     sessions = registry()
     observation = sessions.begin(stream_metadata())
     events = ClosingEvents()
@@ -1310,7 +1365,9 @@ async def test_stream_consumer_close_finishes_failed_exactly_once():
     snapshot = sessions.snapshots()[0]
     assert snapshot.active_requests == 0
     assert snapshot.last_result == "failed"
-    assert sessions.finish_calls == [(observation, "failed")]
+    assert sessions.finish_calls == [(observation, "client_disconnected")]
+    performance = sessions.performance_snapshots().sessions[0].performance
+    assert performance.recent_requests[0].outcome == "client_disconnected"
 
 
 @pytest.mark.asyncio
@@ -1340,8 +1397,8 @@ async def test_overlapping_streams_remain_active_until_each_closes():
     assert snapshot.active_requests == 0
     assert snapshot.last_result == "failed"
     assert sessions.finish_calls == [
-        (first_observation, "failed"),
-        (second_observation, "failed"),
+        (first_observation, "client_disconnected"),
+        (second_observation, "client_disconnected"),
     ]
 
 
@@ -1360,7 +1417,7 @@ class CancellingEvents:
 
 
 @pytest.mark.asyncio
-async def test_stream_cancellation_finishes_failed_once_without_swallowing():
+async def test_stream_cancellation_finishes_cancelled_once_without_swallowing():
     sessions = registry()
     observation = sessions.begin(stream_metadata())
     events = CancellingEvents()
@@ -1375,7 +1432,9 @@ async def test_stream_cancellation_finishes_failed_once_without_swallowing():
     snapshot = sessions.snapshots()[0]
     assert snapshot.active_requests == 0
     assert snapshot.last_result == "failed"
-    assert sessions.finish_calls == [(observation, "failed")]
+    assert sessions.finish_calls == [(observation, "cancelled")]
+    performance = sessions.performance_snapshots().sessions[0].performance
+    assert performance.recent_requests[0].outcome == "cancelled"
 
 
 async def frame_source(*frames):
@@ -1388,7 +1447,11 @@ async def test_stream_completes_only_after_done_frame_yield_resumes():
     sessions = registry()
     observation = sessions.begin(stream_metadata())
     stream = routes_module._record_stream_lifecycle(
-        frame_source(routes_module.DONE_FRAME), sessions, observation
+        frame_source(routes_module.DONE_FRAME),
+        DisconnectRequest(False),
+        stream_context(),
+        sessions,
+        observation,
     )
 
     assert await anext(stream) == routes_module.DONE_FRAME
@@ -1402,3 +1465,329 @@ async def test_stream_completes_only_after_done_frame_yield_resumes():
     assert snapshot.active_requests == 0
     assert snapshot.last_result == "completed"
     assert sessions.finish_calls == [(observation, "completed")]
+
+
+def latest_performance(sessions: SessionRegistry):
+    return sessions.performance_snapshots().sessions[0].performance.recent_requests[0]
+
+
+def test_nonstream_success_records_messages_performance_once(caplog):
+    sessions = registry()
+
+    with caplog.at_level(logging.INFO, logger="claude_code_proxy.logging"):
+        response = client(sessions=sessions).post(
+            "/v1/messages",
+            headers={"x-claude-code-session-id": "message-performance"},
+            json=messages_payload(messages=[]),
+        )
+
+    assert response.status_code == 200
+    snapshot = latest_performance(sessions)
+    assert snapshot.operation == "messages"
+    assert snapshot.outcome == "completed"
+    assert snapshot.input_tokens.value == 2
+    assert snapshot.output_tokens.value == 1
+    assert caplog.text.count("performance ") == 1
+    assert "operation=messages" in caplog.text
+    assert "outcome=completed" in caplog.text
+
+
+def test_count_success_records_distinct_metrics_and_preserves_response(caplog):
+    sessions = registry()
+
+    with caplog.at_level(logging.INFO, logger="claude_code_proxy.logging"):
+        response = client(sessions=sessions).post(
+            "/v1/messages/count_tokens",
+            headers={"x-claude-code-session-id": "count-performance"},
+            json={"model": "claude-sonnet", "messages": []},
+        )
+
+    assert response.status_code == 200
+    assert response.content == b'{"input_tokens":7}'
+    snapshot = latest_performance(sessions)
+    assert snapshot.operation == "count_tokens"
+    assert snapshot.outcome == "completed"
+    assert snapshot.input_tokens.value == 7
+    assert snapshot.ttft.status == "not_applicable"
+    assert snapshot.output_tokens.status == "not_applicable"
+    assert snapshot.tool_calls.status == "not_applicable"
+    assert caplog.text.count("performance ") == 1
+    assert "operation=count_tokens" in caplog.text
+    assert "input_tokens=7" in caplog.text
+
+
+def test_route_samples_start_before_normalization(monkeypatch):
+    calls = []
+    original_normalize = routes_module.normalize_request
+
+    def wall_clock():
+        calls.append("wall")
+        return datetime(2026, 1, 1, tzinfo=UTC)
+
+    def monotonic_clock():
+        calls.append("monotonic")
+        return 1.0
+
+    def tracked_normalize(*args, **kwargs):
+        calls.append("normalize")
+        return original_normalize(*args, **kwargs)
+
+    monkeypatch.setattr(routes_module, "_utc_now", wall_clock)
+    monkeypatch.setattr(routes_module, "_monotonic_now", monotonic_clock)
+    monkeypatch.setattr(routes_module, "normalize_request", tracked_normalize)
+
+    response = client().post("/v1/messages", json=messages_payload(messages=[]))
+
+    assert response.status_code == 200
+    assert calls[:3] == ["wall", "monotonic", "normalize"]
+
+
+def test_provider_failure_preserves_status_and_records_safe_diagnostic_once(caplog):
+    diagnostic = FailureDiagnostic(
+        FailureCategory.UPSTREAM_HTTP,
+        FailureStage.RESPONSE,
+        "overloaded",
+        provider_code="SAFE_CODE",
+    )
+    provider = Provider(
+        ProviderError(
+            "SECRET_PROVIDER_BODY",
+            provider="fake",
+            status_code=503,
+            diagnostic=diagnostic,
+        )
+    )
+    sessions = registry()
+
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
+        response = client(provider, sessions=sessions, with_middleware=True).post(
+            "/v1/messages", json=messages_payload(messages=[])
+        )
+
+    assert response.status_code == 503
+    assert latest_performance(sessions).failure == diagnostic
+    assert sessions.finish_failures == [diagnostic]
+    assert caplog.text.count("provider request failed") == 1
+    assert caplog.text.count("performance ") == 1
+    assert "SECRET_PROVIDER_BODY" not in caplog.text
+
+
+class FailingFinalizationRegistry(RecordingSessionRegistry):
+    def finish(self, handle, result, failure=None):
+        raise RuntimeError("FINALIZATION_SECRET")
+
+
+def test_finalization_failure_does_not_change_successful_response(caplog):
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
+        response = client(sessions=FailingFinalizationRegistry()).post(
+            "/v1/messages", json=messages_payload(messages=[])
+        )
+
+    assert response.status_code == 200
+    assert response.json()["content"] == [{"type": "text", "text": "hello"}]
+    assert caplog.text.count("request finalization failed") == 1
+    assert "FINALIZATION_SECRET" not in caplog.text
+
+
+class FailingCountObserver:
+    def upstream_started(self):
+        return None
+
+    def upstream_finished(self):
+        return None
+
+    def count_tokens(self, _value):
+        raise RuntimeError("COUNT_CALLBACK_SECRET")
+
+
+class FailingCountTelemetryRegistry(RecordingSessionRegistry):
+    def observer(self, handle):
+        super().observer(handle)
+        return FailingCountObserver()
+
+
+def test_count_callback_failure_does_not_change_response(caplog):
+    sessions = FailingCountTelemetryRegistry()
+
+    with caplog.at_level(logging.WARNING):
+        response = client(sessions=sessions).post(
+            "/v1/messages/count_tokens",
+            json={"model": "claude-sonnet", "messages": []},
+        )
+
+    assert response.content == b'{"input_tokens":7}'
+    assert latest_performance(sessions).input_tokens.status == "unavailable"
+    assert "COUNT_CALLBACK_SECRET" not in caplog.text
+
+
+class LifecycleFrames:
+    def __init__(self, error: BaseException, *, close_error=None):
+        self.error = error
+        self.close_error = close_error
+        self.close_calls = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise self.error
+
+    async def aclose(self):
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+@pytest.mark.parametrize(
+    ("disconnected", "expected"),
+    [(False, "cancelled"), (True, "client_disconnected")],
+)
+@pytest.mark.asyncio
+async def test_stream_cancellation_classifies_disconnect_state(disconnected, expected):
+    sessions = registry()
+    observation = sessions.begin(stream_metadata())
+    frames = LifecycleFrames(asyncio.CancelledError())
+    request = DisconnectRequest(disconnected)
+    stream = routes_module._record_stream_lifecycle(
+        frames, request, stream_context(), sessions, observation
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await anext(stream)
+
+    assert request.checks == 1
+    assert frames.close_calls == 1
+    assert sessions.finish_calls == [(observation, expected)]
+    assert latest_performance(sessions).outcome == expected
+
+
+@pytest.mark.asyncio
+async def test_stream_client_disconnect_is_recorded_and_reraised():
+    sessions = registry()
+    observation = sessions.begin(stream_metadata())
+    frames = LifecycleFrames(ClientDisconnect())
+    stream = routes_module._record_stream_lifecycle(
+        frames, DisconnectRequest(False), stream_context(), sessions, observation
+    )
+
+    with pytest.raises(ClientDisconnect):
+        await anext(stream)
+
+    assert frames.close_calls == 1
+    assert sessions.finish_calls == [(observation, "client_disconnected")]
+
+
+@pytest.mark.asyncio
+async def test_original_cancellation_wins_iterator_close_failure():
+    sessions = registry()
+    observation = sessions.begin(stream_metadata())
+    frames = LifecycleFrames(
+        asyncio.CancelledError(), close_error=RuntimeError("close failed")
+    )
+    stream = routes_module._record_stream_lifecycle(
+        frames, DisconnectRequest(False), stream_context(), sessions, observation
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await anext(stream)
+
+    assert frames.close_calls == 1
+    assert sessions.finish_calls == [(observation, "cancelled")]
+
+
+def test_duplicate_finalization_emits_one_terminal_record(caplog):
+    sessions = registry()
+    observation = sessions.begin(stream_metadata())
+    context = stream_context()
+
+    with caplog.at_level(logging.INFO, logger="claude_code_proxy.logging"):
+        routes_module._finalize_request(
+            sessions, observation, context, "completed"
+        )
+        routes_module._finalize_request(
+            sessions, observation, context, "completed"
+        )
+
+    assert sessions.finish_calls == [
+        (observation, "completed"),
+        (observation, "completed"),
+    ]
+    assert caplog.text.count("performance ") == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_error_then_consumer_close_remains_failed():
+    diagnostic = FailureDiagnostic(
+        FailureCategory.UPSTREAM_HTTP,
+        FailureStage.STREAM,
+        "terminal_stream_error",
+    )
+    error = StreamError(
+        error_type="api_error",
+        message="Internal server error",
+        provider="fake",
+        diagnostic=diagnostic,
+    )
+    sessions = registry()
+    observation = sessions.begin(stream_metadata())
+    sessions.observer(observation).stream_event(error)
+    request = DisconnectRequest(False)
+    context = stream_context()
+    routes_module._record_stream_error(request, context, error)
+    stream = routes_module._record_stream_lifecycle(
+        frame_source("event: error\ndata: {}\n\n"),
+        request,
+        context,
+        sessions,
+        observation,
+    )
+
+    assert await anext(stream) == "event: error\ndata: {}\n\n"
+    await stream.aclose()
+
+    assert sessions.snapshots()[0].active_requests == 0
+    assert sessions.finish_calls == [(observation, "failed")]
+    performance = latest_performance(sessions)
+    assert performance.outcome == "failed"
+    assert performance.failure == diagnostic
+
+
+def test_provider_stream_error_survives_logging_sink_failure(
+    monkeypatch,
+):
+    diagnostic = FailureDiagnostic(
+        FailureCategory.UPSTREAM_HTTP,
+        FailureStage.STREAM,
+        "provider_stream_error",
+    )
+    provider = Provider(
+        stream_events=[
+            StreamError(
+                error_type="api_error",
+                message="Internal server error",
+                provider="fake",
+                diagnostic=diagnostic,
+            )
+        ]
+    )
+    sessions = registry()
+
+    def fail_log(*_args, **_kwargs):
+        raise OSError("LOG_SINK_SECRET")
+
+    monkeypatch.setattr(
+        "claude_code_proxy.logging.log_stream_failure", fail_log
+    )
+
+    response = client(provider, sessions=sessions).post(
+        "/v1/messages",
+        json=messages_payload(stream=True, messages=[]),
+    )
+
+    assert response.status_code == 200
+    assert 'event: error' in response.text
+    assert '"message": "Internal server error"' in response.text
+    assert "LOG_SINK_SECRET" not in response.text
+    performance = latest_performance(sessions)
+    assert performance.outcome == "failed"
+    assert performance.failure == diagnostic

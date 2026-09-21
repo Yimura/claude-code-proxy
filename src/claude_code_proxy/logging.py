@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass
 import hashlib
 import logging
+import math
 import os
+import uuid
+from collections.abc import AsyncIterator, Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
-import uuid
+
+from starlette.requests import ClientDisconnect
 
 from .console_logging import SeverityFormatter as _SeverityFormatter
 from .domain.models import ClientIdentity, StreamError, StreamEvent
@@ -21,6 +24,7 @@ from .failures import (
     unexpected_failure_diagnostic,
 )
 from .observability import SessionRegistry
+from .performance import Measurement, RequestPerformanceSnapshot
 from .providers.base import ProviderError
 from .reasoning import ReasoningPolicy
 from .text_safety import bounded_log_token, log_text
@@ -33,6 +37,7 @@ AGENT_HEADER = "x-claude-code-agent-id"
 PARENT_AGENT_HEADER = "x-claude-code-parent-agent-id"
 FAILURE_LOGGED = "failure_logged"
 REQUEST_LOG_CONTEXT = "request_log_context"
+REQUEST_FINALIZER = "request_finalizer"
 DIAGNOSTIC_FIELD_MAX_LENGTH = 128
 SESSION_COLORS = (
     "\033[96m",
@@ -193,6 +198,7 @@ def configure_logging() -> None:
     root.filters[:] = [
         item for item in root.filters if not isinstance(item, MessageFilter)
     ]
+    logger.setLevel(logging.INFO)
     session_logger.setLevel(logging.INFO)
     readiness_logger.setLevel(logging.INFO)
     for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
@@ -369,6 +375,80 @@ def log_unexpected_failure(
     )
 
 
+def _measurement_text(measurement: Measurement) -> str:
+    if measurement.status != "observed":
+        return _structured_log_token(measurement.status)
+    return _structured_log_token(measurement.value)
+
+
+def _milliseconds_text(measurement: Measurement) -> str:
+    if measurement.status != "observed":
+        return _structured_log_token(measurement.status)
+    try:
+        seconds = float(measurement.value)
+        milliseconds = seconds * 1000.0
+    except (OverflowError, TypeError, ValueError):
+        return "unavailable"
+    if not math.isfinite(milliseconds):
+        return "unavailable"
+    return _structured_log_token(format(milliseconds, ".12g"))
+
+
+def _identity_text(identity: AgentIdentity | None, field: str) -> str:
+    if identity is None:
+        return "not_applicable"
+    value = identity.label if field == "agent" else identity.parent_label
+    return "not_applicable" if value is None else _structured_log_token(value)
+
+
+def _performance_fields(
+    snapshot: RequestPerformanceSnapshot,
+    context: RequestLogContext,
+) -> tuple[str, ...]:
+    return (
+        f"outcome={_structured_log_token(snapshot.outcome)}",
+        f"operation={_structured_log_token(snapshot.operation)}",
+        f"session={_structured_log_token(context.session.label)}",
+        f"agent={_identity_text(context.agent, 'agent')}",
+        f"parent={_identity_text(context.agent, 'parent')}",
+        f"request={_structured_log_token(snapshot.id)}",
+        f"duration_ms={_milliseconds_text(snapshot.duration)}",
+        f"upstream_ms={_milliseconds_text(snapshot.upstream_duration)}",
+        f"ttft_ms={_milliseconds_text(snapshot.ttft)}",
+        f"input_tokens={_measurement_text(snapshot.input_tokens)}",
+        f"output_tokens={_measurement_text(snapshot.output_tokens)}",
+        f"cache_read_tokens={_measurement_text(snapshot.cache_read_tokens)}",
+        "cache_creation_tokens="
+        f"{_measurement_text(snapshot.cache_creation_tokens)}",
+        f"reasoning_tokens={_measurement_text(snapshot.reasoning_tokens)}",
+        f"tools={_measurement_text(snapshot.tool_calls)}",
+        f"retries={_measurement_text(snapshot.retries)}",
+        f"peak_concurrency={_measurement_text(snapshot.peak_concurrency)}",
+        "reasoning_continuation="
+        f"{_structured_log_token(snapshot.reasoning_continuation)}",
+        f"model={_structured_log_token(context.original_model)}",
+        f"upstream={_structured_log_token(context.upstream_model)}",
+        f"provider={_structured_log_token(context.provider)}",
+        f"effort={_structured_log_token(context.effort)}",
+    )
+
+
+def log_performance(
+    snapshot: RequestPerformanceSnapshot,
+    context: RequestLogContext,
+) -> None:
+    """Emit one bounded request-performance record without affecting callers."""
+    try:
+        level = logging.WARNING if snapshot.outcome == "failed" else logging.INFO
+        fields = " ".join(_performance_fields(snapshot, context))
+        logger.log(level, "performance %s", fields)
+    except BaseException:
+        try:
+            logger.warning("performance logging failed")
+        except BaseException:
+            pass
+
+
 def _fallback_context_identity(
     request, sessions: SessionRegistry
 ) -> tuple[SessionIdentity, AgentIdentity | None]:
@@ -447,10 +527,35 @@ def log_middleware_exception(
     )
 
 
+def log_telemetry_failure() -> None:
+    """Emit a fixed warning when request telemetry cannot be attached."""
+    try:
+        logger.warning("request telemetry setup failed")
+    except BaseException:
+        pass
+
+
+def log_finalization_failure() -> None:
+    """Emit a fixed internal warning without exposing failure details."""
+    try:
+        logger.warning("request finalization failed")
+    except BaseException:
+        pass
+
+
+def _finalize_client_disconnect(request) -> None:
+    finalizer = getattr(request.state, REQUEST_FINALIZER, None)
+    if callable(finalizer):
+        finalizer("client_disconnected")
+
+
 def request_logging_middleware(sessions: SessionRegistry):
     async def middleware(request, call_next):
         try:
             response = await call_next(request)
+        except ClientDisconnect:
+            _finalize_client_disconnect(request)
+            raise
         except Exception as error:
             if not getattr(request.state, FAILURE_LOGGED, False):
                 log_middleware_exception(request, sessions, error)
@@ -468,20 +573,41 @@ def request_logging_middleware(sessions: SessionRegistry):
     return middleware
 
 
+def _call_observer_safely(
+    callback: Callable[..., None],
+    *args: object,
+    **kwargs: object,
+) -> None:
+    try:
+        callback(*args, **kwargs)
+    except BaseException:
+        pass
+
+
 async def observe_stream(
-    events: AsyncIterator[StreamEvent], context: RequestLogContext
+    events: AsyncIterator[StreamEvent],
+    context: RequestLogContext,
+    *,
+    on_error: Callable[[StreamError], None] | None = None,
 ) -> AsyncIterator[StreamEvent]:
     iterator = aiter(events)
     try:
         async for event in iterator:
             if isinstance(event, StreamError):
-                log_stream_failure(context, event)
+                if on_error is not None:
+                    _call_observer_safely(on_error, event)
+                _call_observer_safely(log_stream_failure, context, event)
             yield event
     except ProviderError as error:
-        log_provider_failure(context, error)
+        _call_observer_safely(log_provider_failure, context, error)
         raise
     except Exception as error:
-        log_unexpected_failure(context, error, stage=FailureStage.STREAM)
+        _call_observer_safely(
+            log_unexpected_failure,
+            context,
+            error,
+            stage=FailureStage.STREAM,
+        )
         raise
     finally:
         close = getattr(iterator, "aclose", None)
