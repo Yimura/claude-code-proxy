@@ -933,9 +933,9 @@ async def test_401_recovers_credentials_after_closing_response_and_retries_once(
     assert order == [
         "request_started",
         "credentials_recovered",
+        "retry_recorded",
         "request_started",
         "response_entered",
-        "retry_recorded",
     ]
     assert events == [
         StreamStart(),
@@ -953,7 +953,7 @@ async def test_401_recovers_credentials_after_closing_response_and_retries_once(
     )
 
 
-async def test_cancel_before_second_response_entry_does_not_record_retry():
+async def test_cancel_during_second_response_entry_records_retry():
     blocked = BlockingEnterContext()
     Client.responses = [Response(status=401), blocked]
     telemetry = RecordingTelemetry()
@@ -967,7 +967,23 @@ async def test_cancel_before_second_response_entry_does_not_record_retry():
     with pytest.raises(asyncio.CancelledError):
         await pending
 
-    assert ("record_retry",) not in telemetry.calls
+    assert telemetry.calls.count(("record_retry",)) == 1
+
+
+async def test_second_response_entry_failure_records_retry():
+    error = httpx.ConnectError("SECOND_ATTEMPT_SECRET")
+    Client.responses = [Response(status=401), EnterFailureContext(error)]
+    telemetry = RecordingTelemetry()
+
+    events = await collect(
+        CodexProvider(Auth(), Client), telemetry=telemetry
+    )
+
+    assert telemetry.calls.count(("record_retry",)) == 1
+    assert len(events) == 1
+    assert isinstance(events[0], StreamError)
+    assert events[0].diagnostic is not None
+    assert events[0].diagnostic.stage == FailureStage.REQUEST
 
 
 async def test_second_401_returns_authentication_error_without_stream_start():

@@ -196,6 +196,8 @@ class CodexProvider:
         telemetry: ProviderTelemetry | None = None,
     ):
         for attempt in range(2):
+            if attempt > 0:
+                notify_telemetry(telemetry, "record_retry")
             retry_rejected = False
             external_signal = None
             headers = self._build_headers(access_token, account_id, identity)
@@ -207,8 +209,6 @@ class CodexProvider:
                     json=payload,
                 )
                 async with response_context as response:
-                    if attempt > 0:
-                        notify_telemetry(telemetry, "record_retry")
                     try:
                         if response.status_code == 401 and attempt == 0:
                             retry_rejected = True
