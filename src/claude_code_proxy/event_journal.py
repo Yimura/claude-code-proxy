@@ -12,6 +12,7 @@ from typing import Final, Literal, TypeAlias
 
 from .limits import MAX_CONTROL_INTEGER
 from .performance import RequestPerformanceSnapshot, SessionPerformanceSnapshot
+from .text_safety import escaped_text_atom
 
 EventType: TypeAlias = Literal[
     "request_started",
@@ -25,6 +26,14 @@ EventType: TypeAlias = Literal[
     "client_disconnected",
 ]
 
+_IDENTITY_TEXT_FIELDS = (
+    "id",
+    "client_model",
+    "model",
+    "provider",
+    "transport",
+    "effort",
+)
 _EVENT_TYPES = frozenset({
     "request_started",
     "first_output",
@@ -46,6 +55,87 @@ OVERFLOW: Final = _Overflow()
 
 
 @dataclass(frozen=True, slots=True)
+class SessionEventIdentity:
+    """Immutable public session metadata captured with one journal event."""
+
+    id: str
+    state: Literal["active", "idle", "failed"]
+    active_requests: int
+    requests: int
+    client_model: str
+    model: str
+    provider: str
+    transport: str
+    effort: str
+    context_window: int | None
+    first_seen: datetime
+    last_seen: datetime
+    elapsed_seconds: float
+    last_result: Literal["completed", "failed"] | None
+
+    @classmethod
+    def from_snapshot(cls, snapshot: object) -> "SessionEventIdentity":
+        values = {
+            name: getattr(snapshot, name) for name in cls.__dataclass_fields__
+        }
+        for name in _IDENTITY_TEXT_FIELDS:
+            value = values[name]
+            if isinstance(value, str):
+                values[name] = "".join(escaped_text_atom(item) for item in value)
+        return cls(**values)
+
+    def __post_init__(self) -> None:
+        _validate_identity_strings(self)
+        _validate_identity_counts(self)
+        _validate_identity_timing(self)
+        _validate_identity_lifecycle(self)
+
+
+def _validate_identity_strings(identity: SessionEventIdentity) -> None:
+    for name in _IDENTITY_TEXT_FIELDS:
+        _require_safe_identifier(name, getattr(identity, name))
+
+
+def _validate_identity_counts(identity: SessionEventIdentity) -> None:
+    _require_control_integer("active_requests", identity.active_requests, minimum=0)
+    _require_control_integer("requests", identity.requests, minimum=0)
+    if identity.active_requests > identity.requests:
+        raise ValueError("active requests must not exceed requests")
+    if identity.context_window is not None:
+        _require_control_integer(
+            "context_window", identity.context_window, minimum=1
+        )
+
+
+def _validate_identity_timing(identity: SessionEventIdentity) -> None:
+    _require_utc_datetime("first_seen", identity.first_seen)
+    _require_utc_datetime("last_seen", identity.last_seen)
+    if identity.first_seen > identity.last_seen:
+        raise ValueError("first_seen must not exceed last_seen")
+    duration = identity.elapsed_seconds
+    if (
+        isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or duration < 0
+        or not math.isfinite(duration)
+        or isinstance(duration, int) and duration > MAX_CONTROL_INTEGER
+    ):
+        raise ValueError("elapsed_seconds must be finite and non-negative")
+
+
+def _validate_identity_lifecycle(identity: SessionEventIdentity) -> None:
+    if identity.last_result not in (None, "completed", "failed"):
+        raise ValueError("invalid last_result")
+    expected_state = "idle"
+    if identity.active_requests:
+        expected_state = "active"
+    elif identity.last_result == "failed":
+        expected_state = "failed"
+    if identity.state != expected_state:
+        raise ValueError("state must match activity and last result")
+
+
+@dataclass(frozen=True, slots=True)
 class JournalEvent:
     """An immutable telemetry event before or after journal sequencing."""
 
@@ -54,6 +144,7 @@ class JournalEvent:
     type: EventType
     session_id: str
     request_id: str
+    activity: SessionEventIdentity
     request: RequestPerformanceSnapshot
     session: SessionPerformanceSnapshot
 
@@ -64,6 +155,10 @@ class JournalEvent:
             raise ValueError("invalid event type")
         _require_safe_identifier("session_id", self.session_id)
         _require_safe_identifier("request_id", self.request_id)
+        if type(self.activity) is not SessionEventIdentity:
+            raise ValueError("activity must be an immutable session identity")
+        if self.activity.id != self.session_id:
+            raise ValueError("activity identity must match event identity")
         if type(self.request) is not RequestPerformanceSnapshot:
             raise ValueError("request must be an immutable performance snapshot")
         if type(self.session) is not SessionPerformanceSnapshot:

@@ -199,6 +199,10 @@ class PerformanceAgentIdentityResponse(_PerformanceActivityResponse):
     parent_id: SafeString | None
 
 
+class PerformanceActivityResponse(_PerformanceActivityResponse):
+    pass
+
+
 class PerformanceSessionIdentityResponse(_PerformanceActivityResponse):
     agents: tuple[PerformanceAgentIdentityResponse, ...] = ()
 
@@ -372,21 +376,28 @@ class SessionPerformanceResponse(_TelemetryModel):
         return self
 
 
+def _validate_activity_performance(
+    activity: _PerformanceActivityResponse,
+    performance: SessionPerformanceResponse,
+) -> None:
+    if activity.id != performance.session_id:
+        raise ValueError("activity identity must match performance identity")
+    if activity.requests != performance.requests:
+        raise ValueError("activity request counts must match")
+    if activity.active_requests != performance.current_concurrency:
+        raise ValueError("activity active request counts must match")
+    activity_is_active = activity.state == "active"
+    if activity_is_active != (performance.current_concurrency > 0):
+        raise ValueError("activity state must match current concurrency")
+
+
 class SessionPerformanceViewResponse(_TelemetryModel):
     session: PerformanceSessionIdentityResponse
     performance: SessionPerformanceResponse
 
     @model_validator(mode="after")
     def validate_session_identity(self) -> Self:
-        if self.session.id != self.performance.session_id:
-            raise ValueError("session identity must match performance identity")
-        if self.session.requests != self.performance.requests:
-            raise ValueError("session request counts must match")
-        if self.session.active_requests != self.performance.current_concurrency:
-            raise ValueError("session active request counts must match")
-        session_is_active = self.session.state == "active"
-        if session_is_active != (self.performance.current_concurrency > 0):
-            raise ValueError("session state must match current concurrency")
+        _validate_activity_performance(self.session, self.performance)
         return self
 
 
@@ -421,37 +432,65 @@ _EVENT_OUTCOMES: dict[OrdinaryPerformanceEventType, RequestOutcome] = {
 }
 
 
+def _validate_event_request_position(
+    request: RequestPerformanceResponse,
+    session: SessionPerformanceResponse,
+) -> None:
+    if request.outcome == "active":
+        matches = tuple(
+            item for item in session.active_requests if item.id == request.id
+        )
+        if len(matches) != 1 or matches[0] != request:
+            raise ValueError("active event must match active session request")
+        return
+    if not session.recent_requests:
+        raise ValueError("terminal event requires a recent request")
+    if session.recent_requests[0] != request:
+        raise ValueError("terminal event must match latest finalized request")
+
+
+def _validate_event_payload(
+    event_type: OrdinaryPerformanceEventType,
+    session_id: str,
+    request: RequestPerformanceResponse,
+    session: SessionPerformanceResponse,
+) -> None:
+    if request.session_id != session_id:
+        raise ValueError("event identity must match request identity")
+    if session.session_id != session_id:
+        raise ValueError("event identity must match session identity")
+    if request.outcome != _EVENT_OUTCOMES[event_type]:
+        raise ValueError("event type must match request outcome")
+    _validate_event_request_position(request, session)
+
+
 class PerformanceEventResponse(_TelemetryModel):
     process: ProcessIdentityResponse
     sequence: PositiveControlInteger
     occurred_at: UTCDateTime
     type: OrdinaryPerformanceEventType
     session_id: SafeString
+    activity: PerformanceActivityResponse
     request: RequestPerformanceResponse
     session: SessionPerformanceResponse
 
     @model_validator(mode="after")
     def validate_lifecycle(self) -> Self:
-        if self.request.session_id != self.session_id:
-            raise ValueError("event identity must match request identity")
-        if self.session.session_id != self.session_id:
-            raise ValueError("event identity must match session identity")
-        if self.request.outcome != _EVENT_OUTCOMES[self.type]:
-            raise ValueError("event type must match request outcome")
-        if self.request.outcome == "active":
-            matches = tuple(
-                request
-                for request in self.session.active_requests
-                if request.id == self.request.id
-            )
-            if len(matches) != 1 or matches[0] != self.request:
-                raise ValueError("active event must match active session request")
-            return self
-        if not self.session.recent_requests:
-            raise ValueError("terminal event requires a recent request")
-        if self.session.recent_requests[0] != self.request:
-            raise ValueError("terminal event must match latest finalized request")
+        _validate_activity_performance(self.activity, self.session)
+        _validate_event_payload(
+            self.type,
+            self.session_id,
+            self.request,
+            self.session,
+        )
         return self
+
+
+class PerformanceCursorResponse(_TelemetryModel):
+    process: ProcessIdentityResponse
+    sequence: PositiveControlInteger
+    occurred_at: UTCDateTime
+    type: Literal["cursor"]
 
 
 class PerformanceResetResponse(_TelemetryModel):
@@ -471,7 +510,7 @@ class PerformanceResetResponse(_TelemetryModel):
 
 
 PerformanceStreamEvent: TypeAlias = Annotated[
-    PerformanceEventResponse | PerformanceResetResponse,
+    PerformanceEventResponse | PerformanceCursorResponse | PerformanceResetResponse,
     Field(discriminator="type"),
 ]
 

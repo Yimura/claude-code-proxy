@@ -12,7 +12,7 @@ from typing import Annotated
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
-from ..event_journal import OVERFLOW, JournalEvent, Subscription
+from ..event_journal import OVERFLOW, JournalEvent
 from ..limits import MAX_CONTROL_INTEGER
 from ..observability import (
     AmbiguousSessionId,
@@ -24,6 +24,7 @@ from ..observability import (
 )
 from .schemas import (
     HealthResponse,
+    PerformanceCursorResponse,
     PerformanceEventResponse,
     PerformanceListResponse,
     PerformanceResetResponse,
@@ -32,6 +33,7 @@ from .schemas import (
     SessionListResponse,
     SessionResponse,
 )
+from .streaming import OwnedPerformanceStreamingResponse, SubscriptionOwner
 
 _DISTRIBUTION_NAME = "anthropic-proxy"
 _MAX_FILTER_ENTRIES = 32
@@ -48,6 +50,7 @@ _SUPPORTED_FILTERS = frozenset(
     }
 )
 _FilterQuery = Annotated[list[str] | None, Query()]
+_ResumeQuery = Annotated[list[str] | None, Query()]
 
 
 @dataclass(frozen=True)
@@ -58,59 +61,6 @@ class _ControlContext:
     pid: int
     clock: Callable[[], datetime]
     heartbeat_interval: float
-
-
-class _SubscriptionOwner:
-    def __init__(self, subscription: Subscription) -> None:
-        self._subscription: Subscription | None = subscription
-        self._closed = False
-
-    @property
-    def subscription(self) -> Subscription:
-        if self._subscription is None:
-            raise RuntimeError("performance subscription is not available")
-        return self._subscription
-
-    def release(self, original: BaseException | None = None) -> None:
-        subscription = self._subscription
-        self._subscription = None
-        if subscription is None:
-            return
-        try:
-            subscription.close()
-        except BaseException:
-            if original is None:
-                raise
-
-    def replace(self, subscription: Subscription) -> None:
-        if self._closed or self._subscription is not None:
-            subscription.close()
-            raise RuntimeError("performance subscription owner is closed")
-        self._subscription = subscription
-
-    def close(self, original: BaseException | None = None) -> None:
-        self._closed = True
-        self.release(original)
-
-
-class _OwnedPerformanceStreamingResponse(StreamingResponse):
-    def __init__(
-        self,
-        content: AsyncIterator[str],
-        owner: _SubscriptionOwner,
-    ) -> None:
-        super().__init__(content, media_type="application/x-ndjson")
-        self._owner = owner
-
-    async def __call__(self, scope, receive, send) -> None:
-        original: BaseException | None = None
-        try:
-            await super().__call__(scope, receive, send)
-        except BaseException as error:
-            original = error
-            raise
-        finally:
-            self._owner.close(original)
 
 
 def create_control_app(
@@ -165,9 +115,9 @@ def _register_control_routes(
     @application.get("/v1/performance/events")
     async def stream_performance(
         filter: _FilterQuery = None,
-        after: str | None = None,
-        pid: str | None = None,
-        started_at: str | None = None,
+        after: _ResumeQuery = None,
+        pid: _ResumeQuery = None,
+        started_at: _ResumeQuery = None,
     ) -> StreamingResponse:
         return _performance_event_response(
             context,
@@ -240,15 +190,16 @@ def _performance_list_response(
 def _performance_event_response(
     context: _ControlContext,
     entries: list[str] | None,
-    after: str | None,
-    pid: str | None,
-    started_at: str | None,
+    after: list[str] | None,
+    pid: list[str] | None,
+    started_at: list[str] | None,
 ) -> StreamingResponse:
     try:
         filters = _parse_filters(entries)
         effective_after = _effective_after(context, after, pid, started_at)
         if effective_after is not None:
             context.sessions.snapshots(filters)
+        event_filters = _resolve_event_filters(context, filters)
         state = context.sessions.subscribe_performance(filters, effective_after)
     except InvalidSessionFilter:
         raise HTTPException(422, "Invalid session filter") from None
@@ -259,24 +210,24 @@ def _performance_event_response(
             422,
             "Invalid performance event request",
         ) from None
-    owner = _SubscriptionOwner(state.subscription)
-    frames = _performance_frames(context, filters, state, owner)
-    return _OwnedPerformanceStreamingResponse(frames, owner)
+    owner = SubscriptionOwner(state.subscription)
+    frames = _performance_frames(context, filters, event_filters, state, owner)
+    return OwnedPerformanceStreamingResponse(frames, owner)
 
 
 async def _performance_frames(
     context: _ControlContext,
     filters: SessionFilters | None,
+    event_filters: SessionFilters | None,
     state: PerformanceSubscription,
-    owner: _SubscriptionOwner,
+    owner: SubscriptionOwner,
 ) -> AsyncIterator[str]:
     original: BaseException | None = None
     try:
         if state.initial is not None:
             yield _reset_line(context, state.initial)
         for event in state.subscription.replay:
-            if _event_matches(context, filters, event):
-                yield _event_line(context, event)
+            yield _filtered_event_line(context, event_filters, event)
         while True:
             item = await owner.subscription.receive(context.heartbeat_interval)
             if item is None:
@@ -286,8 +237,7 @@ async def _performance_frames(
                 state = _reset_after_overflow(context, filters, owner)
                 yield _reset_line(context, state.initial)
                 continue
-            if _event_matches(context, filters, item):
-                yield _event_line(context, item)
+            yield _filtered_event_line(context, event_filters, item)
     except BaseException as error:
         original = error
         raise
@@ -295,21 +245,56 @@ async def _performance_frames(
         owner.close(original)
 
 
-def _event_matches(
+def _resolve_event_filters(
     context: _ControlContext,
+    filters: SessionFilters | None,
+) -> SessionFilters | None:
+    if filters is None:
+        return None
+    resolved = {key: tuple(values) for key, values in filters.items()}
+    session_ids = resolved.get("session_id")
+    if session_ids is not None:
+        resolved["session_id"] = tuple(
+            context.sessions.public_id(value) for value in session_ids
+        )
+    return resolved
+
+
+def _filtered_event_line(
+    context: _ControlContext,
+    filters: SessionFilters | None,
+    event: JournalEvent,
+) -> str:
+    if _event_matches(filters, event):
+        return _event_line(context, event)
+    return _cursor_line(context, event)
+
+
+def _event_matches(
     filters: SessionFilters | None,
     event: JournalEvent,
 ) -> bool:
     if filters is None:
         return True
-    snapshots = context.sessions.snapshots(filters)
-    return any(snapshot.id == event.session_id for snapshot in snapshots)
+    for key, values in filters.items():
+        accepted = {value.casefold() for value in values}
+        if key == "id":
+            if not any(event.activity.id.casefold().startswith(value) for value in accepted):
+                return False
+            continue
+        if key == "session_id":
+            if event.activity.id.casefold() not in accepted:
+                return False
+            continue
+        if str(getattr(event.activity, key)).casefold() not in accepted:
+            return False
+    return True
 
 
 def _reset_after_overflow(
     context: _ControlContext,
     filters: SessionFilters | None,
-    owner: _SubscriptionOwner,
+    owner: SubscriptionOwner,
 ) -> PerformanceSubscription:
     owner.release()
     state = context.sessions.subscribe_performance(filters, after=None)
@@ -327,8 +312,19 @@ def _event_line(context: _ControlContext, event: JournalEvent) -> str:
         occurred_at=event.occurred_at,
         type=event.type,
         session_id=event.session_id,
+        activity=event.activity,
         request=event.request,
         session=event.session,
+    )
+    return _ndjson(response)
+
+
+def _cursor_line(context: _ControlContext, event: JournalEvent) -> str:
+    response = PerformanceCursorResponse(
+        process=_process_identity(context),
+        sequence=event.sequence,
+        occurred_at=event.occurred_at,
+        type="cursor",
     )
     return _ndjson(response)
 
@@ -350,7 +346,11 @@ def _reset_line(
     return _ndjson(response)
 
 
-def _ndjson(response: PerformanceEventResponse | PerformanceResetResponse) -> str:
+def _ndjson(
+    response: PerformanceEventResponse
+    | PerformanceCursorResponse
+    | PerformanceResetResponse,
+) -> str:
     payload = response.model_dump(mode="json")
     return json.dumps(payload, separators=(",", ":"), allow_nan=False) + "\n"
 
@@ -369,18 +369,28 @@ def _performance_capture_response(
 
 def _effective_after(
     context: _ControlContext,
-    after: str | None,
-    pid: str | None,
-    started_at: str | None,
+    after: list[str] | None,
+    pid: list[str] | None,
+    started_at: list[str] | None,
 ) -> int | None:
-    cursor = _parse_query_integer(after, minimum=0)
-    process_pid = _parse_query_integer(pid, minimum=1)
-    process_started_at = _parse_resume_datetime(started_at)
+    cursor = _parse_query_integer(_single_query_value(after), minimum=0)
+    process_pid = _parse_query_integer(_single_query_value(pid), minimum=1)
+    process_started_at = _parse_resume_datetime(
+        _single_query_value(started_at)
+    )
     if cursor is None:
         return None
     if process_pid != context.pid or process_started_at != context.started_at:
         return None
     return cursor
+
+
+def _single_query_value(values: list[str] | None) -> str | None:
+    if values is None:
+        return None
+    if len(values) != 1:
+        raise ValueError("resume query parameter must occur at most once")
+    return values[0]
 
 
 def _parse_query_integer(value: str | None, *, minimum: int) -> int | None:
@@ -446,13 +456,13 @@ def _installed_application_version() -> str:
 
 def _validate_heartbeat_interval(value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError("heartbeat interval must be finite and non-negative")
+        raise ValueError("heartbeat interval must be finite and positive")
     try:
         interval = float(value)
     except (OverflowError, ValueError):
         raise ValueError("heartbeat interval must be finite and non-negative") from None
-    if interval < 0 or not math.isfinite(interval):
-        raise ValueError("heartbeat interval must be finite and non-negative")
+    if interval <= 0 or not math.isfinite(interval):
+        raise ValueError("heartbeat interval must be finite and positive")
     return interval
 
 

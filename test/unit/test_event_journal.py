@@ -2,14 +2,17 @@ from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta, timezone
 import asyncio
 import math
+from types import SimpleNamespace
 from threading import Event, Thread
 
 import pytest
 
+import claude_code_proxy.event_journal as event_journal_module
 from claude_code_proxy.event_journal import (
     OVERFLOW,
     EventJournal,
     JournalEvent,
+    SessionEventIdentity,
     Subscription,
 )
 from claude_code_proxy.limits import MAX_CONTROL_INTEGER
@@ -21,6 +24,51 @@ from claude_code_proxy.performance import (
 )
 
 OCCURRED_AT = datetime(2026, 9, 21, 12, tzinfo=UTC)
+
+
+def test_session_event_identity_copies_and_freezes_snapshot_fields() -> None:
+    identity_type = getattr(event_journal_module, "SessionEventIdentity", None)
+    assert identity_type is not None
+    snapshot = SimpleNamespace(
+        id="safe-session-1",
+        state="active",
+        active_requests=1,
+        requests=2,
+        client_model="client-model",
+        model="provider-model",
+        provider="openai",
+        transport="codex",
+        effort="high",
+        context_window=1_000_000,
+        first_seen=OCCURRED_AT - timedelta(seconds=2),
+        last_seen=OCCURRED_AT,
+        elapsed_seconds=2.0,
+        last_result="completed",
+    )
+
+    identity = identity_type.from_snapshot(snapshot)
+
+    assert identity.id == "safe-session-1"
+    assert identity.provider == "openai"
+    assert identity.active_requests == 1
+    with pytest.raises(FrozenInstanceError):
+        identity.provider = "vertex"
+
+
+def test_session_event_identity_factory_escapes_nonprintable_metadata() -> None:
+    source = event_identity()
+    snapshot = SimpleNamespace(
+        **{
+            name: getattr(source, name)
+            for name in source.__dataclass_fields__
+        }
+    )
+    snapshot.client_model = "model\nforged\x1b‮"
+
+    identity = SessionEventIdentity.from_snapshot(snapshot)
+
+    assert identity.client_model == "model\\x0aforged\\x1b\\u202e"
+    assert identity.client_model.isprintable()
 
 
 def snapshots() -> tuple[RequestPerformanceSnapshot, SessionPerformanceSnapshot]:
@@ -37,6 +85,51 @@ def snapshots() -> tuple[RequestPerformanceSnapshot, SessionPerformanceSnapshot]
     return request.snapshot(10.0), session.snapshot(10.0)
 
 
+def event_identity(session_id: str = "safe-session-1") -> SessionEventIdentity:
+    return SessionEventIdentity(
+        id=session_id,
+        state="active",
+        active_requests=1,
+        requests=1,
+        client_model="client-model",
+        model="provider-model",
+        provider="openai",
+        transport="codex",
+        effort="high",
+        context_window=1_000_000,
+        first_seen=OCCURRED_AT,
+        last_seen=OCCURRED_AT,
+        elapsed_seconds=0.0,
+        last_result=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("id", " "),
+        ("provider", b"openai"),
+        ("active_requests", True),
+        ("active_requests", -1),
+        ("requests", 0),
+        ("context_window", 0),
+        ("first_seen", datetime(2026, 9, 21, 13, tzinfo=timezone(timedelta(hours=1)))),
+        ("last_seen", OCCURRED_AT - timedelta(seconds=1)),
+        ("elapsed_seconds", float("nan")),
+        ("elapsed_seconds", -1),
+        ("elapsed_seconds", MAX_CONTROL_INTEGER + 1),
+        ("state", "idle"),
+        ("last_result", "unknown"),
+    ],
+)
+def test_session_event_identity_rejects_invalid_fields(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError):
+        replace(event_identity(), **{field: value})
+
+
 def event(event_type: str = "progress") -> JournalEvent:
     request, session = snapshots()
     return JournalEvent(
@@ -45,9 +138,18 @@ def event(event_type: str = "progress") -> JournalEvent:
         type=event_type,  # type: ignore[arg-type]
         session_id="safe-session-1",
         request_id="request-1",
+        activity=event_identity(),
         request=request,
         session=session,
     )
+
+
+def test_journal_event_carries_matching_immutable_activity() -> None:
+    published = event()
+
+    assert published.activity == event_identity()
+    with pytest.raises(ValueError, match="activity identity"):
+        replace(published, activity=event_identity("other-session"))
 
 
 def test_publish_assigns_sequence_without_mutating_frozen_input() -> None:
@@ -391,6 +493,7 @@ def test_publish_rejects_mutable_event_subclass() -> None:
         original.type,
         original.session_id,
         original.request_id,
+        original.activity,
         original.request,
         original.session,
     )

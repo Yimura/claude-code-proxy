@@ -14,7 +14,7 @@ import uuid
 
 from .domain.models import ClientIdentity, CompletionResponse, StreamEvent
 from .domain.models import TokenUsage, ToolUseStart
-from .event_journal import EventJournal, EventReservation, EventType, JournalEvent, Subscription
+from .event_journal import EventJournal, EventReservation, EventType, JournalEvent, SessionEventIdentity, Subscription
 from .failures import FailureDiagnostic
 from .limits import MAX_CONTROL_INTEGER
 from .performance import OperationKind, ReasoningContinuation, RequestOutcome, RequestPerformance, RequestPerformanceSnapshot
@@ -724,6 +724,7 @@ class SessionRegistry:
         return JournalEvent(
             sequence=0, occurred_at=occurred_at, type=event_type,
             session_id=record.public_id, request_id=request.request_id,
+            activity=SessionEventIdentity.from_snapshot(_to_snapshot(record, now)),
             request=request.snapshot(now),
             session=record.performance.snapshot(now),
         )
