@@ -1,7 +1,9 @@
 """Validated response schemas for the local control API."""
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
 import math
+from types import MappingProxyType
 from typing import Annotated, Literal, Self, TypeAlias
 
 from pydantic import (
@@ -12,6 +14,7 @@ from pydantic import (
     Field,
     StrictFloat,
     StrictInt,
+    field_serializer,
     field_validator,
     model_validator,
 )
@@ -140,6 +143,26 @@ RequestOutcome = Literal[
     "cancelled",
     "client_disconnected",
 ]
+TerminalRequestOutcome = Literal[
+    "completed",
+    "failed",
+    "cancelled",
+    "client_disconnected",
+]
+
+
+def _require_finite_duration(value: int | float) -> int | float:
+    if value < 0 or isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("duration must be finite and non-negative")
+    if isinstance(value, int) and value > MAX_CONTROL_INTEGER:
+        raise ValueError("duration integer exceeds the control limit")
+    return value
+
+
+FiniteDuration = Annotated[
+    StrictNumber,
+    AfterValidator(_require_finite_duration),
+]
 
 
 class _TelemetryModel(BaseModel):
@@ -148,6 +171,31 @@ class _TelemetryModel(BaseModel):
         from_attributes=True,
         frozen=True,
     )
+
+
+class _PerformanceActivityResponse(_TelemetryModel):
+    id: SafeString
+    state: Literal["active", "idle", "failed"]
+    active_requests: NonNegativeControlInteger
+    requests: NonNegativeControlInteger
+    client_model: SafeString
+    model: SafeString
+    provider: SafeString
+    transport: SafeString
+    effort: SafeString
+    context_window: PositiveControlInteger | None
+    first_seen: UTCDateTime
+    last_seen: UTCDateTime
+    elapsed_seconds: FiniteDuration
+    last_result: Literal["completed", "failed"] | None
+
+
+class PerformanceAgentIdentityResponse(_PerformanceActivityResponse):
+    parent_id: SafeString | None
+
+
+class PerformanceSessionIdentityResponse(_PerformanceActivityResponse):
+    agents: tuple[PerformanceAgentIdentityResponse, ...] = ()
 
 
 class ProcessIdentityResponse(_TelemetryModel):
@@ -180,6 +228,8 @@ class MetricAggregateResponse(_TelemetryModel):
     @model_validator(mode="after")
     def validate_value(self) -> Self:
         _validate_metric_number(self.value, bound_integer=False)
+        if self.observed_samples == 0 and self.value != 0:
+            raise ValueError("aggregate value requires an observed sample")
         return self
 
     @property
@@ -223,6 +273,41 @@ class RequestPerformanceResponse(_TelemetryModel):
     ]
     failure: FailureDiagnosticResponse | None
 
+    @model_validator(mode="after")
+    def validate_lifecycle(self) -> Self:
+        if self.outcome == "active" and self.finished_at is not None:
+            raise ValueError("active request must not be finished")
+        if self.outcome != "active" and self.finished_at is None:
+            raise ValueError("terminal request must be finished")
+        if self.outcome != "failed" and self.failure is not None:
+            raise ValueError("only failed requests may include failure details")
+        return self
+
+
+def _validate_request_collection(
+    requests: tuple[RequestPerformanceResponse, ...],
+    session_id: str,
+    *,
+    active: bool,
+) -> None:
+    expected = "active" if active else "terminal"
+    for request in requests:
+        if request.session_id != session_id:
+            raise ValueError(f"{expected} request must match session identity")
+        if (request.outcome == "active") != active:
+            raise ValueError(f"{expected} request has invalid lifecycle state")
+
+
+def _latest_request(
+    recent: tuple[RequestPerformanceResponse, ...],
+    active: tuple[RequestPerformanceResponse, ...],
+) -> RequestPerformanceResponse | None:
+    if recent:
+        return recent[0]
+    if active:
+        return active[0]
+    return None
+
 
 class SessionPerformanceResponse(_TelemetryModel):
     session_id: SafeString
@@ -232,7 +317,7 @@ class SessionPerformanceResponse(_TelemetryModel):
         tuple[RequestPerformanceResponse, ...],
         Field(max_length=20),
     ]
-    outcomes: dict[RequestOutcome, NonNegativeControlInteger]
+    outcomes: Mapping[TerminalRequestOutcome, NonNegativeControlInteger]
     input_tokens: MetricAggregateResponse
     output_tokens: MetricAggregateResponse
     cache_read_tokens: MetricAggregateResponse
@@ -244,9 +329,43 @@ class SessionPerformanceResponse(_TelemetryModel):
     peak_concurrency: NonNegativeControlInteger
     latest_request: RequestPerformanceResponse | None
 
+    @field_validator("outcomes", mode="after")
+    @classmethod
+    def freeze_outcomes(
+        cls, value: Mapping[TerminalRequestOutcome, int]
+    ) -> Mapping[TerminalRequestOutcome, int]:
+        return MappingProxyType(dict(value))
+
+    @field_serializer("outcomes")
+    def serialize_outcomes(
+        self, value: Mapping[TerminalRequestOutcome, int]
+    ) -> dict[TerminalRequestOutcome, int]:
+        return dict(value)
+
+    @model_validator(mode="after")
+    def validate_snapshot(self) -> Self:
+        _validate_request_collection(
+            self.active_requests, self.session_id, active=True
+        )
+        _validate_request_collection(
+            self.recent_requests, self.session_id, active=False
+        )
+        if self.current_concurrency != len(self.active_requests):
+            raise ValueError("current concurrency must equal active requests")
+        if self.peak_concurrency < self.current_concurrency:
+            raise ValueError("peak concurrency must cover current concurrency")
+        completed = sum(self.outcomes.values())
+        if self.requests != len(self.active_requests) + completed:
+            raise ValueError("request count must match active and terminal requests")
+        if self.latest_request != _latest_request(
+            self.recent_requests, self.active_requests
+        ):
+            raise ValueError("latest request must match snapshot ordering")
+        return self
+
 
 class SessionPerformanceViewResponse(_TelemetryModel):
-    session: SessionResponse
+    session: PerformanceSessionIdentityResponse
     performance: SessionPerformanceResponse
 
     @model_validator(mode="after")
@@ -304,6 +423,19 @@ class PerformanceEventResponse(_TelemetryModel):
             raise ValueError("event identity must match session identity")
         if self.request.outcome != _EVENT_OUTCOMES[self.type]:
             raise ValueError("event type must match request outcome")
+        if self.request.outcome == "active":
+            matches = tuple(
+                request
+                for request in self.session.active_requests
+                if request.id == self.request.id
+            )
+            if len(matches) != 1 or matches[0] != self.request:
+                raise ValueError("active event must match active session request")
+            return self
+        if not self.session.recent_requests:
+            raise ValueError("terminal event requires a recent request")
+        if self.session.recent_requests[0] != self.request:
+            raise ValueError("terminal event must match latest finalized request")
         return self
 
 

@@ -33,7 +33,6 @@ from claude_code_proxy.observability import (
     SessionSnapshot,
 )
 
-
 class RegistryClock:
     def __init__(self) -> None:
         self.wall = datetime(2026, 1, 1, tzinfo=UTC)
@@ -48,7 +47,6 @@ class RegistryClock:
     def advance(self, seconds: float = 1.0) -> None:
         self.wall += timedelta(seconds=seconds)
         self.monotonic += seconds
-
 
 def metadata(
     client_id: str,
@@ -76,7 +74,6 @@ def metadata(
         context_window=context_window,
     )
 
-
 def registry(
     clock: RegistryClock, inactive_limit: int = 10
 ) -> SessionRegistry:
@@ -87,12 +84,10 @@ def registry(
         monotonic_clock=clock.monotonic_now,
     )
 
-
 def filtered_registry() -> tuple[SessionRegistry, dict[str, str]]:
     clock = RegistryClock()
     sessions = registry(clock)
     active = sessions.begin(metadata("raw-active"))
-
     clock.advance()
     idle = sessions.begin(
         metadata(
@@ -106,7 +101,6 @@ def filtered_registry() -> tuple[SessionRegistry, dict[str, str]]:
         )
     )
     sessions.finish(idle, "completed")
-
     clock.advance()
     failed = sessions.begin(
         metadata(
@@ -126,13 +120,11 @@ def filtered_registry() -> tuple[SessionRegistry, dict[str, str]]:
         "failed": failed.public_id,
     }
 
-
 async def request(app, path: str, params=None):
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://control"
     ) as client:
         return await client.get(path, params=params)
-
 
 async def test_session_response_includes_agent_snapshots() -> None:
     clock = RegistryClock()
@@ -143,16 +135,13 @@ async def test_session_response_includes_agent_snapshots() -> None:
         application_version="1.0",
         pid=123,
     )
-
     response = await request(app, "/v1/sessions")
-
     assert response.status_code == 200
     agent = response.json()["sessions"][0]["agents"][0]
     assert agent["id"] == handle.agent_public_id
     assert agent["parent_id"] == handle.parent_agent_public_id
     assert "client_session_id" not in agent
     assert "agent_id" not in agent
-
 
 async def test_health_counts_roots_not_agent_rows() -> None:
     clock = RegistryClock()
@@ -164,12 +153,9 @@ async def test_health_counts_roots_not_agent_rows() -> None:
         application_version="1.0",
         pid=123,
     )
-
     response = await request(app, "/v1/health")
-
     assert response.json()["capabilities"] == ["sessions", "agents"]
     assert response.json()["sessions"] == {"active": 1, "retained": 1}
-
 
 async def test_health_reports_exact_version_process_time_limit_and_counts() -> None:
     registry_clock = RegistryClock()
@@ -186,9 +172,7 @@ async def test_health_reports_exact_version_process_time_limit_and_counts() -> N
         pid=4321,
         clock=lambda: now,
     )
-
     response = await request(app, "/v1/health")
-
     assert response.status_code == 200
     assert response.json() == {
         "protocol_version": 1,
@@ -201,7 +185,6 @@ async def test_health_reports_exact_version_process_time_limit_and_counts() -> N
         "inactive_limit": 7,
     }
 
-
 async def test_health_clamps_uptime_when_clock_precedes_start() -> None:
     clock = RegistryClock()
     started = datetime(2026, 1, 2, tzinfo=UTC)
@@ -212,20 +195,15 @@ async def test_health_clamps_uptime_when_clock_precedes_start() -> None:
         pid=1,
         clock=lambda: started - timedelta(seconds=1),
     )
-
     response = await request(app, "/v1/health")
-
     assert response.json()["uptime_seconds"] == 0
-
 
 async def test_health_uses_installed_distribution_version(monkeypatch) -> None:
     clock = RegistryClock()
     requested_distributions: list[str] = []
-
     def version(distribution: str) -> str:
         requested_distributions.append(distribution)
         return "4.5.6"
-
     monkeypatch.setattr(control_app_module.metadata, "version", version)
     app = create_control_app(
         registry(clock),
@@ -233,12 +211,9 @@ async def test_health_uses_installed_distribution_version(monkeypatch) -> None:
         pid=1,
         clock=clock.wall_now,
     )
-
     response = await request(app, "/v1/health")
-
     assert response.json()["application_version"] == "4.5.6"
     assert requested_distributions == ["anthropic-proxy"]
-
 
 async def test_control_app_defaults_are_resolved_at_construction(monkeypatch) -> None:
     registry_clock = RegistryClock()
@@ -246,26 +221,20 @@ async def test_control_app_defaults_are_resolved_at_construction(monkeypatch) ->
     current = started + timedelta(seconds=3)
     times = iter((started, current))
     requested_distributions: list[str] = []
-
     monkeypatch.setattr(control_app_module, "_utc_now", lambda: next(times))
     monkeypatch.setattr(control_app_module.os, "getpid", lambda: 2468)
-
     def version(distribution: str) -> str:
         requested_distributions.append(distribution)
         return "7.8.9"
-
     monkeypatch.setattr(control_app_module.metadata, "version", version)
-
     app = create_control_app(registry(registry_clock))
     response = await request(app, "/v1/health")
-
     assert response.status_code == 200
     assert response.json()["started_at"] == "2026-04-05T06:07:08Z"
     assert response.json()["uptime_seconds"] == 3
     assert response.json()["application_version"] == "7.8.9"
     assert response.json()["pid"] == 2468
     assert requested_distributions == ["anthropic-proxy"]
-
 
 async def test_sessions_preserve_registry_order_and_one_capture_time() -> None:
     registry_clock = RegistryClock()
@@ -281,9 +250,7 @@ async def test_sessions_preserve_registry_order_and_one_capture_time() -> None:
         pid=1,
         clock=lambda: captured_at,
     )
-
     response = await request(app, "/v1/sessions")
-
     assert response.status_code == 200
     payload = response.json()
     assert payload["captured_at"] == "2026-02-03T04:05:06Z"
@@ -291,7 +258,6 @@ async def test_sessions_preserve_registry_order_and_one_capture_time() -> None:
         second.public_id,
         first.public_id,
     ]
-
 
 @pytest.mark.parametrize(
     ("entry", "expected_name"),
@@ -316,14 +282,11 @@ async def test_sessions_support_each_filter_key(
         application_version="1.0",
         pid=1,
     )
-
     response = await request(app, "/v1/sessions", [("filter", value)])
-
     assert response.status_code == 200
     assert [item["id"] for item in response.json()["sessions"]] == [
         ids[expected_name]
     ]
-
 
 async def test_session_id_filter_never_returns_raw_id() -> None:
     sessions, ids = filtered_registry()
@@ -333,20 +296,17 @@ async def test_session_id_filter_never_returns_raw_id() -> None:
         application_version="1.0",
         pid=1,
     )
-
     raw_id = "raw-idle"
     response = await request(
         app,
         "/v1/sessions",
         [("filter", f"session_id={raw_id}")],
     )
-
     assert response.status_code == 200
     assert [item["id"] for item in response.json()["sessions"]] == [
         ids["idle"]
     ]
     assert raw_id not in response.text
-
 
 async def test_repeated_filter_key_is_or_and_different_keys_are_and() -> None:
     sessions, ids = filtered_registry()
@@ -356,7 +316,6 @@ async def test_repeated_filter_key_is_or_and_different_keys_are_and() -> None:
         application_version="1.0",
         pid=1,
     )
-
     or_response = await request(
         app,
         "/v1/sessions",
@@ -367,7 +326,6 @@ async def test_repeated_filter_key_is_or_and_different_keys_are_and() -> None:
         "/v1/sessions",
         [("filter", "transport=litellm"), ("filter", "effort=medium")],
     )
-
     assert {item["id"] for item in or_response.json()["sessions"]} == {
         ids["idle"],
         ids["failed"],
@@ -375,7 +333,6 @@ async def test_repeated_filter_key_is_or_and_different_keys_are_and() -> None:
     assert [item["id"] for item in and_response.json()["sessions"]] == [
         ids["idle"]
     ]
-
 
 @pytest.mark.parametrize(
     "entry",
@@ -396,11 +353,8 @@ async def test_malformed_filter_entries_return_422(entry: str) -> None:
         application_version="1.0",
         pid=1,
     )
-
     response = await request(app, "/v1/sessions", [("filter", entry)])
-
     assert response.status_code == 422
-
 
 async def test_filter_entry_length_accepts_256_and_rejects_257_characters() -> None:
     sessions, _ = filtered_registry()
@@ -412,20 +366,17 @@ async def test_filter_entry_length_accepts_256_and_rejects_257_characters() -> N
     )
     exactly_256 = "model=" + "x" * 250
     exactly_257 = "model=" + "x" * 251
-
     accepted = await request(
         app, "/v1/sessions", [("filter", exactly_256)]
     )
     rejected = await request(
         app, "/v1/sessions", [("filter", exactly_257)]
     )
-
     assert len(exactly_256) == 256
     assert accepted.status_code == 200
     assert accepted.json()["sessions"] == []
     assert len(exactly_257) == 257
     assert rejected.status_code == 422
-
 
 async def test_invalid_session_id_filter_does_not_echo_raw_value() -> None:
     sessions, _ = filtered_registry()
@@ -436,17 +387,14 @@ async def test_invalid_session_id_filter_does_not_echo_raw_value() -> None:
         pid=1,
     )
     raw_id = "sensitive-session-" + "x" * 240
-
     response = await request(
         app,
         "/v1/sessions",
         [("filter", f"session_id={raw_id}")],
     )
-
     assert response.status_code == 422
     assert response.json() == {"detail": "Invalid session filter"}
     assert raw_id not in response.text
-
 
 async def test_exactly_32_filter_entries_are_accepted() -> None:
     sessions, ids = filtered_registry()
@@ -457,12 +405,9 @@ async def test_exactly_32_filter_entries_are_accepted() -> None:
         pid=1,
     )
     entries = [("filter", "state=idle") for _ in range(32)]
-
     response = await request(app, "/v1/sessions", entries)
-
     assert response.status_code == 200
     assert [item["id"] for item in response.json()["sessions"]] == [ids["idle"]]
-
 
 async def test_filter_whitespace_is_normalized() -> None:
     sessions, ids = filtered_registry()
@@ -472,14 +417,11 @@ async def test_filter_whitespace_is_normalized() -> None:
         application_version="1.0",
         pid=1,
     )
-
     response = await request(
         app, "/v1/sessions", [("filter", " state = idle ")]
     )
-
     assert response.status_code == 200
     assert [item["id"] for item in response.json()["sessions"]] == [ids["idle"]]
-
 
 async def test_more_than_32_filter_entries_returns_422() -> None:
     sessions, _ = filtered_registry()
@@ -490,11 +432,8 @@ async def test_more_than_32_filter_entries_returns_422() -> None:
         pid=1,
     )
     entries = [("filter", "state=idle") for _ in range(33)]
-
     response = await request(app, "/v1/sessions", entries)
-
     assert response.status_code == 422
-
 
 async def test_ambiguous_id_prefix_returns_safe_422() -> None:
     registry_clock = RegistryClock()
@@ -514,17 +453,14 @@ async def test_ambiguous_id_prefix_returns_safe_422() -> None:
         application_version="1.0",
         pid=1,
     )
-
     response = await request(
         app, "/v1/sessions", [("filter", f"id={collision}")]
     )
-
     assert response.status_code == 422
     assert response.json() == {"detail": "Session ID prefix is ambiguous"}
     serialized = response.text
     assert "raw-collision" not in serialized
     assert all(snapshot.id not in serialized for snapshot in sessions.snapshots())
-
 
 async def test_session_json_excludes_raw_ids_and_internal_fields() -> None:
     sessions, _ = filtered_registry()
@@ -534,9 +470,7 @@ async def test_session_json_excludes_raw_ids_and_internal_fields() -> None:
         application_version="1.0",
         pid=1,
     )
-
     response = await request(app, "/v1/sessions")
-
     assert response.status_code == 200
     serialized = json.dumps(response.json())
     assert "raw-active" not in serialized
@@ -561,7 +495,6 @@ async def test_session_json_excludes_raw_ids_and_internal_fields() -> None:
     }
     assert all(set(item) == expected_fields for item in response.json()["sessions"])
 
-
 @pytest.mark.parametrize(
     "path",
     [
@@ -582,11 +515,8 @@ async def test_control_app_exposes_only_versioned_control_routes(path: str) -> N
         application_version="1.0",
         pid=1,
     )
-
     response = await request(app, path)
-
     assert response.status_code == 404
-
 
 def test_health_schemas_are_frozen_and_protocol_version_is_literal_one() -> None:
     counts = SessionCounts(active=1, retained=2)
@@ -599,7 +529,6 @@ def test_health_schemas_are_frozen_and_protocol_version_is_literal_one() -> None
         "inactive_limit": 5,
     }
     health = HealthResponse(**values)
-
     assert health.protocol_version == 1
     with pytest.raises(ValidationError, match="frozen"):
         counts.active = 2
@@ -607,7 +536,6 @@ def test_health_schemas_are_frozen_and_protocol_version_is_literal_one() -> None
         health.pid = 456
     with pytest.raises(ValidationError, match="Input should be 1"):
         HealthResponse(protocol_version=2, **values)
-
 
 def test_session_response_validates_snapshot_attributes_and_is_frozen() -> None:
     snapshot = SessionSnapshot(
@@ -626,14 +554,11 @@ def test_session_response_validates_snapshot_attributes_and_is_frozen() -> None:
         elapsed_seconds=2.5,
         last_result="completed",
     )
-
     response = SessionResponse.model_validate(snapshot)
-
     assert response.model_dump() == snapshot.__dict__
     assert "client_session_id" not in SessionResponse.model_fields
     with pytest.raises(ValidationError, match="frozen"):
         response.requests = 4
-
 
 def test_session_list_response_stores_a_frozen_tuple() -> None:
     snapshot = SessionSnapshot(
@@ -653,17 +578,14 @@ def test_session_list_response_stores_a_frozen_tuple() -> None:
         last_result=None,
     )
     session = SessionResponse.model_validate(snapshot)
-
     response = SessionListResponse(
         captured_at=datetime(2026, 1, 1, tzinfo=UTC),
         sessions=[session],
     )
-
     assert response.sessions == (session,)
     assert isinstance(response.sessions, tuple)
     with pytest.raises(ValidationError, match="frozen"):
         response.sessions = ()
-
 
 async def test_control_app_normalizes_aware_datetimes_and_rejects_naive_ones() -> None:
     clock = RegistryClock()
@@ -675,9 +597,7 @@ async def test_control_app_normalizes_aware_datetimes_and_rejects_naive_ones() -
         pid=1,
         clock=lambda: datetime(2026, 1, 1, 3, tzinfo=offset),
     )
-
     response = await request(app, "/v1/health")
-
     assert response.json()["started_at"] == "2026-01-01T00:00:00Z"
     assert response.json()["uptime_seconds"] == 3600
     with pytest.raises(ValueError, match="started_at must be timezone-aware"):
@@ -687,7 +607,6 @@ async def test_control_app_normalizes_aware_datetimes_and_rejects_naive_ones() -
             application_version="1.0",
             pid=1,
         )
-
     naive_clock_app = create_control_app(
         registry(clock),
         started_at=clock.wall,
@@ -698,29 +617,18 @@ async def test_control_app_normalizes_aware_datetimes_and_rejects_naive_ones() -
     with pytest.raises(ValueError, match="clock result must be timezone-aware"):
         await request(naive_clock_app, "/v1/health")
 
-
 def process_payload() -> dict[str, object]:
     return {"pid": 42, "started_at": "2026-01-02T03:00:00Z"}
-
 
 def failure_payload() -> dict[str, object]:
     return {"category": "internal", "stage": "route", "code": "safe"}
 
-
-def metric_payload(
-    status: str = "observed", value: object = 0
-) -> dict[str, object]:
+def metric_payload(status: str = "observed", value: object = 0) -> dict[str, object]:
     return {"status": status, "value": value}
 
-
 def aggregate_payload(value: object = 0) -> dict[str, object]:
-    return {
-        "value": value,
-        "observed_samples": 1,
-        "unavailable_samples": 0,
-        "not_applicable_samples": 0,
-    }
-
+    return {"value": value, "observed_samples": 1,
+            "unavailable_samples": 0, "not_applicable_samples": 0}
 
 def request_performance_payload() -> dict[str, object]:
     metric = metric_payload()
@@ -746,7 +654,6 @@ def request_performance_payload() -> dict[str, object]:
         "failure": None,
     }
 
-
 def session_performance_payload() -> dict[str, object]:
     request_payload = request_performance_payload()
     aggregate = aggregate_payload()
@@ -765,9 +672,8 @@ def session_performance_payload() -> dict[str, object]:
         "retries": aggregate_payload(),
         "current_concurrency": 0,
         "peak_concurrency": 1,
-        "latest_request": request_payload,
+        "latest_request": request_performance_payload(),
     }
-
 
 def performance_view_payload() -> dict[str, object]:
     return {
@@ -790,15 +696,10 @@ def performance_view_payload() -> dict[str, object]:
         "performance": session_performance_payload(),
     }
 
-
 def performance_list_payload() -> dict[str, object]:
-    return {
-        "process": process_payload(),
-        "captured_at": "2026-01-02T03:04:06Z",
-        "cursor": 1,
-        "sessions": [performance_view_payload()],
-    }
-
+    return {"process": process_payload(),
+            "captured_at": "2026-01-02T03:04:06Z", "cursor": 1,
+            "sessions": [performance_view_payload()]}
 
 def performance_event_payload() -> dict[str, object]:
     return {
@@ -811,17 +712,11 @@ def performance_event_payload() -> dict[str, object]:
         "session": session_performance_payload(),
     }
 
-
 def performance_reset_payload() -> dict[str, object]:
     snapshot = performance_list_payload()
-    return {
-        "process": snapshot["process"],
-        "sequence": snapshot["cursor"],
-        "occurred_at": "2026-01-02T03:04:06Z",
-        "type": "reset",
-        "snapshot": snapshot,
-    }
-
+    return {"process": snapshot["process"], "sequence": snapshot["cursor"],
+            "occurred_at": "2026-01-02T03:04:06Z", "type": "reset",
+            "snapshot": snapshot}
 
 _PERFORMANCE_SCHEMA_CASES = (
     (ProcessIdentityResponse, process_payload),
@@ -835,7 +730,6 @@ _PERFORMANCE_SCHEMA_CASES = (
     (PerformanceEventResponse, performance_event_payload),
     (PerformanceResetResponse, performance_reset_payload),
 )
-
 
 def test_stream_sequences_and_reset_consistency_are_validated() -> None:
     event = performance_event_payload()
@@ -857,15 +751,12 @@ def test_stream_sequences_and_reset_consistency_are_validated() -> None:
         with pytest.raises(ValidationError):
             PerformanceResetResponse.model_validate(payload)
 
-
 def test_stream_event_alias_discriminates_ordinary_and_reset_events() -> None:
     adapter = TypeAdapter(PerformanceStreamEvent)
     ordinary = adapter.validate_python(performance_event_payload())
     reset = adapter.validate_python(performance_reset_payload())
     assert isinstance(ordinary, PerformanceEventResponse)
     assert isinstance(reset, PerformanceResetResponse)
-
-
 
 @pytest.mark.parametrize(
     ("model", "factory"),
@@ -880,13 +771,17 @@ def test_performance_schemas_forbid_sensitive_extra_fields(
     with pytest.raises(ValidationError, match="extra_forbidden"):
         model.model_validate(payload)
 
-
 def test_session_performance_outcomes_are_closed_strict_and_bounded() -> None:
+    payload = session_performance_payload()
+    source = payload["outcomes"]
+    response = SessionPerformanceResponse.model_validate(payload)
+    source["active"] = 1
+    with pytest.raises(TypeError):
+        response.outcomes["active"] = 1
+    assert response.model_dump(mode="json")["outcomes"] == {"completed": 1}
     for outcomes in (
-        {"unknown": 1},
-        {"completed": True},
-        {"completed": "1"},
-        {"completed": -1},
+        {"active": 1}, {"unknown": 1}, {"completed": True},
+        {"completed": "1"}, {"completed": -1},
         {"completed": MAX_CONTROL_INTEGER + 1},
     ):
         payload = session_performance_payload()
@@ -894,13 +789,11 @@ def test_session_performance_outcomes_are_closed_strict_and_bounded() -> None:
         with pytest.raises(ValidationError):
             SessionPerformanceResponse.model_validate(payload)
 
-
-
 def test_real_registry_capture_converts_without_raw_content() -> None:
     clock = RegistryClock()
     sessions = registry(clock)
     handle = sessions.begin(
-        metadata("raw-session-secret"), operation="count_tokens"
+        metadata("raw-session-secret", "raw-agent-secret"), operation="count_tokens"
     )
     sessions.observer(handle).count_tokens(0)
     sessions.finish(handle, "completed")
@@ -911,11 +804,9 @@ def test_real_registry_capture_converts_without_raw_content() -> None:
         cursor=capture.cursor,
         sessions=capture.sessions,
     )
-
     response = PerformanceListResponse.model_validate(wrapped, from_attributes=True)
     dumped = response.model_dump(mode="json")
     serialized = json.dumps(dumped)
-
     performance = response.sessions[0].performance
     assert performance.recent_requests == (performance.latest_request,)
     recent = dumped["sessions"][0]["performance"]["recent_requests"][0]
@@ -932,7 +823,6 @@ def test_real_registry_capture_converts_without_raw_content() -> None:
     for secret in secrets:
         assert secret not in serialized
 
-
 @pytest.mark.parametrize(
     ("model", "factory"),
     _PERFORMANCE_SCHEMA_CASES,
@@ -943,7 +833,6 @@ def test_performance_schema_models_are_frozen(model, factory) -> None:
     with pytest.raises(ValidationError, match="frozen"):
         setattr(instance, field, None)
 
-
 @pytest.mark.parametrize(
     ("path", "value"),
     [
@@ -953,22 +842,25 @@ def test_performance_schema_models_are_frozen(model, factory) -> None:
         ("event.session.session_id", "other"),
         ("event.request.outcome", "failed"),
         ("event.type", "progress"),
+        ("event.request.operation", "count_tokens"),
+        ("event.request.id", "other"),
+        ("active.request.operation", "count_tokens"),
+        ("active.request.id", "other"),
     ],
 )
-def test_performance_envelopes_reject_inconsistent_lifecycle(
-    path: str, value: str
-) -> None:
+def test_performance_envelopes_reject_inconsistent_lifecycle(path: str, value: str) -> None:
     envelope, *parts = path.split(".")
     is_view = envelope == "view"
     model = SessionPerformanceViewResponse if is_view else PerformanceEventResponse
-    payload = performance_view_payload() if is_view else performance_event_payload()
+    factories = {"view": performance_view_payload, "event": performance_event_payload,
+                 "active": active_performance_event_payload}
+    payload = factories[envelope]()
     target = payload
     for part in parts[:-1]:
         target = target[part]
     target[parts[-1]] = value
     with pytest.raises(ValidationError):
         model.model_validate(payload)
-
 
 @pytest.mark.parametrize(
     ("model", "factory", "path"),
@@ -990,3 +882,114 @@ def test_performance_envelopes_reject_numeric_datetime_strings(
     target[path[-1]] = "0"
     with pytest.raises(ValidationError):
         model.model_validate(payload)
+
+def performance_view_with_agent_payload() -> dict[str, object]:
+    payload = performance_view_payload()
+    session = payload["session"]
+    assert isinstance(session, dict)
+    agent = dict(session)
+    agent.update({"id": "agent-public", "parent_id": None})
+    session["agents"] = [agent]
+    return payload
+
+def active_request_payload() -> dict[str, object]:
+    payload = request_performance_payload()
+    payload.update({"outcome": "active", "finished_at": None})
+    return payload
+
+def active_session_performance_payload() -> dict[str, object]:
+    request = active_request_payload()
+    payload = session_performance_payload()
+    payload.update({"active_requests": [request], "recent_requests": [],
+                    "outcomes": {}, "current_concurrency": 1,
+                    "latest_request": request})
+    return payload
+
+def active_performance_event_payload() -> dict[str, object]:
+    payload = performance_event_payload()
+    payload.update({"type": "progress", "request": active_request_payload(),
+                    "session": active_session_performance_payload()})
+    return payload
+
+@pytest.mark.parametrize(
+    ("path", "field", "value"),
+    [
+        (("session",), "raw_session_id", "secret"),
+        (("session", "agents", 0), "prompt", "secret"),
+        (("session",), "first_seen", 0),
+        (("session",), "last_seen", "0"),
+        (("session", "agents", 0), "first_seen", 0),
+        (("session", "agents", 0), "last_seen", "0"),
+        (("session",), "client_model", b"model"),
+        (("session", "agents", 0), "id", b"agent"),
+        (("session",), "elapsed_seconds", float("inf")),
+        (("session", "agents", 0), "elapsed_seconds", float("nan")),
+        (("session",), "active_requests", True),
+        (("session",), "requests", "1"),
+        (("session", "agents", 0), "requests", MAX_CONTROL_INTEGER + 1),
+        (("session",), "elapsed_seconds", -1),
+    ],
+)
+def test_performance_activity_models_reject_unsafe_nested_values(
+    path: tuple[str | int, ...], field: str, value: object
+) -> None:
+    payload = performance_view_with_agent_payload()
+    target = payload
+    for part in path:
+        target = target[part]
+    target[field] = value
+    with pytest.raises(ValidationError):
+        SessionPerformanceViewResponse.model_validate(payload)
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"outcome": "active"},
+        {"finished_at": None},
+        {"failure": failure_payload()},
+        {"outcome": "active", "finished_at": None, "failure": failure_payload()},
+    ],
+)
+def test_request_performance_rejects_incoherent_lifecycle(
+    updates: dict[str, object]
+) -> None:
+    payload = request_performance_payload()
+    payload.update(updates)
+    with pytest.raises(ValidationError):
+        RequestPerformanceResponse.model_validate(payload)
+
+def test_request_performance_accepts_active_and_failed_without_diagnostic() -> None:
+    assert RequestPerformanceResponse.model_validate(active_request_payload()).outcome == "active"
+    failed = request_performance_payload()
+    failed.update({"outcome": "failed", "failure": None})
+    assert RequestPerformanceResponse.model_validate(failed).outcome == "failed"
+
+def test_session_performance_rejects_incoherent_snapshots() -> None:
+    invalid = []
+    active = active_session_performance_payload()
+    active["active_requests"][0]["session_id"] = "other"
+    invalid.append(active)
+    terminal_active = session_performance_payload()
+    terminal_active.update({"active_requests": [request_performance_payload()], "recent_requests": [], "outcomes": {}, "current_concurrency": 1})
+    invalid.append(terminal_active)
+    active_recent = session_performance_payload()
+    live = active_request_payload()
+    active_recent.update({"requests": 0, "recent_requests": [live], "outcomes": {}, "latest_request": live})
+    invalid.append(active_recent)
+    for field, value in (("current_concurrency", 1), ("requests", 2), ("latest_request", None)):
+        payload = session_performance_payload()
+        payload[field] = value
+        invalid.append(payload)
+    peak = active_session_performance_payload()
+    peak["peak_concurrency"] = 0
+    invalid.append(peak)
+    latest = session_performance_payload()
+    latest["latest_request"] = request_performance_payload()
+    latest["latest_request"]["operation"] = "count_tokens"
+    invalid.append(latest)
+    empty = session_performance_payload()
+    empty.update({"requests": 0, "recent_requests": [], "outcomes": {}})
+    invalid.append(empty)
+    for payload in invalid:
+        with pytest.raises(ValidationError):
+            SessionPerformanceResponse.model_validate(payload)
