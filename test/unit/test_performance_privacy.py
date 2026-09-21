@@ -35,6 +35,7 @@ from claude_code_proxy.failures import (
     FailureDiagnostic,
     FailureStage,
 )
+from claude_code_proxy.logging import RequestLoggingMiddleware
 from claude_code_proxy.model_mapping import ModelResolver
 from claude_code_proxy.observability import SessionRegistry
 from claude_code_proxy.performance_cli import render_performance
@@ -203,6 +204,7 @@ def _apps() -> tuple[FastAPI, FastAPI, SessionRegistry, _PrivacyProvider]:
         provider,
     )
     public = FastAPI()
+    public.add_middleware(RequestLoggingMiddleware, sessions=sessions)
     public.include_router(build_router(service, sessions))
     control = create_control_app(
         sessions,

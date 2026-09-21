@@ -13,6 +13,7 @@ from claude_code_proxy.domain.models import (
     TextDelta,
     TokenUsage,
 )
+from claude_code_proxy.logging import RequestLoggingMiddleware
 from claude_code_proxy.model_mapping import ModelResolver
 from claude_code_proxy.observability import SessionRegistry
 from claude_code_proxy.providers.base import ProviderError
@@ -65,6 +66,7 @@ def client(
         provider,
     )
     app = FastAPI()
+    app.add_middleware(RequestLoggingMiddleware, sessions=sessions)
     app.include_router(build_router(service, sessions))
     return TestClient(app), sessions
 
