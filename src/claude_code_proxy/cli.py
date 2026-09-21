@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 import typer
 from wcwidth import wcwidth, wcswidth
 
-from .config import Settings
+from .config import PerformanceMode, Settings
 from .control.client import (
     ControlClient,
     ControlError,
@@ -119,6 +119,13 @@ def proxy(
             help="Maximum retained inactive sessions.",
         ),
     ] = None,
+    performance: Annotated[
+        PerformanceMode,
+        typer.Option(
+            "--performance",
+            help="Performance mode: off, collector, or logging.",
+        ),
+    ] = PerformanceMode.OFF,
 ) -> None:
     """Run the public proxy and local control endpoint in the foreground."""
     try:
@@ -129,6 +136,7 @@ def proxy(
             port=port,
             socket=socket,
             session_limit=session_limit,
+            performance=performance,
         )
         socket_path = resolve_socket_path(effective.control_socket_path)
         _configure_proxy_logging()
@@ -193,14 +201,20 @@ def _apply_proxy_overrides(
     port: int | None,
     socket: Path | None,
     session_limit: int | None,
+    performance: PerformanceMode,
 ) -> Settings:
     overrides = {
         "proxy_host": host,
         "proxy_port": port,
         "control_socket_path": socket,
         "session_retention_limit": session_limit,
+        "performance_mode": performance,
     }
-    supplied = {name: value for name, value in overrides.items() if value is not None}
+    supplied = {
+        name: value
+        for name, value in overrides.items()
+        if value is not None
+    }
     return replace(configured, **supplied)
 
 

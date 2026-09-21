@@ -98,6 +98,14 @@ def _register_control_routes(
     def list_sessions(filter: _FilterQuery = None) -> SessionListResponse:
         return _session_list_response(context, filter)
 
+    if context.sessions.performance_enabled:
+        _register_performance_routes(application, context)
+
+
+def _register_performance_routes(
+    application: FastAPI,
+    context: _ControlContext,
+) -> None:
     @application.get("/v1/performance", response_model=PerformanceListResponse)
     def list_performance(filter: _FilterQuery = None) -> PerformanceListResponse:
         return _performance_list_response(context, filter)
@@ -126,6 +134,11 @@ def _health_response(context: _ControlContext) -> HealthResponse:
         pid=context.pid,
         started_at=context.started_at,
         uptime_seconds=max(0.0, (now - context.started_at).total_seconds()),
+        capabilities=(
+            ("sessions", "agents", "performance", "performance_events")
+            if context.sessions.performance_enabled
+            else ("sessions", "agents")
+        ),
         sessions=SessionCounts(active=active, retained=retained),
         inactive_limit=context.sessions.inactive_limit,
     )

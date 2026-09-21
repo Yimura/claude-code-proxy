@@ -43,7 +43,12 @@ def create_runtime(settings: Settings | None = None) -> RuntimeServices:
     )
     events = EventJournal(4096, 64)
     sessions = SessionRegistry(
-        configured.session_retention_limit, events=events
+        configured.session_retention_limit,
+        events=events,
+        performance_enabled=configured.performance_enabled,
+        performance_logging_enabled=(
+            configured.performance_logging_enabled
+        ),
     )
     started_at = datetime.now(UTC)
     return RuntimeServices(

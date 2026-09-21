@@ -609,6 +609,8 @@ def _request_context(
 def _request_telemetry(
     sessions: SessionRegistry, observation: ObservationHandle
 ) -> RequestTelemetry | None:
+    if not sessions.performance_enabled:
+        return None
     try:
         return sessions.observer(observation)
     except BaseException:
@@ -702,7 +704,8 @@ def _finalize_request(
         snapshot = sessions.finish(observation, outcome, failure)
         if snapshot is None:
             return False
-        log_performance(snapshot, context)
+        if sessions.performance_logging_enabled:
+            log_performance(snapshot, context)
         return True
     except BaseException:
         log_finalization_failure()

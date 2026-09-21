@@ -9,7 +9,6 @@ import hmac
 import secrets
 import threading
 import time
-from typing import Literal
 import uuid
 
 from .domain.models import ClientIdentity, CompletionResponse, StreamEvent
@@ -27,10 +26,21 @@ from .performance_filters import (
     prepare_performance_filters,
     validate_performance_filters,
 )
+from .session_inventory import (
+    SessionResult,
+    SessionState,
+    begin_activity as _begin_activity,
+    elapsed_seconds as _elapsed_seconds,
+    finish_activity as _finish_activity,
+    session_state as _session_state,
+    strip_model_prefix as _strip_model_prefix,
+)
+from .session_snapshot_filters import filter_snapshots as _filter_snapshots
 from .text_safety import scalar_text
 
-SessionState = Literal["active", "idle", "failed"]
-SessionResult = Literal["completed", "failed"]
+
+class PerformanceUnavailable(RuntimeError):
+    """Raised when performance telemetry was not enabled at startup."""
 
 @dataclass(frozen=True)
 class SessionMetadata:
@@ -160,9 +170,9 @@ class _AgentRecord(_ActivityRecord):
 
 @dataclass
 class _SessionRecord(_ActivityRecord):
-    performance: SessionPerformance
+    performance: SessionPerformance | None
     agents: dict[str, _AgentRecord] = field(default_factory=dict)
-    progress_at: dict[str, float] = field(default_factory=dict)
+    progress_at: dict[str, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,9 +194,24 @@ class SessionRegistry:
         wall_clock: Callable[[], datetime] | None = None,
         monotonic_clock: Callable[[], float] | None = None,
         events: EventJournal | None = None,
+        performance_enabled: bool = True,
+        performance_logging_enabled: bool | None = None,
     ) -> None:
         _validate_inactive_limit(inactive_limit)
+        _validate_performance_enabled(performance_enabled)
+        logging_enabled = (
+            performance_enabled
+            if performance_logging_enabled is None
+            else performance_logging_enabled
+        )
+        _validate_performance_logging_enabled(logging_enabled)
+        if logging_enabled and not performance_enabled:
+            raise ValueError(
+                "performance logging requires performance collection"
+            )
         self._inactive_limit = inactive_limit
+        self._performance_enabled = performance_enabled
+        self._performance_logging_enabled = logging_enabled
         self._secret = secrets.token_bytes(32) if secret is None else secret
         self._wall_clock = wall_clock or (lambda: datetime.now(UTC))
         self._monotonic_clock = monotonic_clock or time.monotonic
@@ -202,6 +227,14 @@ class SessionRegistry:
     @property
     def events(self) -> EventJournal:
         return self._events
+
+    @property
+    def performance_enabled(self) -> bool:
+        return self._performance_enabled
+
+    @property
+    def performance_logging_enabled(self) -> bool:
+        return self._performance_logging_enabled
 
     def sample_clocks(self) -> tuple[datetime, float]:
         """Sample and validate the registry's clock domain atomically."""
@@ -278,8 +311,19 @@ class SessionRegistry:
     ) -> ObservationHandle:
         context = self._begin_context(metadata)
         with self._lock:
-            monotonic = started_monotonic if started_monotonic is not None else self._monotonic_clock()
+            monotonic = (
+                started_monotonic
+                if started_monotonic is not None
+                else self._monotonic_clock()
+            )
             wall = self._wall_clock() if started_at is None else started_at
+            if not self._performance_enabled:
+                _validate_operation(operation)
+                validate_clock_sample(wall, monotonic)
+                handle, _ = self._start_locked(
+                    context, metadata, None, operation, wall, monotonic
+                )
+                return handle
             request = RequestPerformance(
                 context.request_id,
                 context.public_id,
@@ -290,7 +334,7 @@ class SessionRegistry:
             )
             with self._events.reserve(1) as reservation:
                 handle, record = self._start_locked(
-                    context, metadata, request, wall, monotonic
+                    context, metadata, request, operation, wall, monotonic
                 )
                 self._commit_events_locked(
                     reservation, record, request,
@@ -312,7 +356,8 @@ class SessionRegistry:
         self,
         context: "_BeginContext",
         metadata: SessionMetadata,
-        request: RequestPerformance,
+        request: RequestPerformance | None,
+        operation: OperationKind,
         wall: datetime,
         monotonic: float,
     ) -> tuple[ObservationHandle, _SessionRecord]:
@@ -321,9 +366,12 @@ class SessionRegistry:
         is_new = record is None
         if record is None:
             record = _new_session_record(
-                context.public_id, snapshot_metadata, wall
+                context.public_id, snapshot_metadata, wall,
+                performance_enabled=self._performance_enabled,
             )
-        record.performance.start(request)
+        if request is not None:
+            assert record.performance is not None
+            record.performance.start(request)
         _begin_activity(
             record, snapshot_metadata, context.request_id, monotonic, wall
         )
@@ -338,9 +386,12 @@ class SessionRegistry:
         )
         if is_new:
             self._records[context.key] = record
-        return _to_handle(context, request, is_new, agent), record
+        return _to_handle(
+            context, operation, monotonic, is_new, agent
+        ), record
 
     def observer(self, handle: ObservationHandle) -> RequestTelemetryObserver:
+        self._require_performance()
         with self._lock:
             if self._request_locked(handle) is None:
                 raise ValueError("observation handle is unknown or finalized")
@@ -530,6 +581,8 @@ class SessionRegistry:
     ) -> RequestPerformanceSnapshot | None:
         _validate_terminal_outcome(result)
         with self._lock:
+            if not self._performance_enabled:
+                return self._finish_without_performance_locked(handle, result)
             target = self._request_locked(handle)
             if target is None:
                 return None
@@ -540,6 +593,7 @@ class SessionRegistry:
                 request.finish(
                     result, finished_at, finished_monotonic, failure
                 )
+                assert record.performance is not None
                 terminal = record.performance.add_finalized(request)
                 if terminal is None:
                     raise RuntimeError(
@@ -552,9 +606,26 @@ class SessionRegistry:
                     reservation, record, request, (result,),
                     finished_at, finished_monotonic,
                 )
+                assert record.progress_at is not None
                 record.progress_at.pop(handle.request_id, None)
                 self._retain_finished_locked(handle, record)
                 return terminal
+
+    def _finish_without_performance_locked(
+        self, handle: ObservationHandle, result: RequestOutcome
+    ) -> None:
+        record = self._active_record_locked(handle)
+        if record is None:
+            return None
+        finished_at = self._wall_clock()
+        finished_monotonic = validate_clock_sample(
+            finished_at, self._monotonic_clock()
+        )
+        self._finish_base_locked(
+            record, handle, finished_at, finished_monotonic, result
+        )
+        self._retain_finished_locked(handle, record)
+        return None
 
     def _finish_base_locked(
         self,
@@ -609,6 +680,7 @@ class SessionRegistry:
     def performance_snapshots(
         self, filters: SessionFilters | None = None
     ) -> PerformanceCapture:
+        self._require_performance()
         normalized = validate_performance_filters(filters)
         with self._lock:
             return self._performance_capture_locked(normalized)
@@ -620,6 +692,7 @@ class SessionRegistry:
         *,
         resolved: bool = False,
     ) -> PerformanceSubscription:
+        self._require_performance()
         normalized = validate_performance_filters(filters)
         with self._lock:
             subscription = self._events.subscribe(after)
@@ -653,7 +726,7 @@ class SessionRegistry:
         views = tuple(
             SessionPerformanceView(
                 session,
-                records[session.id].performance.snapshot(now),
+                _performance(records[session.id]).snapshot(now),
             )
             for session in sessions
         )
@@ -688,13 +761,29 @@ class SessionRegistry:
     ) -> tuple[_SessionRecord, RequestPerformance] | None:
         if not isinstance(handle, ObservationHandle):
             return None
-        record = self._records.get(handle.key)
-        if record is None or record.public_id != handle.public_id:
+        record = self._active_record_locked(handle)
+        if record is None or record.performance is None:
             return None
         request = record.performance.request(handle.request_id)
         if request is None or request.is_terminal:
             return None
         return record, request
+
+    def _active_record_locked(
+        self, handle: ObservationHandle
+    ) -> _SessionRecord | None:
+        if not isinstance(handle, ObservationHandle):
+            return None
+        record = self._records.get(handle.key)
+        if record is None or record.public_id != handle.public_id:
+            return None
+        if handle.request_id not in record.active:
+            return None
+        return record
+
+    def _require_performance(self) -> None:
+        if not self._performance_enabled:
+            raise PerformanceUnavailable("performance telemetry is disabled")
 
     def _sample_event_clocks_locked(
         self, request: RequestPerformance
@@ -708,6 +797,7 @@ class SessionRegistry:
     def _progress_due(
         record: _SessionRecord, request: RequestPerformance, now: float
     ) -> bool:
+        assert record.progress_at is not None
         last = record.progress_at.get(request.request_id)
         return last is None or now - last >= 0.25
 
@@ -721,6 +811,7 @@ class SessionRegistry:
             for kind in event_types
         )
         published = reservation.publish(events)
+        assert record.progress_at is not None
         record.progress_at[request.request_id] = now
         return published
 
@@ -734,7 +825,7 @@ class SessionRegistry:
             session_id=record.public_id, request_id=request.request_id,
             activity=SessionEventIdentity.from_snapshot(_to_snapshot(record, now)),
             request=request.snapshot(now),
-            session=record.performance.snapshot(now),
+            session=_performance(record).snapshot(now),
         )
 
     def _evict_inactive(self) -> None:
@@ -754,8 +845,32 @@ def _validate_inactive_limit(inactive_limit: object) -> None:
         )
 
 
+def _validate_performance_enabled(value: object) -> None:
+    if type(value) is not bool:
+        raise ValueError("performance_enabled must be a boolean")
+
+
+def _validate_performance_logging_enabled(value: object) -> None:
+    if type(value) is not bool:
+        raise ValueError(
+            "performance_logging_enabled must be a boolean"
+        )
+
+
+def _validate_operation(operation: object) -> None:
+    if operation not in {"messages", "count_tokens"}:
+        raise ValueError("invalid operation")
+
+
+def _performance(record: _SessionRecord) -> SessionPerformance:
+    if record.performance is None:
+        raise PerformanceUnavailable("performance telemetry is disabled")
+    return record.performance
+
+
 def _new_session_record(
-    public_id: str, metadata: _SnapshotMetadata, seen_at: datetime
+    public_id: str, metadata: _SnapshotMetadata, seen_at: datetime,
+    *, performance_enabled: bool,
 ) -> _SessionRecord:
     return _SessionRecord(
         public_id=public_id,
@@ -764,13 +879,17 @@ def _new_session_record(
         last_seen=seen_at,
         requests=0,
         active={},
-        performance=SessionPerformance(public_id),
+        performance=(
+            SessionPerformance(public_id) if performance_enabled else None
+        ),
+        progress_at={} if performance_enabled else None,
     )
 
 
 def _to_handle(
     context: _BeginContext,
-    request: RequestPerformance,
+    operation: OperationKind,
+    started_monotonic: float,
     is_new: bool,
     agent: tuple[str | None, str | None, str | None, bool],
 ) -> ObservationHandle:
@@ -779,8 +898,8 @@ def _to_handle(
         key=context.key,
         request_id=context.request_id,
         public_id=context.public_id,
-        operation=request.operation,
-        started_monotonic=request.started_monotonic,
+        operation=operation,
+        started_monotonic=started_monotonic,
         is_new=is_new,
         request_scoped=context.request_scoped,
         agent_key=agent_key,
@@ -807,49 +926,14 @@ def _validate_count_tokens(value: object) -> None:
             f"{MAX_CONTROL_INTEGER}"
         )
 
-def _begin_activity(
-    record: _ActivityRecord,
-    metadata: _SnapshotMetadata,
-    request_id: str,
-    started: float,
-    seen_at: datetime,
-) -> None:
-    record.metadata = metadata
-    record.last_seen = max(record.last_seen, seen_at)
-    record.requests += 1
-    record.active[request_id] = started
-
-
-def _finish_activity(
-    record: _ActivityRecord,
-    request_id: str,
-    finished_at: float,
-    seen_at: datetime,
-    result: SessionResult,
-) -> bool:
-    started = record.active.pop(request_id, None)
-    if started is None:
-        return False
-    record.latest_duration = max(0.0, finished_at - started)
-    record.last_seen = max(record.last_seen, seen_at)
-    record.last_result = result
-    return True
-
-
-def _strip_model_prefix(model: str) -> str:
-    _, separator, unprefixed = model.partition("/")
-    return unprefixed if separator else model
 
 
 def _to_snapshot(record: _SessionRecord, now: float) -> SessionSnapshot:
-    active_requests = len(record.active)
-    state = _session_state(record)
-    elapsed = _elapsed_seconds(record, now)
     metadata = record.metadata
     return SessionSnapshot(
         id=record.public_id,
-        state=state,
-        active_requests=active_requests,
+        state=_session_state(record),
+        active_requests=len(record.active),
         requests=record.requests,
         client_model=metadata.client_model,
         model=metadata.model,
@@ -859,7 +943,7 @@ def _to_snapshot(record: _SessionRecord, now: float) -> SessionSnapshot:
         context_window=metadata.context_window,
         first_seen=record.first_seen,
         last_seen=record.last_seen,
-        elapsed_seconds=elapsed,
+        elapsed_seconds=_elapsed_seconds(record, now),
         last_result=record.last_result,
         agents=tuple(
             _to_agent_snapshot(agent, now)
@@ -891,76 +975,3 @@ def _to_agent_snapshot(record: _AgentRecord, now: float) -> AgentSnapshot:
         elapsed_seconds=_elapsed_seconds(record, now),
         last_result=record.last_result,
     )
-
-
-def _session_state(record: _ActivityRecord) -> SessionState:
-    if record.active:
-        return "active"
-    if record.last_result == "failed":
-        return "failed"
-    return "idle"
-
-
-def _elapsed_seconds(record: _ActivityRecord, now: float) -> float:
-    if not record.active:
-        return record.latest_duration
-    return max(0.0, now - min(record.active.values()))
-
-
-def _filter_snapshots(
-    snapshots: list[SessionSnapshot],
-    filters: dict[str, tuple[str, ...]],
-    exact_ids: set[str] | None,
-) -> list[SessionSnapshot]:
-    selected_ids = _resolve_id_filters(snapshots, filters.get("id"))
-    matches = _filter_snapshot_ids(snapshots, selected_ids, exact_ids)
-    for key, values in filters.items():
-        if key not in {"id", "session_id"}:
-            matches = _filter_snapshot_field(matches, key, values)
-    return matches
-
-
-def _filter_snapshot_ids(
-    snapshots: list[SessionSnapshot],
-    selected_ids: set[str] | None,
-    exact_ids: set[str] | None,
-) -> list[SessionSnapshot]:
-    matches = snapshots
-    if selected_ids is not None:
-        matches = [item for item in matches if item.id in selected_ids]
-    if exact_ids is not None:
-        matches = [item for item in matches if item.id in exact_ids]
-    return matches
-
-
-def _filter_snapshot_field(
-    snapshots: list[SessionSnapshot],
-    key: str,
-    values: tuple[str, ...],
-) -> list[SessionSnapshot]:
-    accepted = {value.casefold() for value in values}
-    return [
-        item
-        for item in snapshots
-        if str(getattr(item, key)).casefold() in accepted
-    ]
-
-def _resolve_id_filters(
-    snapshots: list[SessionSnapshot],
-    prefixes: tuple[str, ...] | None,
-) -> set[str] | None:
-    if prefixes is None:
-        return None
-
-    selected: set[str] = set()
-    for prefix in prefixes:
-        folded = prefix.casefold()
-        matches = [
-            item.id
-            for item in snapshots
-            if item.id.casefold().startswith(folded)
-        ]
-        if len(matches) > 1:
-            raise AmbiguousSessionId(f"session ID prefix {prefix!r} is ambiguous")
-        selected.update(matches)
-    return selected
