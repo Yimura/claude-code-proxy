@@ -678,8 +678,12 @@ class ProviderCallbackProvider(LifecycleProvider):
 
     async def stream(self, request, telemetry=None):
         self.notify_provider_callbacks(telemetry)
-        async for event in super().stream(request, telemetry):
-            yield event
+        inner = super().stream(request, telemetry)
+        try:
+            async for event in inner:
+                yield event
+        finally:
+            await inner.aclose()
 
 
 def assert_provider_callbacks_isolated(provider, telemetry, caplog):
@@ -736,6 +740,7 @@ async def test_stream_isolates_provider_telemetry_callbacks(caplog):
 
     assert events == [event]
     assert events[0] is event
+    assert provider.close_count == 1
     assert_provider_callbacks_isolated(provider, telemetry, caplog)
 
 
