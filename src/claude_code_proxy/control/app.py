@@ -14,6 +14,7 @@ from fastapi.responses import StreamingResponse
 
 from ..event_journal import OVERFLOW, JournalEvent
 from ..limits import MAX_CONTROL_INTEGER
+from ..performance_filters import FILTER_FIELDS
 from ..observability import (
     AmbiguousSessionId,
     InvalidSessionFilter,
@@ -38,17 +39,6 @@ from .streaming import OwnedPerformanceStreamingResponse, SubscriptionOwner
 _DISTRIBUTION_NAME = "anthropic-proxy"
 _MAX_FILTER_ENTRIES = 32
 _MAX_FILTER_ENTRY_LENGTH = 256
-_SUPPORTED_FILTERS = frozenset(
-    {
-        "id",
-        "session_id",
-        "state",
-        "provider",
-        "transport",
-        "model",
-        "effort",
-    }
-)
 _FilterQuery = Annotated[list[str] | None, Query()]
 _ResumeQuery = Annotated[list[str] | None, Query()]
 
@@ -197,9 +187,6 @@ def _performance_event_response(
     try:
         filters = _parse_filters(entries)
         effective_after = _effective_after(context, after, pid, started_at)
-        if effective_after is not None:
-            context.sessions.snapshots(filters)
-        event_filters = _resolve_event_filters(context, filters)
         state = context.sessions.subscribe_performance(filters, effective_after)
     except InvalidSessionFilter:
         raise HTTPException(422, "Invalid session filter") from None
@@ -211,14 +198,12 @@ def _performance_event_response(
             "Invalid performance event request",
         ) from None
     owner = SubscriptionOwner(state.subscription)
-    frames = _performance_frames(context, filters, event_filters, state, owner)
+    frames = _performance_frames(context, state, owner)
     return OwnedPerformanceStreamingResponse(frames, owner)
 
 
 async def _performance_frames(
     context: _ControlContext,
-    filters: SessionFilters | None,
-    event_filters: SessionFilters | None,
     state: PerformanceSubscription,
     owner: SubscriptionOwner,
 ) -> AsyncIterator[str]:
@@ -227,37 +212,22 @@ async def _performance_frames(
         if state.initial is not None:
             yield _reset_line(context, state.initial)
         for event in state.subscription.replay:
-            yield _filtered_event_line(context, event_filters, event)
+            yield _filtered_event_line(context, state.event_filters, event)
         while True:
             item = await owner.subscription.receive(context.heartbeat_interval)
             if item is None:
                 yield "\n"
                 continue
             if item is OVERFLOW:
-                state = _reset_after_overflow(context, filters, owner)
+                state = _reset_after_overflow(context, state, owner)
                 yield _reset_line(context, state.initial)
                 continue
-            yield _filtered_event_line(context, event_filters, item)
+            yield _filtered_event_line(context, state.event_filters, item)
     except BaseException as error:
         original = error
         raise
     finally:
         owner.close(original)
-
-
-def _resolve_event_filters(
-    context: _ControlContext,
-    filters: SessionFilters | None,
-) -> SessionFilters | None:
-    if filters is None:
-        return None
-    resolved = {key: tuple(values) for key, values in filters.items()}
-    session_ids = resolved.get("session_id")
-    if session_ids is not None:
-        resolved["session_id"] = tuple(
-            context.sessions.public_id(value) for value in session_ids
-        )
-    return resolved
 
 
 def _filtered_event_line(
@@ -279,10 +249,6 @@ def _event_matches(
     for key, values in filters.items():
         accepted = {value.casefold() for value in values}
         if key == "id":
-            if not any(event.activity.id.casefold().startswith(value) for value in accepted):
-                return False
-            continue
-        if key == "session_id":
             if event.activity.id.casefold() not in accepted:
                 return False
             continue
@@ -293,11 +259,15 @@ def _event_matches(
 
 def _reset_after_overflow(
     context: _ControlContext,
-    filters: SessionFilters | None,
+    previous: PerformanceSubscription,
     owner: SubscriptionOwner,
 ) -> PerformanceSubscription:
     owner.release()
-    state = context.sessions.subscribe_performance(filters, after=None)
+    state = context.sessions.subscribe_performance(
+        previous.event_filters,
+        after=None,
+        resolved=True,
+    )
     owner.replace(state.subscription)
     if state.initial is None:
         owner.release()
@@ -439,7 +409,7 @@ def _parse_filters(entries: list[str] | None) -> SessionFilters | None:
         raw_key, raw_value = entry.split("=", 1)
         key = raw_key.strip()
         value = raw_value.strip()
-        if not key or not value or key not in _SUPPORTED_FILTERS:
+        if not key or not value or key not in FILTER_FIELDS:
             raise InvalidSessionFilter("malformed filter entry")
         aggregated.setdefault(key, []).append(value)
     return {key: tuple(values) for key, values in aggregated.items()}

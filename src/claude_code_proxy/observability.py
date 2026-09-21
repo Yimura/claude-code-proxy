@@ -1,7 +1,7 @@
 """Thread-safe, privacy-preserving runtime session observations."""
 
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import hashlib
@@ -19,16 +19,18 @@ from .failures import FailureDiagnostic
 from .limits import MAX_CONTROL_INTEGER
 from .performance import OperationKind, ReasoningContinuation, RequestOutcome, RequestPerformance, RequestPerformanceSnapshot
 from .performance import RequestTelemetryObserver, SessionPerformance, SessionPerformanceSnapshot, validate_clock_sample
+from .performance_filters import (
+    AmbiguousSessionId,
+    FilterMap as SessionFilters,
+    InvalidSessionFilter as InvalidSessionFilter,
+    mutable_performance_filters,
+    prepare_performance_filters,
+    validate_performance_filters,
+)
 from .text_safety import scalar_text
 
 SessionState = Literal["active", "idle", "failed"]
 SessionResult = Literal["completed", "failed"]
-SessionFilters = Mapping[str, Sequence[str]]
-
-_FILTER_FIELDS = frozenset({
-    "id", "session_id", "state", "provider", "transport", "model", "effort",
-})
-
 
 @dataclass(frozen=True)
 class SessionMetadata:
@@ -115,14 +117,7 @@ class PerformanceCapture:
 class PerformanceSubscription:
     initial: PerformanceCapture | None
     subscription: Subscription
-
-
-class InvalidSessionFilter(ValueError):
-    pass
-
-
-class AmbiguousSessionId(ValueError):
-    pass
+    event_filters: SessionFilters | None
 
 
 @dataclass(frozen=True)
@@ -606,7 +601,7 @@ class SessionRegistry:
         filters: SessionFilters | None = None,
     ) -> list[SessionSnapshot]:
         """Copy snapshots and optionally filter their public fields."""
-        normalized = _validate_filters(filters)
+        normalized = validate_performance_filters(filters)
         with self._lock:
             return self._session_snapshots_at_locked(
                 normalized, self._monotonic_clock())
@@ -614,7 +609,7 @@ class SessionRegistry:
     def performance_snapshots(
         self, filters: SessionFilters | None = None
     ) -> PerformanceCapture:
-        normalized = _validate_filters(filters)
+        normalized = validate_performance_filters(filters)
         with self._lock:
             return self._performance_capture_locked(normalized)
 
@@ -622,15 +617,28 @@ class SessionRegistry:
         self,
         filters: SessionFilters | None,
         after: int | None,
+        *,
+        resolved: bool = False,
     ) -> PerformanceSubscription:
-        normalized = _validate_filters(filters)
+        normalized = validate_performance_filters(filters)
         with self._lock:
             subscription = self._events.subscribe(after)
             try:
+                event_filters = prepare_performance_filters(
+                    normalized,
+                    (record.public_id for record in self._records.values()),
+                    subscription.replay,
+                    self.public_id,
+                    resolved=resolved,
+                )
                 initial = None
                 if after is None or subscription.reset_required:
-                    initial = self._performance_capture_locked(normalized)
-                return PerformanceSubscription(initial, subscription)
+                    initial = self._performance_capture_locked(
+                        mutable_performance_filters(event_filters)
+                    )
+                return PerformanceSubscription(
+                    initial, subscription, event_filters
+                )
             except BaseException:
                 subscription.close()
                 raise
@@ -897,47 +905,6 @@ def _elapsed_seconds(record: _ActivityRecord, now: float) -> float:
     if not record.active:
         return record.latest_duration
     return max(0.0, now - min(record.active.values()))
-
-
-def _validate_filters(
-    filters: SessionFilters | None,
-) -> dict[str, tuple[str, ...]] | None:
-    if filters is None:
-        return None
-    if not isinstance(filters, Mapping) or not filters:
-        raise InvalidSessionFilter("filters must contain at least one key")
-
-    normalized: dict[str, tuple[str, ...]] = {}
-    for key, values in filters.items():
-        _validate_filter_key(key)
-        normalized[key] = _validate_filter_values(key, values)
-    return normalized
-
-
-def _validate_filter_key(key: object) -> None:
-    if not isinstance(key, str) or not key.strip() or key not in _FILTER_FIELDS:
-        raise InvalidSessionFilter(f"unsupported session filter {key!r}")
-
-
-def _validate_filter_values(
-    key: str, values: object
-) -> tuple[str, ...]:
-    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
-        raise InvalidSessionFilter(
-            f"filter {key!r} requires a sequence of values"
-        )
-    entries = tuple(values)
-    if not entries or any(_invalid_filter_value(key, value) for value in entries):
-        raise InvalidSessionFilter(
-            f"filter {key!r} requires non-empty values"
-        )
-    return entries
-
-
-def _invalid_filter_value(key: str, value: object) -> bool:
-    if not isinstance(value, str) or not value:
-        return True
-    return key == "session_id" and not value.strip()
 
 
 def _filter_snapshots(
