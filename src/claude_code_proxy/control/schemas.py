@@ -52,7 +52,12 @@ class HealthResponse(_FrozenModel):
     pid: PositiveControlInteger
     started_at: datetime
     uptime_seconds: float
-    capabilities: tuple[str, ...] = ("sessions", "agents")
+    capabilities: tuple[str, ...] = (
+        "sessions",
+        "agents",
+        "performance",
+        "performance_events",
+    )
     sessions: SessionCounts
     inactive_limit: NonNegativeControlInteger
 

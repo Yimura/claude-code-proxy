@@ -195,7 +195,15 @@ def test_create_app_passes_runtime_sessions_to_middleware_and_router(
     assert observed == {"router": runtime.sessions}
 
 
-@pytest.mark.parametrize("path", ["/v1/health", "/v1/sessions"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1/health",
+        "/v1/sessions",
+        "/v1/performance",
+        "/v1/performance/events",
+    ],
+)
 async def test_public_app_does_not_expose_control_routes(tmp_path, path):
     from httpx import ASGITransport, AsyncClient
 
