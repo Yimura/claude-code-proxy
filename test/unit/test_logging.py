@@ -3,7 +3,6 @@ import io
 import json
 import logging
 import re
-from datetime import UTC, datetime
 
 import pytest
 from starlette.requests import ClientDisconnect
@@ -33,7 +32,6 @@ from claude_code_proxy.logging import (
     client_identity_from_headers,
     configure_logging,
     effective_effort,
-    log_performance,
     log_provider_failure,
     log_session_started,
     log_startup_summary,
@@ -43,25 +41,11 @@ from claude_code_proxy.logging import (
     palette_index,
     session_identity,
 )
-from claude_code_proxy.performance import Measurement, RequestPerformanceSnapshot
 from claude_code_proxy.providers.base import ProviderError
 from claude_code_proxy.providers.codex.auth import CodexAccountIdentity
 from claude_code_proxy.reasoning import ReasoningPolicy
 
-
-def make_context(identity: SessionIdentity | None = None) -> RequestLogContext:
-    return RequestLogContext(
-        session=identity
-        or SessionIdentity("abcdef123456", "[session abcdef123456]", False),
-        method="POST",
-        endpoint="/v1/messages",
-        original_model="claude-sonnet",
-        upstream_model="openai/gpt-5.6-sol",
-        provider="fake",
-        effort="high",
-    )
-
-
+from test.unit.logging_test_support import make_context
 
 
 def test_agent_identity_hides_raw_values():
@@ -78,6 +62,7 @@ def test_agent_identity_hides_raw_values():
         parent_label="b" * 12,
         is_new=True,
     )
+
 
 def test_client_identity_from_headers_reads_full_lineage():
     identity = client_identity_from_headers(
@@ -107,6 +92,7 @@ def test_client_identity_from_headers_normalizes_blank_and_orphan_parent():
 
     assert blank == ClientIdentity()
     assert orphan == ClientIdentity()
+
 
 def test_startup_summary_reports_litellm_transport(caplog):
     with caplog.at_level(
@@ -334,7 +320,6 @@ def test_effective_effort(policy, expected):
     assert effective_effort(policy) == expected
 
 
-
 def test_root_lifecycle_log_excludes_agent_context(caplog):
     context = RequestLogContext(
         session=SessionIdentity("session-safe", "[session session-safe]", True),
@@ -355,6 +340,7 @@ def test_root_lifecycle_log_excludes_agent_context(caplog):
 
     assert "[session session-safe]" in caplog.text
     assert "[agent agent-safe]" not in caplog.text
+
 
 def test_untrusted_log_context_escapes_record_and_terminal_controls(caplog):
     hostile = "field\n\r\t\x1b\x85\u2028\u2029\u202e\ud800"
@@ -564,7 +550,6 @@ def test_provider_failure_tokens_resist_field_injection(caplog):
     assert "'" not in value
     assert '"' not in value
     assert " " not in value
-
 
 
 def test_stream_failure_tokens_bound_all_untrusted_structured_values(caplog):
@@ -823,133 +808,6 @@ async def test_observe_stream_does_not_swallow_cancellation():
         await anext(observe_stream(events, make_context()))
 
     assert events.closed is True
-
-
-def performance_snapshot(**changes):
-    values = {
-        "id": "request-safe-123",
-        "session_id": "session-safe-123",
-        "operation": "messages",
-        "outcome": "completed",
-        "started_at": datetime(2026, 1, 1, tzinfo=UTC),
-        "finished_at": datetime(2026, 1, 1, tzinfo=UTC),
-        "duration": Measurement.observed(0),
-        "upstream_duration": Measurement.unavailable(),
-        "ttft": Measurement.not_applicable(),
-        "input_tokens": Measurement.observed(0),
-        "output_tokens": Measurement.unavailable(),
-        "cache_read_tokens": Measurement.not_applicable(),
-        "cache_creation_tokens": Measurement.observed(0),
-        "reasoning_tokens": Measurement.unavailable(),
-        "tool_calls": Measurement.not_applicable(),
-        "retries": Measurement.observed(0),
-        "peak_concurrency": Measurement.observed(1),
-        "reasoning_continuation": "unavailable",
-        "failure": None,
-    }
-    values.update(changes)
-    return RequestPerformanceSnapshot(**values)
-
-
-def test_performance_log_distinguishes_zero_unavailable_and_not_applicable(caplog):
-    with caplog.at_level(logging.INFO, logger="claude_code_proxy.logging"):
-        log_performance(performance_snapshot(), make_context())
-
-    assert len(caplog.records) == 1
-    rendered = caplog.records[0].getMessage()
-    assert caplog.records[0].levelno == logging.INFO
-    for expected in (
-        "performance",
-        "request=request-safe-123",
-        "operation=messages",
-        "outcome=completed",
-        "duration_ms=0",
-        "upstream_ms=unavailable",
-        "ttft_ms=not_applicable",
-        "input_tokens=0",
-        "output_tokens=unavailable",
-        "cache_read_tokens=not_applicable",
-        "cache_creation_tokens=0",
-        "reasoning_tokens=unavailable",
-        "tools=not_applicable",
-        "retries=0",
-        "peak_concurrency=1",
-        "reasoning_continuation=unavailable",
-        "model=claude-sonnet",
-        "upstream=openai/gpt-5.6-sol",
-        "provider=fake",
-        "effort=high",
-    ):
-        assert expected in rendered
-
-
-def test_failed_performance_log_is_warning(caplog):
-    with caplog.at_level(logging.INFO, logger="claude_code_proxy.logging"):
-        log_performance(
-            performance_snapshot(outcome="failed"),
-            make_context(),
-        )
-
-    assert len(caplog.records) == 1
-    assert caplog.records[0].levelno == logging.WARNING
-    assert "performance" in caplog.records[0].getMessage()
-    assert "outcome=failed" in caplog.records[0].getMessage()
-
-
-def test_performance_log_encodes_and_bounds_every_string_field(caplog):
-    hostile = "field outcome=forged\r\n\t=\\\"'‮" + "x" * 400
-    context = RequestLogContext(
-        session=SessionIdentity("safe", "[session safe]", False),
-        agent=AgentIdentity("agent-safe", "[agent agent-safe]", hostile, False),
-        method="POST",
-        endpoint="/v1/messages",
-        original_model=hostile,
-        upstream_model=hostile,
-        provider=hostile,
-        effort=hostile,
-    )
-    snapshot = performance_snapshot(
-        id=hostile,
-        operation=hostile,
-        outcome=hostile,
-        reasoning_continuation=hostile,
-    )
-
-    with caplog.at_level(logging.INFO, logger="claude_code_proxy.logging"):
-        log_performance(snapshot, context)
-
-    rendered = caplog.records[0].getMessage()
-    assert len(rendered.splitlines()) == 1
-    assert "\r" not in rendered
-    assert "\n" not in rendered
-    assert "\t" not in rendered
-    assert "‮" not in rendered
-    for field in (
-        "request",
-        "operation",
-        "outcome",
-        "reasoning_continuation",
-        "model",
-        "upstream",
-        "provider",
-        "effort",
-    ):
-        [value] = re.findall(rf"(?:^| ){field}=(\S+)", rendered)
-        assert len(value) == 128
-        assert value.endswith("...")
-        assert "=" not in value
-        assert '"' not in value
-        assert "'" not in value
-    assert "field outcome=forged" not in rendered
-
-
-def test_performance_logging_failure_isolated(monkeypatch):
-    def fail_log(*_args, **_kwargs):
-        raise RuntimeError("sink secret")
-
-    monkeypatch.setattr("claude_code_proxy.logging.logger.log", fail_log)
-
-    log_performance(performance_snapshot(), make_context())
 
 
 @pytest.mark.asyncio

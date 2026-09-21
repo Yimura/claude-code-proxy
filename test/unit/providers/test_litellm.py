@@ -1,7 +1,6 @@
 import asyncio
 from dataclasses import replace
 import logging
-from pathlib import Path
 import re
 
 import httpx
@@ -11,9 +10,8 @@ from litellm.types.utils import Usage as LiteLLMUsage
 
 from claude_code_proxy.api.schemas import MessagesRequest
 from claude_code_proxy.api.translation import normalize_request, serialize_stream
-from claude_code_proxy.config import Settings
 from claude_code_proxy.domain.models import (
-    ClientIdentity, CompletionRequest, CompletionResponse,
+    ClientIdentity,
     ImageBlock,
     Message,
     StreamComplete,
@@ -35,30 +33,20 @@ from claude_code_proxy.failures import (
     FailureDiagnostic,
     FailureStage,
 )
-from claude_code_proxy.logging import (
-    RequestLogContext,
-    SessionIdentity,
-    log_stream_failure,
-)
+from claude_code_proxy.logging import log_stream_failure
 from claude_code_proxy.providers.base import ProviderError
 from claude_code_proxy.providers.litellm import LiteLLMProvider, clean_gemini_schema
-from claude_code_proxy.reasoning import OutputConfig, ReasoningPolicy, ThinkingConfig
+from claude_code_proxy.reasoning import (
+    OutputConfig,
+    ThinkingConfig,
+)
 
-
-@pytest.fixture
-def settings():
-    return Settings(
-        anthropic_api_key="anthropic-key",
-        openai_api_key="openai-key",
-        gemini_api_key="gemini-key",
-        vertex_project="project",
-        vertex_location="region",
-        use_vertex_auth=False,
-        openai_base_url=None,
-        openai_transport="litellm",
-        opencode_data_dir=Path("/auth"),
-        model_mapping_path=Path("mapping.json"),
-    )
+from test.unit.providers.litellm_test_support import (
+    FakeClient,
+    log_context,
+    request,
+    settings as settings,
+)
 
 
 def assert_failure_evidence(
@@ -78,31 +66,6 @@ def assert_failure_evidence(
     )
 
 
-def log_context():
-    return RequestLogContext(
-        session=SessionIdentity("session", "[session session]", False),
-        method="POST",
-        endpoint="/v1/messages",
-        original_model="claude",
-        upstream_model="openai/gpt-5.6-sol",
-        provider="litellm",
-        effort="default",
-    )
-
-
-def request(model="openai/gpt-5.6-sol", **changes):
-    base = CompletionRequest(
-        original_model=model,
-        model=model,
-        response_model=model,
-        max_tokens=20000,
-        messages=(Message("user", (TextBlock("hello"),)),),
-        reasoning=ReasoningPolicy(True, "high"),
-    )
-    return replace(base, **changes)
-
-
-
 def test_build_request_does_not_forward_client_identity(settings):
     provider = LiteLLMProvider(settings, object())
     payload = provider.build_request(
@@ -118,6 +81,7 @@ def test_build_request_does_not_forward_client_identity(settings):
     assert "client_metadata" not in payload
     assert "prompt_cache_key" not in payload
 
+
 def test_build_request_preserves_tools_reasoning_and_auth(settings):
     provider = LiteLLMProvider(settings, object())
     payload = provider.build_request(request(
@@ -130,7 +94,6 @@ def test_build_request_preserves_tools_reasoning_and_auth(settings):
     assert payload["api_key"] == "openai-key"
 
 
-
 def test_openai_token_cap_does_not_depend_on_transport(settings):
     codex_settings = replace(settings, openai_transport="codex")
 
@@ -139,6 +102,7 @@ def test_openai_token_cap_does_not_depend_on_transport(settings):
     )
 
     assert payload["max_completion_tokens"] == 16_384
+
 
 def test_missing_selected_tool_falls_back_to_auto(settings):
     payload = LiteLLMProvider(settings, object()).build_request(request(
@@ -179,185 +143,6 @@ def test_anthropic_preserves_thinking_and_output_config(settings):
     assert payload["thinking"] == {"type": "adaptive"}
     assert payload["output_config"] == {"effort": "high", "format": {"type": "json_schema"}}
     assert "reasoning_effort" not in payload
-
-
-class RecordingTelemetry:
-    def __init__(self):
-        self.calls = []
-
-    def mark_retries_supported(self):
-        self.calls.append(("mark_retries_supported",))
-
-    def record_retry(self):
-        self.calls.append(("record_retry",))
-
-    def set_reasoning_continuation(self, value):
-        self.calls.append(("set_reasoning_continuation", value))
-
-
-class FailingTelemetry(RecordingTelemetry):
-    def set_reasoning_continuation(self, value):
-        raise RuntimeError("sensitive callback failure")
-
-
-class FakeClient:
-    def __init__(self, response=None, chunks=(), token_count=9):
-        self.response = response
-        self.chunks = chunks
-        self.token_count = token_count
-        self.counter_args = None
-
-    def completion(self, **kwargs):
-        return self.response
-
-    async def acompletion(self, **kwargs):
-        async def generate():
-            for chunk in self.chunks:
-                yield chunk
-        return generate()
-
-    def token_counter(self, **kwargs):
-        self.counter_args = kwargs
-        return self.token_count
-
-
-async def invoke_provider_operation(
-    provider, operation, completion_request, telemetry
-):
-    if operation == "complete":
-        return await provider.complete(
-            completion_request, telemetry=telemetry
-        )
-    if operation == "stream":
-        return [
-            event
-            async for event in provider.stream(
-                completion_request, telemetry=telemetry
-            )
-        ]
-    return await provider.count_tokens(
-        completion_request, telemetry=telemetry
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ["complete", "stream"])
-@pytest.mark.parametrize(
-    ("enabled", "expected"),
-    [(True, "unavailable"), (False, "not_applicable"), (None, "not_applicable")],
-)
-async def test_operations_report_reasoning_state_once(
-    settings, operation, enabled, expected
-):
-    telemetry = RecordingTelemetry()
-    client = FakeClient(
-        response={
-            "id": "response-1",
-            "choices": [{
-                "message": {"content": "ok", "tool_calls": None},
-                "finish_reason": "stop",
-            }],
-            "usage": {},
-        },
-        chunks=[{"choices": [{"delta": {}, "finish_reason": "stop"}]}],
-    )
-
-    await invoke_provider_operation(
-        LiteLLMProvider(settings, client),
-        operation,
-        request(reasoning=ReasoningPolicy(enabled, None)),
-        telemetry,
-    )
-
-    assert telemetry.calls == [("set_reasoning_continuation", expected)]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ["complete", "stream"])
-async def test_operations_report_reasoning_before_translation_failure(
-    settings, monkeypatch, operation
-):
-    telemetry = RecordingTelemetry()
-    provider = LiteLLMProvider(settings, FakeClient())
-
-    def fail_build(*args, **kwargs):
-        raise RuntimeError("sensitive build failure")
-
-    monkeypatch.setattr(provider, "build_request", fail_build)
-
-    if operation == "stream":
-        await invoke_provider_operation(
-            provider, operation, request(), telemetry
-        )
-    else:
-        with pytest.raises(ProviderError):
-            await invoke_provider_operation(
-                provider, operation, request(), telemetry
-            )
-
-    assert telemetry.calls == [("set_reasoning_continuation", "unavailable")]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ["complete", "stream", "count_tokens"])
-async def test_telemetry_callback_failure_does_not_change_provider_behavior(
-    settings, operation, caplog
-):
-    client = FakeClient(
-        response={
-            "id": "response-1",
-            "choices": [{
-                "message": {"content": "ok", "tool_calls": None},
-                "finish_reason": "stop",
-            }],
-            "usage": {},
-        },
-        chunks=[{"choices": [{"delta": {}, "finish_reason": "stop"}]}],
-    )
-
-    with caplog.at_level(
-        logging.WARNING, logger="claude_code_proxy.performance"
-    ):
-        result = await invoke_provider_operation(
-            LiteLLMProvider(settings, client),
-            operation,
-            request(),
-            FailingTelemetry(),
-        )
-
-    if operation == "complete":
-        assert result == CompletionResponse(
-            "response-1",
-            "openai/gpt-5.6-sol",
-            (TextBlock("ok"),),
-            "end_turn",
-            TokenUsage.unavailable(),
-        )
-    elif operation == "stream":
-        assert result == [
-            StreamStart(),
-            StreamComplete("end_turn", TokenUsage.unavailable()),
-        ]
-    else:
-        assert result == 9
-
-    if operation == "count_tokens":
-        assert caplog.records == []
-    else:
-        assert caplog.records[-1].getMessage() == "telemetry callback failed"
-    assert "sensitive callback failure" not in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_count_tokens_does_not_report_reasoning_continuation(settings):
-    telemetry = RecordingTelemetry()
-
-    result = await LiteLLMProvider(
-        settings, FakeClient(token_count=17)
-    ).count_tokens(request(), telemetry=telemetry)
-
-    assert result == 17
-    assert telemetry.calls == []
 
 
 @pytest.mark.asyncio
@@ -462,17 +247,6 @@ async def test_stream_returns_semantic_text_events(settings):
         )
     ]
     assert events == [StreamStart(), TextDelta("hel"), TextDelta("lo"), StreamComplete("end_turn", TokenUsage(3, 2))]
-
-
-@pytest.mark.asyncio
-async def test_stream_without_usage_marks_fields_unavailable(settings):
-    client = FakeClient(chunks=[
-        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
-    ])
-
-    events = [event async for event in LiteLLMProvider(settings, client).stream(request())]
-
-    assert events[-1].usage.observed_fields == frozenset()
 
 
 @pytest.mark.asyncio
