@@ -16,7 +16,13 @@ from claude_code_proxy.control.client import (
     ControlUnavailable,
     IncompatibleProtocol,
 )
-from claude_code_proxy.control.schemas import HealthResponse, SessionResponse
+from claude_code_proxy.control.schemas import (
+    HealthResponse,
+    MetricAggregateResponse,
+    MetricResponse,
+    SessionResponse,
+)
+from claude_code_proxy.limits import MAX_CONTROL_INTEGER
 
 
 SOCKET_PATH = Path("/run/user/1000/claude-code-proxy/control.sock")
@@ -871,3 +877,71 @@ def test_close_is_idempotent_and_use_after_close_is_clear() -> None:
     assert transport.close_count == 1
     with pytest.raises(ControlError, match="closed"):
         client.health()
+
+
+def metric_response_payload(
+    status: str = "observed", value: object = 0
+) -> dict[str, object]:
+    return {"status": status, "value": value}
+
+
+def metric_aggregate_payload(value: object = 0) -> dict[str, object]:
+    return {
+        "value": value,
+        "observed_samples": 1,
+        "unavailable_samples": 0,
+        "not_applicable_samples": 0,
+    }
+
+
+def test_metric_response_enforces_status_value_contract() -> None:
+    assert MetricResponse.model_validate(metric_response_payload()).value == 0
+    unavailable = MetricResponse.model_validate(
+        metric_response_payload("unavailable", None)
+    )
+    not_applicable = MetricResponse.model_validate(
+        metric_response_payload("not_applicable", None)
+    )
+    assert unavailable.value is None
+    assert not_applicable.value is None
+    for payload in (
+        metric_response_payload("observed", None),
+        metric_response_payload("unavailable", 0),
+        metric_response_payload("not_applicable", 0),
+    ):
+        with pytest.raises(ValidationError):
+            MetricResponse.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,
+        -1,
+        "1",
+        MAX_CONTROL_INTEGER + 1,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+    ],
+)
+def test_metric_response_rejects_unsafe_numbers(value: object) -> None:
+    with pytest.raises(ValidationError):
+        MetricResponse.model_validate(metric_response_payload(value=value))
+
+
+def test_metric_aggregate_allows_large_total_but_bounds_samples() -> None:
+    assert MetricAggregateResponse.model_validate(
+        metric_aggregate_payload(MAX_CONTROL_INTEGER + 1)
+    ).value == MAX_CONTROL_INTEGER + 1
+    for value in (True, -1, "1", MAX_CONTROL_INTEGER + 1):
+        payload = metric_aggregate_payload()
+        payload["observed_samples"] = value
+        with pytest.raises(ValidationError):
+            MetricAggregateResponse.model_validate(payload)
+
+
+@pytest.mark.parametrize("value", [True, -1, "1", float("nan"), float("inf")])
+def test_metric_aggregate_rejects_invalid_values(value: object) -> None:
+    with pytest.raises(ValidationError):
+        MetricAggregateResponse.model_validate(metric_aggregate_payload(value))

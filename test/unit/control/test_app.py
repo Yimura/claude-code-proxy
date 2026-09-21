@@ -1,19 +1,37 @@
 from datetime import UTC, datetime, timedelta, timezone
 import json
+from types import SimpleNamespace
 
 from httpx import ASGITransport, AsyncClient
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 import pytest
 
 import claude_code_proxy.control.app as control_app_module
 from claude_code_proxy.control.app import create_control_app
 from claude_code_proxy.control.schemas import (
+    FailureDiagnosticResponse,
     HealthResponse,
+    MetricAggregateResponse,
+    MetricResponse,
+    PerformanceEventResponse,
+    PerformanceListResponse,
+    PerformanceResetResponse,
+    PerformanceStreamEvent,
+    ProcessIdentityResponse,
+    RequestPerformanceResponse,
     SessionCounts,
     SessionListResponse,
+    SessionPerformanceResponse,
+    SessionPerformanceViewResponse,
     SessionResponse,
 )
 from claude_code_proxy.domain.models import ClientIdentity
+from claude_code_proxy.failures import (
+    FailureCategory,
+    FailureDiagnostic,
+    FailureStage,
+)
+from claude_code_proxy.limits import MAX_CONTROL_INTEGER
 from claude_code_proxy.observability import (
     SessionMetadata,
     SessionRegistry,
@@ -684,3 +702,282 @@ async def test_control_app_normalizes_aware_datetimes_and_rejects_naive_ones() -
     )
     with pytest.raises(ValueError, match="clock result must be timezone-aware"):
         await request(naive_clock_app, "/v1/health")
+
+
+def process_payload() -> dict[str, object]:
+    return {"pid": 42, "started_at": "2026-01-02T03:00:00Z"}
+
+
+def failure_payload() -> dict[str, object]:
+    return {"category": "internal", "stage": "route", "code": "safe"}
+
+
+def metric_payload(
+    status: str = "observed", value: object = 0
+) -> dict[str, object]:
+    return {"status": status, "value": value}
+
+
+def aggregate_payload(value: object = 0) -> dict[str, object]:
+    return {
+        "value": value,
+        "observed_samples": 1,
+        "unavailable_samples": 0,
+        "not_applicable_samples": 0,
+    }
+
+
+def request_performance_payload() -> dict[str, object]:
+    metric = metric_payload()
+    return {
+        "id": "request-public",
+        "session_id": "session-public",
+        "operation": "messages",
+        "outcome": "completed",
+        "started_at": "2026-01-02T03:04:05Z",
+        "finished_at": "2026-01-02T03:04:06Z",
+        "duration": metric,
+        "upstream_duration": metric_payload(),
+        "ttft": metric_payload(),
+        "input_tokens": metric_payload(),
+        "output_tokens": metric_payload(),
+        "cache_read_tokens": metric_payload(),
+        "cache_creation_tokens": metric_payload(),
+        "reasoning_tokens": metric_payload(),
+        "tool_calls": metric_payload(),
+        "retries": metric_payload(),
+        "peak_concurrency": metric_payload(),
+        "reasoning_continuation": "not_applicable",
+        "failure": None,
+    }
+
+
+def session_performance_payload() -> dict[str, object]:
+    request_payload = request_performance_payload()
+    aggregate = aggregate_payload()
+    return {
+        "session_id": "session-public",
+        "requests": 1,
+        "active_requests": [],
+        "recent_requests": [request_payload],
+        "outcomes": {"completed": 1},
+        "input_tokens": aggregate,
+        "output_tokens": aggregate_payload(),
+        "cache_read_tokens": aggregate_payload(),
+        "cache_creation_tokens": aggregate_payload(),
+        "reasoning_tokens": aggregate_payload(),
+        "tool_calls": aggregate_payload(),
+        "retries": aggregate_payload(),
+        "current_concurrency": 0,
+        "peak_concurrency": 1,
+        "latest_request": request_payload,
+    }
+
+
+def performance_view_payload() -> dict[str, object]:
+    return {
+        "session": {
+            "id": "session-public",
+            "state": "idle",
+            "active_requests": 0,
+            "requests": 1,
+            "client_model": "client-model",
+            "model": "provider-model",
+            "provider": "provider",
+            "transport": "transport",
+            "effort": "high",
+            "context_window": 1000,
+            "first_seen": "2026-01-02T03:04:05Z",
+            "last_seen": "2026-01-02T03:04:06Z",
+            "elapsed_seconds": 1,
+            "last_result": "completed",
+        },
+        "performance": session_performance_payload(),
+    }
+
+
+def performance_list_payload() -> dict[str, object]:
+    return {
+        "process": process_payload(),
+        "captured_at": "2026-01-02T03:04:06Z",
+        "cursor": 1,
+        "sessions": [performance_view_payload()],
+    }
+
+
+def performance_event_payload() -> dict[str, object]:
+    return {
+        "process": process_payload(),
+        "sequence": 1,
+        "occurred_at": "2026-01-02T03:04:06Z",
+        "type": "completed",
+        "session_id": "session-public",
+        "request": request_performance_payload(),
+        "session": session_performance_payload(),
+    }
+
+
+def performance_reset_payload() -> dict[str, object]:
+    snapshot = performance_list_payload()
+    return {
+        "process": snapshot["process"],
+        "sequence": snapshot["cursor"],
+        "occurred_at": "2026-01-02T03:04:06Z",
+        "type": "reset",
+        "snapshot": snapshot,
+    }
+
+
+_PERFORMANCE_SCHEMA_CASES = (
+    (ProcessIdentityResponse, process_payload),
+    (MetricResponse, metric_payload),
+    (MetricAggregateResponse, aggregate_payload),
+    (FailureDiagnosticResponse, failure_payload),
+    (RequestPerformanceResponse, request_performance_payload),
+    (SessionPerformanceResponse, session_performance_payload),
+    (SessionPerformanceViewResponse, performance_view_payload),
+    (PerformanceListResponse, performance_list_payload),
+    (PerformanceEventResponse, performance_event_payload),
+    (PerformanceResetResponse, performance_reset_payload),
+)
+
+
+def test_stream_sequences_and_reset_consistency_are_validated() -> None:
+    event = performance_event_payload()
+    event["sequence"] = 0
+    with pytest.raises(ValidationError):
+        PerformanceEventResponse.model_validate(event)
+    reset = PerformanceResetResponse.model_validate(performance_reset_payload())
+    assert reset.sequence == 1
+    payload = performance_reset_payload()
+    payload["sequence"] = 0
+    payload["snapshot"]["cursor"] = 0
+    assert PerformanceResetResponse.model_validate(payload).sequence == 0
+    for field in ("sequence", "process"):
+        payload = performance_reset_payload()
+        payload[field] = 2 if field == "sequence" else {
+            "pid": 43,
+            "started_at": "2026-01-02T03:00:00Z",
+        }
+        with pytest.raises(ValidationError):
+            PerformanceResetResponse.model_validate(payload)
+
+
+def test_stream_event_alias_discriminates_ordinary_and_reset_events() -> None:
+    adapter = TypeAdapter(PerformanceStreamEvent)
+    ordinary = adapter.validate_python(performance_event_payload())
+    reset = adapter.validate_python(performance_reset_payload())
+    assert isinstance(ordinary, PerformanceEventResponse)
+    assert isinstance(reset, PerformanceResetResponse)
+
+
+def test_performance_datetimes_normalize_offsets_and_reject_naive_values() -> None:
+    utc = ProcessIdentityResponse.model_validate(
+        {"pid": 1, "started_at": "2026-01-02T03:04:05Z"}
+    )
+    offset = ProcessIdentityResponse.model_validate(
+        {"pid": 1, "started_at": "2026-01-02T05:04:05+02:00"}
+    )
+    assert utc.started_at == offset.started_at
+    assert offset.started_at.tzinfo is UTC
+    with pytest.raises(ValidationError):
+        ProcessIdentityResponse.model_validate(
+            {"pid": 1, "started_at": "2026-01-02T03:04:05"}
+        )
+
+
+@pytest.mark.parametrize(
+    ("model", "factory"),
+    _PERFORMANCE_SCHEMA_CASES,
+)
+@pytest.mark.parametrize("field", ["prompt", "raw_session_id", "provider_payload"])
+def test_performance_schemas_forbid_sensitive_extra_fields(
+    model, factory, field: str
+) -> None:
+    payload = factory()
+    payload[field] = "secret"
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        model.model_validate(payload)
+
+
+def test_session_performance_outcomes_are_closed_strict_and_bounded() -> None:
+    for outcomes in (
+        {"unknown": 1},
+        {"completed": True},
+        {"completed": "1"},
+        {"completed": -1},
+        {"completed": MAX_CONTROL_INTEGER + 1},
+    ):
+        payload = session_performance_payload()
+        payload["outcomes"] = outcomes
+        with pytest.raises(ValidationError):
+            SessionPerformanceResponse.model_validate(payload)
+
+
+def test_failure_diagnostic_maps_only_safe_structured_fields() -> None:
+    diagnostic = FailureDiagnostic(
+        FailureCategory.UPSTREAM_HTTP,
+        FailureStage.RESPONSE,
+        "provider_error",
+        provider_code="rate_limit",
+        exception_type="ProviderError",
+        location="module:function:10",
+    )
+    response = FailureDiagnosticResponse.model_validate(diagnostic)
+    assert response.model_dump(mode="json") == {
+        "category": "upstream_http",
+        "stage": "response",
+        "code": "provider_error",
+        "provider_code": "rate_limit",
+        "exception_type": "ProviderError",
+        "location": "module:function:10",
+    }
+    assert "message" not in FailureDiagnosticResponse.model_fields
+
+
+def test_real_registry_capture_converts_without_raw_content() -> None:
+    clock = RegistryClock()
+    sessions = registry(clock)
+    handle = sessions.begin(
+        metadata("raw-session-secret"), operation="count_tokens"
+    )
+    sessions.observer(handle).count_tokens(0)
+    sessions.finish(handle, "completed")
+    capture = sessions.performance_snapshots()
+    wrapped = SimpleNamespace(
+        process=SimpleNamespace(pid=42, started_at=clock.wall),
+        captured_at=capture.captured_at,
+        cursor=capture.cursor,
+        sessions=capture.sessions,
+    )
+
+    response = PerformanceListResponse.model_validate(wrapped, from_attributes=True)
+    dumped = response.model_dump(mode="json")
+    serialized = json.dumps(dumped)
+
+    performance = response.sessions[0].performance
+    assert performance.recent_requests == (performance.latest_request,)
+    recent = dumped["sessions"][0]["performance"]["recent_requests"][0]
+    assert recent["input_tokens"] == {"status": "observed", "value": 0}
+    input_tokens = dumped["sessions"][0]["performance"]["input_tokens"]
+    assert input_tokens["observed_samples"] == 1
+    assert handle.public_id in serialized
+    secrets = (
+        "raw-session-secret",
+        "prompt",
+        "raw_session_id",
+        "provider_payload",
+    )
+    for secret in secrets:
+        assert secret not in serialized
+
+
+@pytest.mark.parametrize(
+    ("model", "factory"),
+    _PERFORMANCE_SCHEMA_CASES,
+)
+def test_performance_schema_models_are_frozen(model, factory) -> None:
+    instance = model.model_validate(factory())
+    field = next(iter(model.model_fields))
+    with pytest.raises(ValidationError, match="frozen"):
+        setattr(instance, field, None)
