@@ -619,59 +619,38 @@ async def test_control_app_normalizes_aware_datetimes_and_rejects_naive_ones() -
 
 def process_payload() -> dict[str, object]:
     return {"pid": 42, "started_at": "2026-01-02T03:00:00Z"}
-
 def failure_payload() -> dict[str, object]:
     return {"category": "internal", "stage": "route", "code": "safe"}
-
 def metric_payload(status: str = "observed", value: object = 0) -> dict[str, object]:
     return {"status": status, "value": value}
-
 def aggregate_payload(value: object = 0) -> dict[str, object]:
     return {"value": value, "observed_samples": 1,
             "unavailable_samples": 0, "not_applicable_samples": 0}
-
+_REQUEST_METRICS = (
+    "duration", "upstream_duration", "ttft", "input_tokens", "output_tokens",
+    "cache_read_tokens", "cache_creation_tokens", "reasoning_tokens",
+    "tool_calls", "retries", "peak_concurrency",
+)
+_AGGREGATE_METRICS = (
+    "input_tokens", "output_tokens", "cache_read_tokens",
+    "cache_creation_tokens", "reasoning_tokens", "tool_calls", "retries",
+)
 def request_performance_payload() -> dict[str, object]:
-    metric = metric_payload()
     return {
-        "id": "request-public",
-        "session_id": "session-public",
-        "operation": "messages",
-        "outcome": "completed",
+        "id": "request-public", "session_id": "session-public",
+        "operation": "messages", "outcome": "completed",
         "started_at": "2026-01-02T03:04:05Z",
         "finished_at": "2026-01-02T03:04:06Z",
-        "duration": metric,
-        "upstream_duration": metric_payload(),
-        "ttft": metric_payload(),
-        "input_tokens": metric_payload(),
-        "output_tokens": metric_payload(),
-        "cache_read_tokens": metric_payload(),
-        "cache_creation_tokens": metric_payload(),
-        "reasoning_tokens": metric_payload(),
-        "tool_calls": metric_payload(),
-        "retries": metric_payload(),
-        "peak_concurrency": metric_payload(),
-        "reasoning_continuation": "not_applicable",
-        "failure": None,
+        **{name: metric_payload() for name in _REQUEST_METRICS},
+        "reasoning_continuation": "not_applicable", "failure": None,
     }
-
 def session_performance_payload() -> dict[str, object]:
-    request_payload = request_performance_payload()
-    aggregate = aggregate_payload()
+    request = request_performance_payload()
     return {
-        "session_id": "session-public",
-        "requests": 1,
-        "active_requests": [],
-        "recent_requests": [request_payload],
-        "outcomes": {"completed": 1},
-        "input_tokens": aggregate,
-        "output_tokens": aggregate_payload(),
-        "cache_read_tokens": aggregate_payload(),
-        "cache_creation_tokens": aggregate_payload(),
-        "reasoning_tokens": aggregate_payload(),
-        "tool_calls": aggregate_payload(),
-        "retries": aggregate_payload(),
-        "current_concurrency": 0,
-        "peak_concurrency": 1,
+        "session_id": "session-public", "requests": 1, "active_requests": [],
+        "recent_requests": [request], "outcomes": {"completed": 1},
+        **{name: aggregate_payload() for name in _AGGREGATE_METRICS},
+        "current_concurrency": 0, "peak_concurrency": 1,
         "latest_request": request_performance_payload(),
     }
 
@@ -837,6 +816,9 @@ def test_performance_schema_models_are_frozen(model, factory) -> None:
     ("path", "value"),
     [
         ("view.performance.session_id", "other"),
+        ("view.session.requests", 2),
+        ("view.session.active_requests", 1),
+        ("view.session.state", "active"),
         ("event.session_id", "other"),
         ("event.request.session_id", "other"),
         ("event.session.session_id", "other"),
@@ -848,7 +830,7 @@ def test_performance_schema_models_are_frozen(model, factory) -> None:
         ("active.request.id", "other"),
     ],
 )
-def test_performance_envelopes_reject_inconsistent_lifecycle(path: str, value: str) -> None:
+def test_performance_envelopes_reject_inconsistent_lifecycle(path: str, value: object) -> None:
     envelope, *parts = path.split(".")
     is_view = envelope == "view"
     model = SessionPerformanceViewResponse if is_view else PerformanceEventResponse
@@ -993,3 +975,24 @@ def test_session_performance_rejects_incoherent_snapshots() -> None:
     for payload in invalid:
         with pytest.raises(ValidationError):
             SessionPerformanceResponse.model_validate(payload)
+
+
+@pytest.mark.parametrize("location", ["active", "recent", "combined"])
+def test_session_performance_rejects_duplicate_request_ids(location: str) -> None:
+    payload = session_performance_payload()
+    if location == "active":
+        request = active_request_payload()
+        payload.update({"requests": 2, "active_requests": [request, request],
+                        "recent_requests": [], "outcomes": {},
+                        "current_concurrency": 2, "peak_concurrency": 2,
+                        "latest_request": request})
+    elif location == "recent":
+        request = request_performance_payload()
+        payload.update({"requests": 2, "recent_requests": [request, request],
+                        "outcomes": {"completed": 2}, "latest_request": request})
+    else:
+        payload.update({"requests": 2,
+                        "active_requests": [active_request_payload()],
+                        "outcomes": {"completed": 1}, "current_concurrency": 1})
+    with pytest.raises(ValidationError):
+        SessionPerformanceResponse.model_validate(payload)

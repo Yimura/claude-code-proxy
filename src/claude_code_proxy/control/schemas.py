@@ -350,6 +350,9 @@ class SessionPerformanceResponse(_TelemetryModel):
         _validate_request_collection(
             self.recent_requests, self.session_id, active=False
         )
+        requests = self.active_requests + self.recent_requests
+        if len({request.id for request in requests}) != len(requests):
+            raise ValueError("request IDs must be unique within the session snapshot")
         if self.current_concurrency != len(self.active_requests):
             raise ValueError("current concurrency must equal active requests")
         if self.peak_concurrency < self.current_concurrency:
@@ -372,6 +375,13 @@ class SessionPerformanceViewResponse(_TelemetryModel):
     def validate_session_identity(self) -> Self:
         if self.session.id != self.performance.session_id:
             raise ValueError("session identity must match performance identity")
+        if self.session.requests != self.performance.requests:
+            raise ValueError("session request counts must match")
+        if self.session.active_requests != self.performance.current_concurrency:
+            raise ValueError("session active request counts must match")
+        session_is_active = self.session.state == "active"
+        if session_is_active != (self.performance.current_concurrency > 0):
+            raise ValueError("session state must match current concurrency")
         return self
 
 
