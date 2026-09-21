@@ -1615,6 +1615,31 @@ async def test_count_tokens_applies_codex_agent_completion_guidance():
     assert captured[0].tools[1].description.endswith(TASK_OUTPUT_GUIDANCE)
 
 
+async def test_complete_without_telemetry_uses_legacy_stream_arity(monkeypatch):
+    async def stream(self, completion_request):
+        yield TextDelta("ok")
+        yield StreamComplete("end_turn", TokenUsage(1, 1))
+
+    monkeypatch.setattr(CodexProvider, "stream", stream)
+
+    result = await CodexProvider(Auth(), Client).complete(request())
+
+    assert result.content == (TextBlock("ok"),)
+
+
+async def test_count_tokens_without_telemetry_uses_legacy_counter_arity():
+    captured = []
+
+    async def local_counter(completion_request):
+        captured.append(completion_request)
+        return 8
+
+    provider = CodexProvider(Auth(), Client, local_counter)
+
+    assert await provider.count_tokens(request()) == 8
+    assert len(captured) == 1
+
+
 async def test_complete_forwards_telemetry_to_internal_stream(monkeypatch):
     telemetry = object()
     captured = []

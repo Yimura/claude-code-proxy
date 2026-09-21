@@ -34,6 +34,29 @@ class FakeProvider:
         return 7
 
 
+class LegacyProvider:
+    name = "legacy"
+
+    def __init__(self):
+        self.response = CompletionResponse(
+            "legacy-id",
+            "claude-sonnet",
+            (TextBlock("ok"),),
+            "end_turn",
+            TokenUsage(1, 1),
+        )
+        self.event = StreamComplete("end_turn", TokenUsage(1, 1))
+
+    async def complete(self, request):
+        return self.response
+
+    async def stream(self, request):
+        yield self.event
+
+    async def count_tokens(self, request):
+        return 11
+
+
 def make_request(model="claude-sonnet", **changes):
     request = CompletionRequest(
         original_model=model,
@@ -436,6 +459,37 @@ def lifecycle_service(provider):
 
 
 @pytest.mark.asyncio
+async def test_complete_without_telemetry_supports_legacy_provider_arity():
+    provider = LegacyProvider()
+
+    response = await lifecycle_service(provider).complete_prepared(make_request())
+
+    assert response is provider.response
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_without_telemetry_supports_legacy_provider_arity():
+    provider = LegacyProvider()
+
+    result = await lifecycle_service(provider).count_tokens_prepared(make_request())
+
+    assert result == 11
+
+
+@pytest.mark.asyncio
+async def test_stream_without_telemetry_supports_legacy_provider_arity():
+    provider = LegacyProvider()
+
+    events = [
+        event
+        async for event in lifecycle_service(provider).stream_prepared(make_request())
+    ]
+
+    assert events == [provider.event]
+    assert events[0] is provider.event
+
+
+@pytest.mark.asyncio
 async def test_complete_observes_lifecycle_in_order_and_forwards_telemetry():
     provider = LifecycleProvider()
     telemetry = RecordingTelemetry()
@@ -445,7 +499,8 @@ async def test_complete_observes_lifecycle_in_order_and_forwards_telemetry():
     )
 
     assert response is provider.response_value
-    assert provider.last_telemetry is telemetry
+    assert provider.last_telemetry is not telemetry
+    assert provider.last_telemetry is not None
     assert telemetry.calls == [
         ("upstream_started", None),
         ("response", response),
@@ -489,7 +544,8 @@ async def test_count_tokens_observes_lifecycle_and_preserves_outcome(fails):
     else:
         assert await operation == 23
 
-    assert provider.last_telemetry is telemetry
+    assert provider.last_telemetry is not telemetry
+    assert provider.last_telemetry is not None
     assert telemetry.calls == [
         ("upstream_started", None),
         ("upstream_finished", None),
@@ -512,7 +568,8 @@ async def test_stream_observes_events_before_yield_without_replacing_them():
 
     assert events[0] is first
     assert events[1] is second
-    assert provider.last_telemetry is telemetry
+    assert provider.last_telemetry is not telemetry
+    assert provider.last_telemetry is not None
     assert provider.close_count == 1
     assert telemetry.calls == [
         ("upstream_started", None),
@@ -597,6 +654,107 @@ async def test_stream_cancellation_propagates_and_finishes_once():
     ]
 
 
+PROVIDER_CALLBACKS = (
+    "mark_retries_supported",
+    "record_retry",
+    "set_reasoning_continuation",
+)
+
+
+class ProviderCallbackProvider(LifecycleProvider):
+    @staticmethod
+    def notify_provider_callbacks(telemetry):
+        telemetry.mark_retries_supported()
+        telemetry.record_retry()
+        telemetry.set_reasoning_continuation("expected")
+
+    async def complete(self, request, telemetry=None):
+        self.notify_provider_callbacks(telemetry)
+        return await super().complete(request, telemetry)
+
+    async def count_tokens(self, request, telemetry=None):
+        self.notify_provider_callbacks(telemetry)
+        return await super().count_tokens(request, telemetry)
+
+    async def stream(self, request, telemetry=None):
+        self.notify_provider_callbacks(telemetry)
+        async for event in super().stream(request, telemetry):
+            yield event
+
+
+def assert_provider_callbacks_isolated(provider, telemetry, caplog):
+    assert provider.last_telemetry is not telemetry
+    assert provider.last_telemetry is not None
+    adapter_calls = [
+        name for name, _ in telemetry.calls if name in PROVIDER_CALLBACKS
+    ]
+    assert adapter_calls == list(PROVIDER_CALLBACKS)
+    assert caplog.messages == ["telemetry callback failed"] * 3
+
+
+@pytest.mark.asyncio
+async def test_complete_isolates_provider_telemetry_callbacks(caplog):
+    provider = ProviderCallbackProvider()
+    telemetry = RecordingTelemetry(PROVIDER_CALLBACKS)
+
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.performance"):
+        response = await lifecycle_service(provider).complete_prepared(
+            make_request(), telemetry=telemetry
+        )
+
+    assert response is provider.response_value
+    assert_provider_callbacks_isolated(provider, telemetry, caplog)
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_isolates_provider_telemetry_callbacks(caplog):
+    provider = ProviderCallbackProvider(count=23)
+    telemetry = RecordingTelemetry(PROVIDER_CALLBACKS)
+
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.performance"):
+        result = await lifecycle_service(provider).count_tokens_prepared(
+            make_request(), telemetry=telemetry
+        )
+
+    assert result == 23
+    assert_provider_callbacks_isolated(provider, telemetry, caplog)
+
+
+@pytest.mark.asyncio
+async def test_stream_isolates_provider_telemetry_callbacks(caplog):
+    event = StreamComplete("end_turn", TokenUsage(1, 1))
+    provider = ProviderCallbackProvider(events=(event,))
+    telemetry = RecordingTelemetry(PROVIDER_CALLBACKS)
+
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.performance"):
+        events = [
+            item
+            async for item in lifecycle_service(provider).stream_prepared(
+                make_request(), telemetry=telemetry
+            )
+        ]
+
+    assert events == [event]
+    assert events[0] is event
+    assert_provider_callbacks_isolated(provider, telemetry, caplog)
+
+
+@pytest.mark.asyncio
+async def test_provider_callback_failures_preserve_provider_error(caplog):
+    error = ProviderError("safe", provider="fake", status_code=503)
+    provider = ProviderCallbackProvider(complete_error=error)
+    telemetry = RecordingTelemetry(PROVIDER_CALLBACKS)
+
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.performance"):
+        with pytest.raises(ProviderError) as caught:
+            await lifecycle_service(provider).complete_prepared(
+                make_request(), telemetry=telemetry
+            )
+
+    assert caught.value is error
+    assert_provider_callbacks_isolated(provider, telemetry, caplog)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failing_callback",
@@ -619,7 +777,7 @@ async def test_complete_callback_failures_are_isolated_and_safely_logged(
         "response",
         "upstream_finished",
     ]
-    assert "RuntimeError" in caplog.text
+    assert caplog.messages == ["telemetry callback failed"]
     assert "telemetry-secret-marker" not in caplog.text
     assert "response-id" not in caplog.text
     assert "hi" not in caplog.text
@@ -653,6 +811,7 @@ async def test_stream_callback_failure_keeps_event_and_cleanup(
         "stream_event",
         "upstream_finished",
     ]
+    assert caplog.messages == ["telemetry callback failed"]
     assert "telemetry-secret-marker" not in caplog.text
 
 
@@ -776,6 +935,24 @@ async def test_none_telemetry_preserves_provider_results_and_event_identity():
     assert events[0] is stream_event
     assert response_provider.last_telemetry is None
     assert stream_provider.last_telemetry is None
+
+
+def test_notify_telemetry_logs_only_fixed_warning(caplog):
+    marker = "callback-secret\n\x1b[31m" + "x" * 500
+    hostile_error = type(marker, (Exception,), {})
+
+    class HostileTelemetry:
+        def upstream_started(self):
+            raise hostile_error
+
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.performance"):
+        notify_telemetry(HostileTelemetry(), "upstream_started")
+
+    assert caplog.messages == ["telemetry callback failed"]
+    assert marker not in caplog.text
+    assert "callback-secret" not in caplog.text
+    assert "\x1b" not in caplog.text
+    assert len(caplog.messages[0]) == len("telemetry callback failed")
 
 
 def test_notify_telemetry_does_not_swallow_cancellation():

@@ -65,9 +65,11 @@ class CodexProvider:
         request: CompletionRequest,
         telemetry: ProviderTelemetry | None = None,
     ):
-        events = [
-            event async for event in self.stream(request, telemetry=telemetry)
-        ]
+        if telemetry is None:
+            stream = self.stream(request)
+        else:
+            stream = self.stream(request, telemetry=telemetry)
+        events = [event async for event in stream]
         error = next((event for event in events if isinstance(event, StreamError)), None)
         if error:
             raise ProviderError(
@@ -387,9 +389,10 @@ class CodexProvider:
     ) -> int:
         if self._token_counter is None:
             return 1000
-        return await self._token_counter(
-            reconcile_codex_request(request), telemetry=telemetry
-        )
+        reconciled = reconcile_codex_request(request)
+        if telemetry is None:
+            return await self._token_counter(reconciled)
+        return await self._token_counter(reconciled, telemetry=telemetry)
 
     async def _http_error(self, response) -> ProviderError:
         status_code = response.status_code

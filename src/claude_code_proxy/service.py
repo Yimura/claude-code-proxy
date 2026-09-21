@@ -11,7 +11,11 @@ from .domain.models import (
     StreamEvent,
 )
 from .model_mapping import ModelResolver
-from .performance import RequestTelemetry, notify_telemetry
+from .performance import (
+    RequestTelemetry,
+    SafeProviderTelemetry,
+    notify_telemetry,
+)
 from .prompt_identity import reconcile_message_identities, reconcile_system_identity
 from .providers.base import Provider, ProviderError, protocol_error, stream_error_from_exception
 from .reasoning import resolve_reasoning_policy
@@ -72,7 +76,12 @@ class ProxyService:
         provider = self.provider_for(request)
         notify_telemetry(telemetry, "upstream_started")
         try:
-            response = await provider.complete(request, telemetry=telemetry)
+            if telemetry is None:
+                response = await provider.complete(request)
+            else:
+                response = await provider.complete(
+                    request, telemetry=SafeProviderTelemetry(telemetry)
+                )
             notify_telemetry(telemetry, "response", response)
             return response
         finally:
@@ -109,7 +118,11 @@ class ProxyService:
         provider = self.provider_for(request)
         notify_telemetry(telemetry, "upstream_started")
         try:
-            return await provider.count_tokens(request, telemetry=telemetry)
+            if telemetry is None:
+                return await provider.count_tokens(request)
+            return await provider.count_tokens(
+                request, telemetry=SafeProviderTelemetry(telemetry)
+            )
         finally:
             notify_telemetry(telemetry, "upstream_finished")
 
@@ -120,7 +133,12 @@ async def _provider_stream(
     telemetry: RequestTelemetry | None,
 ) -> AsyncIterator[StreamEvent]:
     try:
-        events = provider.stream(request, telemetry=telemetry)
+        if telemetry is None:
+            events = provider.stream(request)
+        else:
+            events = provider.stream(
+                request, telemetry=SafeProviderTelemetry(telemetry)
+            )
     except Exception as error:
         yield stream_error_from_exception(error, provider=provider.name)
         return

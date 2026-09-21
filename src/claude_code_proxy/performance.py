@@ -82,10 +82,27 @@ def notify_telemetry(
     try:
         callback = getattr(telemetry, method_name)
         callback(*args)
-    except Exception as error:
-        logger.warning(
-            "telemetry callback failed exception=%s",
-            type(error).__name__,
+    except Exception:
+        logger.warning("telemetry callback failed")
+
+
+@dataclass(frozen=True, slots=True)
+class SafeProviderTelemetry:
+    """Isolate provider telemetry callbacks from request behavior."""
+
+    _telemetry: ProviderTelemetry
+
+    def mark_retries_supported(self) -> None:
+        notify_telemetry(self._telemetry, "mark_retries_supported")
+
+    def record_retry(self) -> None:
+        notify_telemetry(self._telemetry, "record_retry")
+
+    def set_reasoning_continuation(
+        self, value: ReasoningContinuation
+    ) -> None:
+        notify_telemetry(
+            self._telemetry, "set_reasoning_continuation", value
         )
 
 
