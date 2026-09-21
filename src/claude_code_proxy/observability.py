@@ -15,6 +15,7 @@ from .domain.models import ClientIdentity, CompletionResponse, StreamEvent
 from .domain.models import TokenUsage, ToolUseStart
 from .event_journal import EventJournal, EventReservation, EventType, JournalEvent, SessionEventIdentity, Subscription
 from .failures import FailureDiagnostic
+from .finalization import FinalizationResult, validate_finalization
 from .limits import MAX_CONTROL_INTEGER
 from .performance import OperationKind, ReasoningContinuation, RequestOutcome, RequestPerformance, RequestPerformanceSnapshot
 from .performance import RequestTelemetryObserver, SessionPerformance, SessionPerformanceSnapshot, validate_clock_sample
@@ -579,44 +580,58 @@ class SessionRegistry:
         result: RequestOutcome,
         failure: FailureDiagnostic | None = None,
     ) -> RequestPerformanceSnapshot | None:
-        _validate_terminal_outcome(result)
+        return self.finish_with_status(handle, result, failure).performance
+
+    def finish_with_status(
+        self,
+        handle: ObservationHandle,
+        result: RequestOutcome,
+        failure: FailureDiagnostic | None = None,
+    ) -> FinalizationResult:
+        validate_finalization(result, failure)
         with self._lock:
             if not self._performance_enabled:
                 return self._finish_without_performance_locked(handle, result)
-            target = self._request_locked(handle)
-            if target is None:
-                return None
-            record, request = target
-            finished_at = self._wall_clock()
-            finished_monotonic = self._monotonic_clock()
-            with self._events.reserve(1) as reservation:
-                request.finish(
-                    result, finished_at, finished_monotonic, failure
-                )
-                assert record.performance is not None
-                terminal = record.performance.add_finalized(request)
-                if terminal is None:
-                    raise RuntimeError(
-                        "request finalization invariant violated"
-                    )
-                self._finish_base_locked(
-                    record, handle, finished_at, finished_monotonic, result
-                )
-                self._commit_events_locked(
-                    reservation, record, request, (result,),
-                    finished_at, finished_monotonic,
-                )
-                assert record.progress_at is not None
-                record.progress_at.pop(handle.request_id, None)
-                self._retain_finished_locked(handle, record)
-                return terminal
+            return self._finish_with_performance_locked(
+                handle, result, failure
+            )
+
+    def _finish_with_performance_locked(
+        self,
+        handle: ObservationHandle,
+        result: RequestOutcome,
+        failure: FailureDiagnostic | None,
+    ) -> FinalizationResult:
+        target = self._request_locked(handle)
+        if target is None:
+            return FinalizationResult(False, None)
+        record, request = target
+        finished_at = self._wall_clock()
+        finished_monotonic = self._monotonic_clock()
+        with self._events.reserve(1) as reservation:
+            request.finish(result, finished_at, finished_monotonic, failure)
+            assert record.performance is not None
+            terminal = record.performance.add_finalized(request)
+            if terminal is None:
+                raise RuntimeError("request finalization invariant violated")
+            self._finish_base_locked(
+                record, handle, finished_at, finished_monotonic, result
+            )
+            self._commit_events_locked(
+                reservation, record, request, (result,),
+                finished_at, finished_monotonic,
+            )
+            assert record.progress_at is not None
+            record.progress_at.pop(handle.request_id, None)
+            self._retain_finished_locked(handle, record)
+            return FinalizationResult(True, terminal)
 
     def _finish_without_performance_locked(
         self, handle: ObservationHandle, result: RequestOutcome
-    ) -> None:
+    ) -> FinalizationResult:
         record = self._active_record_locked(handle)
         if record is None:
-            return None
+            return FinalizationResult(False, None)
         finished_at = self._wall_clock()
         finished_monotonic = validate_clock_sample(
             finished_at, self._monotonic_clock()
@@ -625,7 +640,7 @@ class SessionRegistry:
             record, handle, finished_at, finished_monotonic, result
         )
         self._retain_finished_locked(handle, record)
-        return None
+        return FinalizationResult(True, None)
 
     def _finish_base_locked(
         self,
@@ -907,16 +922,6 @@ def _to_handle(
         parent_agent_public_id=parent_public_id,
         agent_is_new=agent_is_new,
     )
-
-
-def _validate_terminal_outcome(outcome: object) -> None:
-    if outcome not in {
-        "completed",
-        "failed",
-        "cancelled",
-        "client_disconnected",
-    }:
-        raise ValueError("finish requires a terminal outcome")
 
 
 def _validate_count_tokens(value: object) -> None:

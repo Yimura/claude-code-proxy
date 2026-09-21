@@ -109,7 +109,7 @@ class RecordingSessionRegistry(SessionRegistry):
         self.finish_calls: list[tuple[ObservationHandle, RequestOutcome]] = []
         self.finish_failures: list[FailureDiagnostic | None] = []
 
-    def finish(
+    def finish_with_status(
         self,
         handle: ObservationHandle,
         result: RequestOutcome,
@@ -117,7 +117,7 @@ class RecordingSessionRegistry(SessionRegistry):
     ):
         self.finish_calls.append((handle, result))
         self.finish_failures.append(failure)
-        return super().finish(handle, result, failure)
+        return super().finish_with_status(handle, result, failure)
 
 
 def registry() -> RecordingSessionRegistry:
@@ -1595,7 +1595,7 @@ def test_provider_failure_preserves_status_and_records_safe_diagnostic_once(capl
 
 
 class FailingFinalizationRegistry(RecordingSessionRegistry):
-    def finish(self, handle, result, failure=None):
+    def finish_with_status(self, handle, result, failure=None):
         raise RuntimeError("FINALIZATION_SECRET")
 
 

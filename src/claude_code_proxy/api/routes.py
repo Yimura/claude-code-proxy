@@ -701,12 +701,13 @@ def _finalize_request(
     failure: FailureDiagnostic | None = None,
 ) -> bool:
     try:
-        snapshot = sessions.finish(observation, outcome, failure)
-        if snapshot is None:
-            return False
-        if sessions.performance_logging_enabled:
-            log_performance(snapshot, context)
-        return True
+        result = sessions.finish_with_status(observation, outcome, failure)
+        if (
+            result.performance is not None
+            and sessions.performance_logging_enabled
+        ):
+            log_performance(result.performance, context)
+        return result.finalized
     except BaseException:
         log_finalization_failure()
         return False
