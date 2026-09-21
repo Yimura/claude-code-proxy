@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import selectors
 import signal
 import socket
 import subprocess
@@ -14,7 +15,15 @@ import time
 from typing import cast
 
 import httpx
+from pydantic import TypeAdapter
 import pytest
+
+from claude_code_proxy.control.schemas import (
+    PerformanceEventResponse,
+    PerformanceListResponse,
+    PerformanceResetResponse,
+    PerformanceStreamEvent,
+)
 
 _STARTUP_TIMEOUT_SECONDS = 15.0
 _STARTUP_STABILITY_SECONDS = 0.5
@@ -187,6 +196,8 @@ def _launch_proxy_attempt(
     mapping_path: Path,
     executable: Path,
     attempt: int,
+    *,
+    performance: str | None = None,
 ) -> _RunningProxy:
     attempt_path = tmp_path / f"proxy-attempt-{attempt}"
     attempt_path.mkdir(mode=0o700)
@@ -201,8 +212,11 @@ def _launch_proxy_attempt(
         port,
     )
     reservation.close()
+    command = [str(executable), "proxy"]
+    if performance is not None:
+        command.extend(("--performance", performance))
     process = subprocess.Popen(
-        [str(executable), "proxy"],
+        command,
         cwd=tmp_path,
         env=environment,
         stdout=subprocess.PIPE,
@@ -236,15 +250,26 @@ def _start_proxy_with_retries(
     mapping_path: Path,
     executable: Path,
     max_attempts: int = _STARTUP_ATTEMPTS,
+    *,
+    performance: str | None = None,
 ) -> _RunningProxy:
     address_conflicts: list[str] = []
     for attempt in range(1, max_attempts + 1):
-        running = _launch_proxy_attempt(
-            tmp_path,
-            mapping_path,
-            executable,
-            attempt,
-        )
+        if performance is not None:
+            running = _launch_proxy_attempt(
+                tmp_path,
+                mapping_path,
+                executable,
+                attempt,
+                performance=performance,
+            )
+        else:
+            running = _launch_proxy_attempt(
+                tmp_path,
+                mapping_path,
+                executable,
+                attempt,
+            )
         try:
             _wait_for_both_servers(running)
             return running
@@ -276,8 +301,12 @@ def _proxy_process(
     tmp_path: Path,
     mapping_path: Path,
     executable: Path,
+    *,
+    performance: str | None = None,
 ) -> Iterator[_RunningProxy]:
-    running = _start_proxy_with_retries(tmp_path, mapping_path, executable)
+    running = _start_proxy_with_retries(
+        tmp_path, mapping_path, executable, performance=performance
+    )
     failure: Exception | None = None
     try:
         yield running
@@ -330,6 +359,12 @@ def _assert_http_contract(running: _RunningProxy) -> None:
     assert health.json()["inactive_limit"] == 2
     assert health.json()["sessions"] == {"active": 0, "retained": 0}
     assert sessions.json()["sessions"] == []
+    assert _control_get(
+        running.socket_path, "/v1/performance"
+    ).status_code == 404
+    assert _control_get(
+        running.socket_path, "/v1/performance/events"
+    ).status_code == 404
 
 
 def _run_ps(
@@ -356,6 +391,74 @@ def _run_ps(
         timeout=_PROCESS_TIMEOUT_SECONDS,
         check=False,
     )
+
+
+def _run_perf(
+    tmp_path: Path,
+    executable: Path,
+    running: _RunningProxy,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            str(executable),
+            "perf",
+            "--socket",
+            str(running.socket_path),
+            "--format",
+            "json",
+        ],
+        cwd=tmp_path,
+        env=running.environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        timeout=_PROCESS_TIMEOUT_SECONDS,
+        check=False,
+    )
+
+
+def _assert_perf_watch_reset_and_signal_shutdown(
+    tmp_path: Path,
+    executable: Path,
+    running: _RunningProxy,
+) -> None:
+    process = subprocess.Popen(
+        [
+            str(executable),
+            "perf",
+            "--watch",
+            "--format",
+            "json",
+            "--socket",
+            str(running.socket_path),
+        ],
+        cwd=tmp_path,
+        env=running.environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+    )
+    assert process.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    try:
+        assert selector.select(timeout=_PROCESS_TIMEOUT_SECONDS), (
+            "perf --watch did not emit its initial reset before the deadline"
+        )
+        reset = PerformanceResetResponse.model_validate_json(
+            process.stdout.readline()
+        )
+        assert reset.type == "reset"
+        process.send_signal(signal.SIGINT)
+        assert process.wait(timeout=_PROCESS_TIMEOUT_SECONDS) == 0
+        _, stderr = process.communicate(timeout=1)
+        assert stderr == ""
+    finally:
+        selector.close()
+        _stop_process(process)
 
 
 def _assert_ps_is_empty(
@@ -400,14 +503,10 @@ class _PollingProcess:
         return self.returncode
 
 
-def test_responsive_port_collision_exits_during_stabilization_and_retries(
+def _collision_proxies(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    starts: list[int] = []
-    cleaned: list[_RunningProxy] = []
+) -> tuple[_RunningProxy, _RunningProxy, _PollingProcess]:
     first_process = _PollingProcess(1001, [None, 1])
-    second_process = _PollingProcess(1002, [None, None])
     first = _RunningProxy(
         cast(subprocess.Popen[str], first_process),
         {},
@@ -415,11 +514,21 @@ def test_responsive_port_collision_exits_during_stabilization_and_retries(
         10001,
     )
     second = _RunningProxy(
-        cast(subprocess.Popen[str], second_process),
+        cast(subprocess.Popen[str], _PollingProcess(1002, [None, None])),
         {},
         tmp_path / "second.sock",
         10002,
     )
+    return first, second, first_process
+
+
+def test_responsive_port_collision_exits_during_stabilization_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    starts: list[int] = []
+    cleaned: list[_RunningProxy] = []
+    first, second, first_process = _collision_proxies(tmp_path)
     by_socket = {first.socket_path: first, second.socket_path: second}
 
     def launch(_tmp_path, _mapping_path, _executable, attempt):
@@ -621,6 +730,156 @@ def test_foreground_proxy_serves_isolated_public_and_control_planes(
         _assert_ps_is_empty(tmp_path, executable, running)
         assert not fake_marker.exists(), "ambient PATH executable was invoked"
         _assert_clean_shutdown(running)
+
+
+def _assert_performance_stream(
+    running: _RunningProxy,
+    snapshot: PerformanceListResponse,
+    headers: dict[str, str],
+    body: dict[str, object],
+) -> None:
+    transport = httpx.HTTPTransport(uds=str(running.socket_path))
+    with httpx.Client(
+        transport=transport,
+        base_url="http://control",
+        timeout=httpx.Timeout(2.0),
+        trust_env=False,
+    ) as control_client:
+        with control_client.stream("GET", "/v1/performance/events") as stream:
+            assert stream.status_code == 200
+            assert stream.headers["content-type"].startswith(
+                "application/x-ndjson"
+            )
+            lines = stream.iter_lines()
+            reset = PerformanceResetResponse.model_validate_json(next(lines))
+            assert reset.sequence == snapshot.cursor
+            with httpx.Client(timeout=5.0, trust_env=False) as public_client:
+                response = public_client.post(
+                    f"http://127.0.0.1:{running.port}/v1/messages/count_tokens",
+                    headers=headers,
+                    json=body,
+                )
+            assert response.status_code == 200
+            events: list[PerformanceEventResponse] = []
+            for line in lines:
+                if not line:
+                    continue
+                event = TypeAdapter(PerformanceStreamEvent).validate_json(line)
+                assert isinstance(event, PerformanceEventResponse)
+                events.append(event)
+                if event.type == "completed":
+                    break
+            assert [event.sequence for event in events] == list(
+                range(reset.sequence + 1, reset.sequence + len(events) + 1)
+            )
+            assert {event.type for event in events} >= {
+                "request_started",
+                "completed",
+            }
+            assert all(event.process == reset.process for event in events)
+
+
+def test_performance_snapshot_and_events_stream_over_control_uds(
+    tmp_path: Path,
+) -> None:
+    mapping_path = tmp_path / "models.json"
+    _write_mapping(mapping_path)
+    (tmp_path / "home").mkdir()
+    executable = _cli_executable()
+    headers = {"x-claude-code-session-id": "stream-integration-session"}
+    body = {
+        "model": "claude-haiku",
+        "messages": [{"role": "user", "content": "count me"}],
+    }
+
+    with _proxy_process(
+        tmp_path, mapping_path, executable, performance="collector"
+    ) as running:
+        health = _control_get(running.socket_path, "/v1/health")
+        assert health.json()["capabilities"] == [
+            "sessions", "agents", "performance", "performance_events"
+        ]
+        response = _control_get(running.socket_path, "/v1/performance")
+        assert response.status_code == 200
+        snapshot = PerformanceListResponse.model_validate(response.json())
+        _assert_performance_stream(running, snapshot, headers, body)
+
+        perf_result = _run_perf(tmp_path, executable, running)
+        assert perf_result.returncode == 0, perf_result.stderr
+        perf_payload = json.loads(perf_result.stdout)
+        assert perf_payload["sessions"][0]["performance"][
+            "latest_request"
+        ]["operation"] == "count_tokens"
+        _assert_perf_watch_reset_and_signal_shutdown(
+            tmp_path, executable, running
+        )
+        assert _control_get(running.socket_path, "/v1/health").status_code == 200
+        assert running.process.poll() is None
+        _assert_clean_shutdown(running)
+        stdout, stderr = running.process.communicate(timeout=1)
+        assert "performance outcome=" not in stdout + stderr
+
+
+def test_default_mode_keeps_perf_disabled_and_terminal_logs_quiet(
+    tmp_path: Path,
+) -> None:
+    mapping_path = tmp_path / "models.json"
+    _write_mapping(mapping_path)
+    (tmp_path / "home").mkdir()
+    executable = _cli_executable()
+    running = _start_proxy_with_retries(tmp_path, mapping_path, executable)
+    stdout = stderr = ""
+    try:
+        _assert_http_contract(running)
+        with httpx.Client(timeout=5.0, trust_env=False) as client:
+            response = client.post(
+                f"http://127.0.0.1:{running.port}/v1/messages/count_tokens",
+                headers={"x-claude-code-session-id": "default-off-session"},
+                json={
+                    "model": "claude-haiku",
+                    "messages": [{"role": "user", "content": "count me"}],
+                },
+            )
+        assert response.status_code == 200
+        sessions = _control_get(running.socket_path, "/v1/sessions").json()
+        assert sessions["sessions"][0]["requests"] == 1
+
+        perf_result = _run_perf(tmp_path, executable, running)
+        assert perf_result.returncode == 1
+        assert "proxy --performance collector" in perf_result.stderr
+        _assert_clean_shutdown(running)
+    finally:
+        stdout, stderr = _cleanup_running_proxy(running)
+
+    assert "performance outcome=" not in stdout + stderr
+
+
+def test_logging_mode_emits_one_terminal_performance_record(
+    tmp_path: Path,
+) -> None:
+    mapping_path = tmp_path / "models.json"
+    _write_mapping(mapping_path)
+    (tmp_path / "home").mkdir()
+    executable = _cli_executable()
+    running = _start_proxy_with_retries(
+        tmp_path, mapping_path, executable, performance="logging"
+    )
+    stdout = stderr = ""
+    try:
+        with httpx.Client(timeout=5.0, trust_env=False) as client:
+            response = client.post(
+                f"http://127.0.0.1:{running.port}/v1/messages/count_tokens",
+                json={
+                    "model": "claude-haiku",
+                    "messages": [{"role": "user", "content": "count me"}],
+                },
+            )
+        assert response.status_code == 200
+        _assert_clean_shutdown(running)
+    finally:
+        stdout, stderr = _cleanup_running_proxy(running)
+
+    assert (stdout + stderr).count("performance outcome=completed") == 1
 
 
 def test_agent_identity_reaches_control_json_and_nested_ps(

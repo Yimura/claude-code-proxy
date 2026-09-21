@@ -1,17 +1,14 @@
 import asyncio
-from datetime import UTC, datetime
 import json
 import logging
+from datetime import UTC, datetime
 
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
 import claude_code_proxy.api.routes as routes_module
 from claude_code_proxy import cli as cli_module
-from claude_code_proxy.api.routes import build_router
-from claude_code_proxy.config import ModelConfig, ModelDefinition
 from claude_code_proxy.control.app import create_control_app
 from claude_code_proxy.control.schemas import SessionListResponse
 from claude_code_proxy.domain.models import (
@@ -29,138 +26,24 @@ from claude_code_proxy.failures import (
     FailureDiagnostic,
     FailureStage,
 )
-from claude_code_proxy.logging import (
-    RequestLogContext,
-    SessionIdentity,
-    observe_stream,
-    request_logging_middleware,
-)
-from claude_code_proxy.observability import (
-    ObservationHandle,
-    SessionMetadata,
-    SessionRegistry,
-    SessionResult,
-)
-from claude_code_proxy.model_mapping import ModelResolver
 from claude_code_proxy.providers.base import ProviderError
-from claude_code_proxy.reasoning import MappingEntry
-from claude_code_proxy.service import ProxyService
 
-
-class Provider:
-    name = "fake"
-
-    def __init__(
-        self,
-        error=None,
-        *,
-        count_error=None,
-        stream_events=None,
-        stream_error=None,
-    ):
-        self.error = error
-        self.count_error = count_error
-        self.stream_events = stream_events
-        self.stream_error = stream_error
-        self.requests = []
-
-    async def complete(self, request):
-        self.requests.append(request)
-        if self.error:
-            raise self.error
-        return CompletionResponse(
-            "msg-1",
-            request.response_model,
-            (TextBlock("hello"),),
-            "end_turn",
-            TokenUsage(2, 1),
-        )
-
-    async def stream(self, request):
-        if self.stream_error:
-            raise self.stream_error
-        if self.stream_events is not None:
-            for event in self.stream_events:
-                yield event
-            return
-        yield TextDelta("hello")
-        yield StreamComplete("end_turn", TokenUsage(2, 1))
-
-    async def count_tokens(self, request):
-        if self.count_error:
-            raise self.count_error
-        return 7
-
-
-class RecordingSessionRegistry(SessionRegistry):
-    def __init__(self) -> None:
-        super().__init__(100, secret=b"x" * 32)
-        self.finish_calls: list[tuple[ObservationHandle, SessionResult]] = []
-
-    def finish(
-        self, handle: ObservationHandle, result: SessionResult
-    ) -> None:
-        self.finish_calls.append((handle, result))
-        super().finish(handle, result)
-
-
-def registry() -> RecordingSessionRegistry:
-    return RecordingSessionRegistry()
-
-
-def assert_finished_once(
-    sessions: RecordingSessionRegistry, expected: SessionResult
-) -> None:
-    assert len(sessions.finish_calls) == 1
-    handle, result = sessions.finish_calls[0]
-    assert handle.public_id == sessions.snapshots()[0].id
-    assert result == expected
-
-
-def application(
-    provider=None, *, sessions=None, with_middleware=False, config=None
-) -> FastAPI:
-    provider = provider or Provider()
-    config = config or ModelConfig({}, {}, {})
-    service = ProxyService(ModelResolver(config), "litellm", provider, provider)
-    app = FastAPI()
-    sessions = sessions or registry()
-    if with_middleware:
-        app.middleware("http")(request_logging_middleware(sessions))
-    app.include_router(build_router(service, sessions))
-    return app
-
-
-def client(provider=None, *, sessions=None, with_middleware=False, config=None):
-    app = application(
-        provider,
-        sessions=sessions,
-        with_middleware=with_middleware,
-        config=config,
-    )
-    return TestClient(app)
-
-
-def mapped_config():
-    return ModelConfig(
-        models={
-            "sol": ModelDefinition(
-                target="openai/gpt-5.6-sol", context_window=1_000_000
-            )
-        },
-        tiers={"big": "sol"},
-        mappings={"sonnet": MappingEntry(tier="big", effort="high")},
-    )
-
-
-def messages_payload(**changes):
-    payload = {
-        "model": "claude-sonnet",
-        "max_tokens": 10,
-        "messages": [{"role": "user", "content": "hi"}],
-    }
-    payload.update(changes)
-    return payload
+from test.unit.api.route_test_support import (
+    ClosingEvents,
+    DisconnectRequest,
+    Provider,
+    application,
+    assert_finished_once,
+    client,
+    frame_source,
+    latest_performance,
+    mapped_config,
+    messages_payload,
+    registry,
+    serialized_lifecycle_stream,
+    stream_context,
+    stream_metadata,
+)
 
 
 def test_root_response_is_preserved():
@@ -172,6 +55,13 @@ def test_hello_probe_returns_empty_success():
 
     assert response.status_code == 200
     assert response.content == b""
+
+
+def test_openapi_operation_ids_remain_compatible():
+    paths = client().get("/openapi.json").json()["paths"]
+
+    assert paths["/api/hello"]["head"]["operationId"] == "hello_api_hello_head"
+    assert paths["/"]["get"]["operationId"] == "root__get"
 
 
 def test_non_streaming_messages_return_anthropic_json():
@@ -213,7 +103,7 @@ def test_mapped_streaming_response_uses_client_capability_identity():
 def test_surrogate_model_reaches_provider_unchanged_and_control_snapshot_is_safe():
     provider = Provider()
 
-    async def complete_with_safe_response(request):
+    async def complete_with_safe_response(request, telemetry=None):
         provider.requests.append(request)
         return CompletionResponse(
             "msg-1",
@@ -394,7 +284,7 @@ def test_route_log_encodes_hostile_model_without_changing_provider_request(
     monkeypatch.setenv("NO_COLOR", "1")
     provider = Provider()
 
-    async def complete_with_safe_response(request):
+    async def complete_with_safe_response(request, telemetry=None):
         provider.requests.append(request)
         return CompletionResponse(
             "msg-1",
@@ -531,7 +421,7 @@ def test_stream_error_logs_once_and_returns_safe_sse(caplog):
     assert "category=upstream_http" in caplog.text
     assert "stage=stream" in caplog.text
     assert "code=stream_http_error" in caplog.text
-    assert "provider_code=SECRET_PROVIDER_CODE" in caplog.text
+    assert "provider_code=" not in caplog.text and "SECRET_PROVIDER_CODE" not in caplog.text
     assert "error=api_error" in caplog.text
     assert "retryable=True" in caplog.text
     assert 'event: error' in response.text
@@ -570,6 +460,11 @@ def test_serializer_protocol_error_logs_once_and_finishes_failed(caplog):
     assert "category=translation" in caplog.text
     assert "stage=client_translation" in caplog.text
     assert "code=invalid_event_sequence" in caplog.text
+    performance = latest_performance(sessions)
+    assert performance.failure is not None
+    assert performance.failure.category == FailureCategory.TRANSLATION
+    assert performance.failure.stage == FailureStage.CLIENT_TRANSLATION
+    assert performance.failure.code == "invalid_event_sequence"
     snapshot = sessions.snapshots()[0]
     assert snapshot.active_requests == 0
     assert snapshot.last_result == "failed"
@@ -626,17 +521,6 @@ def test_premature_stream_eof_logs_once_and_finishes_failed(caplog):
     assert snapshot.active_requests == 0
     assert snapshot.last_result == "failed"
     assert_finished_once(sessions, "failed")
-
-
-def test_successful_stream_has_no_completion_log(caplog):
-    with caplog.at_level(logging.INFO, logger="claude_code_proxy.logging"):
-        response = client().post(
-            "/v1/messages",
-            json=messages_payload(stream=True, messages=[]),
-        )
-    assert response.status_code == 200
-    assert "completed" not in caplog.text
-    assert "200 OK" not in caplog.text
 
 
 def test_stream_iterator_exception_becomes_safe_terminal_error(caplog):
@@ -853,7 +737,6 @@ def test_later_same_session_request_updates_metadata_and_request_count():
     assert snapshot.transport == "fake"
 
 
-
 def test_new_agent_log_uses_safe_agent_and_parent_ids(caplog):
     sessions = registry()
     raw_session = "raw-session-marker"
@@ -882,6 +765,7 @@ def test_new_agent_log_uses_safe_agent_and_parent_ids(caplog):
     assert sessions.public_agent_id(raw_session, raw_agent)[:12] in caplog.text
     assert sessions.public_agent_id(raw_session, raw_parent)[:12] in caplog.text
 
+
 def test_raw_session_id_is_absent_from_logs_and_safe_prefix_is_present(caplog):
     sessions = registry()
     raw_id = "raw-secret-session-value"
@@ -896,171 +780,6 @@ def test_raw_session_id_is_absent_from_logs_and_safe_prefix_is_present(caplog):
     assert response.status_code == 200
     assert raw_id not in caplog.text
     assert sessions.public_id(raw_id)[:12] in caplog.text
-
-
-_SENSITIVE_MARKERS = {
-    "raw_session": "raw-session-sensitive-marker-10",
-    "raw_agent": "raw-agent-sensitive-marker-10",
-    "raw_parent_agent": "raw-parent-agent-sensitive-marker-10",
-    "credential": "credential-sensitive-marker-10",
-    "system": "system-sensitive-marker-10",
-    "user": "user-sensitive-marker-10",
-    "tool_name": "tool_name_sensitive_marker_10",
-    "tool_description": "tool-description-sensitive-marker-10",
-    "tool_schema": "tool-schema-sensitive-marker-10",
-    "tool_input": "tool-input-sensitive-marker-10",
-    "tool_result": "tool-result-sensitive-marker-10",
-    "thinking": "thinking-sensitive-marker-10",
-}
-_SESSION_RESPONSE_FIELDS = {
-    "id",
-    "state",
-    "active_requests",
-    "requests",
-    "client_model",
-    "model",
-    "provider",
-    "transport",
-    "effort",
-    "context_window",
-    "first_seen",
-    "last_seen",
-    "elapsed_seconds",
-    "last_result",
-    "agents",
-}
-
-
-def _sensitive_messages_payload():
-    markers = _SENSITIVE_MARKERS
-    return messages_payload(
-        system=markers["system"],
-        messages=[
-            {"role": "user", "content": markers["user"]},
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "redacted_thinking", "data": markers["thinking"]},
-                    {
-                        "type": "tool_use",
-                        "id": "toolu_10",
-                        "name": markers["tool_name"],
-                        "input": {"value": markers["tool_input"]},
-                    },
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": "toolu_10",
-                        "content": markers["tool_result"],
-                    }
-                ],
-            },
-        ],
-        tools=[
-            {
-                "name": markers["tool_name"],
-                "description": markers["tool_description"],
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "value": {"description": markers["tool_schema"]}
-                    },
-                },
-            }
-        ],
-    )
-
-
-def _session_exposure_surfaces(sessions, logs):
-    control_app = create_control_app(
-        sessions,
-        application_version="1.0",
-        pid=123,
-    )
-    with TestClient(control_app) as control_client:
-        control = control_client.get("/v1/sessions")
-    assert control.status_code == 200
-    parsed = SessionListResponse.model_validate(control.json())
-    return control, {
-        "registry": repr(sessions.snapshots()[0]),
-        "control": control.text,
-        "table": cli_module._render_sessions(
-            parsed, cli_module.OutputFormat.TABLE, False
-        ),
-        "full_table": cli_module._render_sessions(
-            parsed, cli_module.OutputFormat.TABLE, True
-        ),
-        "json": cli_module._render_sessions(
-            parsed, cli_module.OutputFormat.JSON, True
-        ),
-        "logs": logs,
-    }
-
-
-def test_sensitive_request_data_never_crosses_the_session_metadata_boundary(caplog):
-    provider = Provider()
-    sessions = registry()
-    headers = {
-        "authorization": f"Bearer {_SENSITIVE_MARKERS['credential']}",
-        "x-api-key": _SENSITIVE_MARKERS["credential"],
-        "x-claude-code-session-id": _SENSITIVE_MARKERS["raw_session"],
-        "x-claude-code-agent-id": _SENSITIVE_MARKERS["raw_agent"],
-        "x-claude-code-parent-agent-id": _SENSITIVE_MARKERS["raw_parent_agent"],
-    }
-
-    with caplog.at_level(logging.INFO, logger="claude_code_proxy"):
-        response = client(
-            provider,
-            sessions=sessions,
-            with_middleware=True,
-            config=mapped_config(),
-        ).post(
-            "/v1/messages",
-            headers=headers,
-            json=_sensitive_messages_payload(),
-        )
-
-    assert response.status_code == 200
-    provider_payload = repr(provider.requests[0])
-    for name, marker in _SENSITIVE_MARKERS.items():
-        if name not in {"credential", "raw_session", "raw_agent", "raw_parent_agent"}:
-            assert marker in provider_payload
-    assert _SENSITIVE_MARKERS["raw_session"] not in provider_payload
-    assert _SENSITIVE_MARKERS["raw_agent"] not in provider_payload
-    assert _SENSITIVE_MARKERS["raw_parent_agent"] not in provider_payload
-
-    snapshot = sessions.snapshots()[0]
-    safe_id = sessions.public_id(_SENSITIVE_MARKERS["raw_session"])
-    safe_agent_id = sessions.public_agent_id(
-        _SENSITIVE_MARKERS["raw_session"],
-        _SENSITIVE_MARKERS["raw_agent"],
-    )
-    safe_parent_id = sessions.public_agent_id(
-        _SENSITIVE_MARKERS["raw_session"],
-        _SENSITIVE_MARKERS["raw_parent_agent"],
-    )
-    control, exposed_surfaces = _session_exposure_surfaces(sessions, caplog.text)
-    for surface, content in exposed_surfaces.items():
-        for marker in _SENSITIVE_MARKERS.values():
-            assert marker not in content, f"{marker!r} leaked through {surface}"
-
-    assert len(safe_id) == 64
-    assert snapshot.id == safe_id
-    assert safe_id in exposed_surfaces["registry"]
-    assert safe_id in exposed_surfaces["control"]
-    assert safe_id[:12] in exposed_surfaces["table"]
-    assert safe_id in exposed_surfaces["full_table"]
-    assert _SENSITIVE_MARKERS["raw_session"] not in exposed_surfaces["full_table"]
-    assert safe_id in exposed_surfaces["json"]
-    assert safe_agent_id in exposed_surfaces["json"]
-    assert safe_parent_id in exposed_surfaces["json"]
-    for value in ("claude-sonnet", "gpt-5.6-sol", "openai", "fake", "high"):
-        assert value in exposed_surfaces["control"]
-    assert set(control.json()["sessions"][0]) == _SESSION_RESPONSE_FIELDS
 
 
 def test_fallback_validation_log_uses_safe_id_without_registry_row(caplog):
@@ -1131,7 +850,7 @@ class ConcurrentProvider(Provider):
         self.all_started = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def complete(self, request):
+    async def complete(self, request, telemetry=None):
         self.started += 1
         self.loops.append(asyncio.get_running_loop())
         if self.started == 2:
@@ -1227,92 +946,6 @@ def test_token_count_response_failure_finishes_once_after_provider_success(
     assert_finished_once(sessions, "failed")
 
 
-def stream_metadata(
-    session_id: str = "direct-stream",
-) -> SessionMetadata:
-    return SessionMetadata(
-        client_identity=ClientIdentity(session_id=session_id),
-        client_model="claude-sonnet",
-        upstream_model="openai/gpt-test",
-        provider="openai",
-        transport="fake",
-        effort="default",
-        context_window=None,
-    )
-
-
-def stream_context() -> RequestLogContext:
-    return RequestLogContext(
-        session=SessionIdentity(
-            "safe-public", "[session safe-public]", False
-        ),
-        method="POST",
-        endpoint="/v1/messages",
-        original_model="claude-sonnet",
-        upstream_model="openai/gpt-test",
-        provider="fake",
-        effort="default",
-    )
-
-
-def serialized_lifecycle_stream(
-    events,
-    sessions: RecordingSessionRegistry,
-    observation: ObservationHandle,
-):
-    prepared = routes_module.normalize_request(
-        routes_module.MessagesRequest(
-            model="claude-sonnet", max_tokens=10, messages=[]
-        )
-    )
-    context = stream_context()
-    observed = observe_stream(events, context)
-    serialized = routes_module.serialize_stream(
-        prepared,
-        observed,
-        heartbeat_interval=0.005,
-        on_error=lambda error: routes_module.log_stream_failure(
-            context, error
-        ),
-    )
-    return routes_module._record_stream_lifecycle(
-        serialized, sessions, observation
-    )
-
-
-class ClosingEvents:
-    def __init__(self) -> None:
-        self.closed = False
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        return TextDelta("pending")
-
-    async def aclose(self):
-        self.closed = True
-
-
-@pytest.mark.asyncio
-async def test_stream_consumer_close_finishes_failed_exactly_once():
-    sessions = registry()
-    observation = sessions.begin(stream_metadata())
-    events = ClosingEvents()
-    stream = serialized_lifecycle_stream(events, sessions, observation)
-
-    for _ in range(3):
-        await anext(stream)
-    assert sessions.snapshots()[0].active_requests == 1
-    await stream.aclose()
-
-    assert events.closed is True
-    snapshot = sessions.snapshots()[0]
-    assert snapshot.active_requests == 0
-    assert snapshot.last_result == "failed"
-    assert sessions.finish_calls == [(observation, "failed")]
-
-
 @pytest.mark.asyncio
 async def test_overlapping_streams_remain_active_until_each_closes():
     sessions = registry()
@@ -1340,47 +973,9 @@ async def test_overlapping_streams_remain_active_until_each_closes():
     assert snapshot.active_requests == 0
     assert snapshot.last_result == "failed"
     assert sessions.finish_calls == [
-        (first_observation, "failed"),
-        (second_observation, "failed"),
+        (first_observation, "client_disconnected"),
+        (second_observation, "client_disconnected"),
     ]
-
-
-class CancellingEvents:
-    def __init__(self) -> None:
-        self.closed = False
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        raise asyncio.CancelledError
-
-    async def aclose(self):
-        self.closed = True
-
-
-@pytest.mark.asyncio
-async def test_stream_cancellation_finishes_failed_once_without_swallowing():
-    sessions = registry()
-    observation = sessions.begin(stream_metadata())
-    events = CancellingEvents()
-    stream = serialized_lifecycle_stream(events, sessions, observation)
-
-    await anext(stream)
-    await anext(stream)
-    with pytest.raises(asyncio.CancelledError):
-        await anext(stream)
-
-    assert events.closed is True
-    snapshot = sessions.snapshots()[0]
-    assert snapshot.active_requests == 0
-    assert snapshot.last_result == "failed"
-    assert sessions.finish_calls == [(observation, "failed")]
-
-
-async def frame_source(*frames):
-    for frame in frames:
-        yield frame
 
 
 @pytest.mark.asyncio
@@ -1388,7 +983,11 @@ async def test_stream_completes_only_after_done_frame_yield_resumes():
     sessions = registry()
     observation = sessions.begin(stream_metadata())
     stream = routes_module._record_stream_lifecycle(
-        frame_source(routes_module.DONE_FRAME), sessions, observation
+        frame_source(routes_module.DONE_FRAME),
+        DisconnectRequest(False),
+        stream_context(),
+        sessions,
+        observation,
     )
 
     assert await anext(stream) == routes_module.DONE_FRAME

@@ -12,6 +12,7 @@ from ...domain.models import (
     StreamError,
     StreamStart,
 )
+from ...performance import ProviderTelemetry, notify_telemetry
 from ...failures import (
     FailureCategory,
     FailureDiagnostic,
@@ -28,7 +29,12 @@ from ..base import (
 from .auth import CodexAuth
 from .identity import CodexIdentity
 from .orchestration import reconcile_codex_request
-from .translation import CodexEventTranslator, build_request, response_from_events
+from .translation import (
+    CodexEventTranslator,
+    build_request,
+    reasoning_continuation_state,
+    response_from_events,
+)
 
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 CODEX_USER_AGENT = "opencode/latest/2.0.3/cli"
@@ -59,8 +65,16 @@ class CodexProvider:
         self._client_factory = client_factory
         self._token_counter = token_counter
 
-    async def complete(self, request: CompletionRequest):
-        events = [event async for event in self.stream(request)]
+    async def complete(
+        self,
+        request: CompletionRequest,
+        telemetry: ProviderTelemetry | None = None,
+    ):
+        if telemetry is None:
+            stream = self.stream(request)
+        else:
+            stream = self.stream(request, telemetry=telemetry)
+        events = [event async for event in stream]
         error = next((event for event in events if isinstance(event, StreamError)), None)
         if error:
             raise ProviderError(
@@ -76,9 +90,11 @@ class CodexProvider:
                 error, "response_translation_failed"
             ) from error
 
-    async def stream(self, request: CompletionRequest):
+    async def stream(self, request: CompletionRequest, telemetry: ProviderTelemetry | None = None):
         try:
-            request, identity, payload = self._prepare_request(request)
+            request, identity, payload = self._prepare_request(
+                request, telemetry
+            )
         except ProviderError as error:
             yield stream_error_from_exception(error, provider=self.name)
             return
@@ -102,6 +118,7 @@ class CodexProvider:
                     access_token,
                     account_id,
                     state,
+                    telemetry,
                 )
                 try:
                     async for event in inner:
@@ -147,7 +164,18 @@ class CodexProvider:
             )
         yield state.terminal
 
-    def _prepare_request(self, request: CompletionRequest):
+    def _prepare_request(
+        self,
+        request: CompletionRequest,
+        telemetry: ProviderTelemetry | None = None,
+    ):
+        if telemetry is not None:
+            notify_telemetry(telemetry, "mark_retries_supported")
+            notify_telemetry(
+                telemetry,
+                "set_reasoning_continuation",
+                reasoning_continuation_state(request),
+            )
         try:
             request = reconcile_codex_request(request)
             identity = CodexIdentity.from_client(request.client_identity)
@@ -165,8 +193,11 @@ class CodexProvider:
         access_token: str,
         account_id: str,
         state: _CodexStreamState,
+        telemetry: ProviderTelemetry | None = None,
     ):
         for attempt in range(2):
+            if attempt > 0:
+                notify_telemetry(telemetry, "record_retry")
             retry_rejected = False
             external_signal = None
             headers = self._build_headers(access_token, account_id, identity)
@@ -373,10 +404,17 @@ class CodexProvider:
                 ),
             ) from error
 
-    async def count_tokens(self, request: CompletionRequest) -> int:
+    async def count_tokens(
+        self,
+        request: CompletionRequest,
+        telemetry: ProviderTelemetry | None = None,
+    ) -> int:
         if self._token_counter is None:
             return 1000
-        return await self._token_counter(reconcile_codex_request(request))
+        reconciled = reconcile_codex_request(request)
+        if telemetry is None:
+            return await self._token_counter(reconciled)
+        return await self._token_counter(reconciled, telemetry=telemetry)
 
     async def _http_error(self, response) -> ProviderError:
         status_code = response.status_code

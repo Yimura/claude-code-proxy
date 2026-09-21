@@ -20,6 +20,11 @@ from ..domain.models import (
     StreamStart, TextBlock, TextDelta, TokenUsage, ToolInputDelta, ToolResultBlock,
     ToolUseBlock, ToolUseEnd, ToolUseStart,
 )
+from ..performance import (
+    ProviderTelemetry,
+    ReasoningContinuation,
+    notify_telemetry,
+)
 from ..failures import (
     FailureCategory,
     FailureDiagnostic,
@@ -71,7 +76,7 @@ def parse_tool_result_content(content: Any) -> str:
 
 @dataclass
 class _LiteLLMStreamState:
-    usage: TokenUsage = field(default_factory=lambda: TokenUsage(0, 0))
+    usage: TokenUsage = field(default_factory=lambda: TokenUsage.unavailable())
     stop_reason: str = "end_turn"
     finish_seen: bool = False
     slots: set[str] = field(default_factory=set)
@@ -116,6 +121,15 @@ class _LiteLLMStreamState:
         events = [ToolUseEnd(slot) for slot in sorted(self.slots)]
         events.append(StreamComplete(self.stop_reason, self.usage))
         return tuple(events)
+
+
+def _report_reasoning_continuation(
+    request: CompletionRequest, telemetry: ProviderTelemetry | None
+) -> None:
+    state: ReasoningContinuation = (
+        "unavailable" if request.reasoning.enabled else "not_applicable"
+    )
+    notify_telemetry(telemetry, "set_reasoning_continuation", state)
 
 
 class LiteLLMProvider:
@@ -242,7 +256,12 @@ class LiteLLMProvider:
                 if key not in {"role", "content", "name", "tool_call_id", "tool_calls"}:
                     del message[key]
 
-    async def complete(self, request: CompletionRequest) -> CompletionResponse:
+    async def complete(
+        self,
+        request: CompletionRequest,
+        telemetry: ProviderTelemetry | None = None,
+    ) -> CompletionResponse:
+        _report_reasoning_continuation(request, telemetry)
         try:
             payload = self.build_request(request, stream=False)
         except Exception as error:
@@ -296,7 +315,8 @@ class LiteLLMProvider:
             normalize_usage(usage),
         )
 
-    async def stream(self, request: CompletionRequest):
+    async def stream(self, request: CompletionRequest, telemetry: ProviderTelemetry | None = None):
+        _report_reasoning_continuation(request, telemetry)
         try:
             payload = self.build_request(request, stream=True)
         except Exception as error:
@@ -397,7 +417,11 @@ class LiteLLMProvider:
                 error, provider=self.name
             )
 
-    async def count_tokens(self, request: CompletionRequest) -> int:
+    async def count_tokens(
+        self,
+        request: CompletionRequest,
+        telemetry: ProviderTelemetry | None = None,
+    ) -> int:
         try:
             payload = self.build_request(request, stream=False)
         except Exception as error:

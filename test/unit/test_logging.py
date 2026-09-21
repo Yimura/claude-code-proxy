@@ -5,6 +5,7 @@ import logging
 import re
 
 import pytest
+from starlette.requests import ClientDisconnect
 
 from claude_code_proxy.console_logging import LOG_FORMAT, SeverityFormatter
 from claude_code_proxy.domain.models import (
@@ -20,17 +21,20 @@ from claude_code_proxy.failures import (
     FailureStage,
 )
 from claude_code_proxy.logging import (
+    REQUEST_FINALIZER,
+    REQUEST_LOG_CONTEXT,
     AgentIdentity,
     MessageFilter,
     RequestLogContext,
+    RequestLoggingMiddleware,
     SessionIdentity,
     agent_identity,
     client_identity_from_headers,
     configure_logging,
     effective_effort,
     log_provider_failure,
-    log_startup_summary,
     log_session_started,
+    log_startup_summary,
     log_stream_failure,
     log_unexpected_failure,
     observe_stream,
@@ -41,20 +45,7 @@ from claude_code_proxy.providers.base import ProviderError
 from claude_code_proxy.providers.codex.auth import CodexAccountIdentity
 from claude_code_proxy.reasoning import ReasoningPolicy
 
-
-def make_context(identity: SessionIdentity | None = None) -> RequestLogContext:
-    return RequestLogContext(
-        session=identity
-        or SessionIdentity("abcdef123456", "[session abcdef123456]", False),
-        method="POST",
-        endpoint="/v1/messages",
-        original_model="claude-sonnet",
-        upstream_model="openai/gpt-5.6-sol",
-        provider="fake",
-        effort="high",
-    )
-
-
+from test.unit.logging_test_support import make_context
 
 
 def test_agent_identity_hides_raw_values():
@@ -71,6 +62,7 @@ def test_agent_identity_hides_raw_values():
         parent_label="b" * 12,
         is_new=True,
     )
+
 
 def test_client_identity_from_headers_reads_full_lineage():
     identity = client_identity_from_headers(
@@ -100,6 +92,7 @@ def test_client_identity_from_headers_normalizes_blank_and_orphan_parent():
 
     assert blank == ClientIdentity()
     assert orphan == ClientIdentity()
+
 
 def test_startup_summary_reports_litellm_transport(caplog):
     with caplog.at_level(
@@ -159,6 +152,7 @@ def isolated_logging_state():
     original_filters = root.filters[:]
     original_level = root.level
     logger_names = (
+        "claude_code_proxy.logging",
         "claude_code_proxy.logging.session",
         "claude_code_proxy.logging.readiness",
         "uvicorn",
@@ -197,6 +191,7 @@ def assert_console_configuration(root):
     assert len(handler.filters) == 1
     assert isinstance(handler.filters[0], MessageFilter)
     assert not any(isinstance(item, MessageFilter) for item in root.filters)
+    assert logging.getLogger("claude_code_proxy.logging").level == logging.INFO
     assert logging.getLogger(
         "claude_code_proxy.logging.readiness"
     ).level == logging.INFO
@@ -325,7 +320,6 @@ def test_effective_effort(policy, expected):
     assert effective_effort(policy) == expected
 
 
-
 def test_root_lifecycle_log_excludes_agent_context(caplog):
     context = RequestLogContext(
         session=SessionIdentity("session-safe", "[session session-safe]", True),
@@ -346,6 +340,7 @@ def test_root_lifecycle_log_excludes_agent_context(caplog):
 
     assert "[session session-safe]" in caplog.text
     assert "[agent agent-safe]" not in caplog.text
+
 
 def test_untrusted_log_context_escapes_record_and_terminal_controls(caplog):
     hostile = "field\n\r\t\x1b\x85\u2028\u2029\u202e\ud800"
@@ -544,18 +539,17 @@ def test_provider_failure_tokens_resist_field_injection(caplog):
     assert rendered.count(" category=") == 1
     assert "status=503" in rendered
     assert "retryable=True" in rendered
-    for field in ("provider_code", "provider"):
-        matches = re.findall(rf"(?:^| ){field}=(\S+)", rendered)
-        assert len(matches) == 1
-        value = matches[0]
-        assert len(value) == 128
-        assert value.endswith("...")
-        for escaped in ("\\x20", "\\x3d", "\\x5c", "\\x27", "\\x22", "\\u00a0"):
-            assert escaped in value
-        assert "=" not in value
-        assert "'" not in value
-        assert '"' not in value
-        assert "\u00a0" not in value
+    assert "provider_code=" not in rendered and hostile not in rendered
+    assert len(matches := re.findall(r"(?:^| )provider=(\S+)", rendered)) == 1
+    value = matches[0]
+    assert len(value) == 128
+    assert value.endswith("...")
+    for escaped in ("\\x20", "\\x3d", "\\x5c", "\\x27", "\\x22", "\\u00a0"):
+        assert escaped in value
+    assert "=" not in value
+    assert "'" not in value
+    assert '"' not in value
+    assert " " not in value
 
 
 def test_stream_failure_tokens_bound_all_untrusted_structured_values(caplog):
@@ -633,14 +627,14 @@ def test_diagnostic_text_is_encoded_and_bounded_to_128_rendered_chars(caplog):
 
     assert len(caplog.records) == 1
     rendered = caplog.records[0].getMessage()
-    for field in ("category", "stage", "code", "provider_code"):
+    for field in ("category", "stage", "code"):
         match = re.search(rf"(?:^| ){field}=(\S+)", rendered)
         assert match is not None
         value = match.group(1)
         assert len(value) == 128
         assert value.endswith("...")
         assert "\\x0d\\x0a\\x09\\x1b\\x85\\u2028\\u2029\\u202e" in value
-    assert "\r" not in rendered
+    assert "provider_code=" not in rendered and "\r" not in rendered
     assert "\n" not in rendered
     assert "\t" not in rendered
     assert "\x1b" not in rendered
@@ -742,13 +736,19 @@ async def test_observe_stream_logs_semantic_error_once_and_preserves_events(capl
         ),
     )
     events = [TextDelta("hello"), error]
+    observed_errors = []
     with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
         observed = [
             event
-            async for event in observe_stream(iter_events(events), make_context())
+            async for event in observe_stream(
+                iter_events(events),
+                make_context(),
+                on_error=observed_errors.append,
+            )
         ]
 
     assert observed == events
+    assert observed_errors == [error]
     assert caplog.text.count("provider stream failed") == 1
     assert "category=upstream_http" in caplog.text
     assert "stage=stream" in caplog.text
@@ -808,3 +808,138 @@ async def test_observe_stream_does_not_swallow_cancellation():
         await anext(observe_stream(events, make_context()))
 
     assert events.closed is True
+
+
+@pytest.mark.asyncio
+async def test_middleware_finalizes_client_disconnect_without_unexpected_log(caplog):
+    outcomes = []
+    scope = {"type": "http", "state": {REQUEST_FINALIZER: outcomes.append}}
+
+    async def disconnect(_scope, _receive, _send):
+        raise ClientDisconnect
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(_message):
+        return None
+
+    middleware = RequestLoggingMiddleware(disconnect, None)
+    with caplog.at_level(logging.ERROR, logger="claude_code_proxy.logging"):
+        with pytest.raises(ClientDisconnect):
+            await middleware(scope, receive, send)
+
+    assert outcomes == ["client_disconnected"]
+    assert "unexpected" not in caplog.text
+
+
+class CancellingCloseFailureEvents:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise asyncio.CancelledError
+
+    async def aclose(self):
+        self.close_calls += 1
+        raise RuntimeError("CLOSE_SECRET")
+
+
+@pytest.mark.asyncio
+async def test_observe_stream_preserves_cancellation_over_close_failure():
+    events = CancellingCloseFailureEvents()
+
+    with pytest.raises(asyncio.CancelledError):
+        await anext(observe_stream(events, make_context()))
+
+    assert events.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_observe_stream_reports_safe_unexpected_diagnostic_once(caplog):
+    diagnostics = []
+
+    async def failing_events():
+        raise RuntimeError("OBSERVED_STREAM_SECRET")
+        yield
+
+    with caplog.at_level(logging.ERROR, logger="claude_code_proxy.logging"):
+        with pytest.raises(RuntimeError, match="OBSERVED_STREAM_SECRET"):
+            await anext(
+                observe_stream(
+                    failing_events(),
+                    make_context(),
+                    on_exception=diagnostics.append,
+                )
+            )
+
+    assert len(diagnostics) == 1
+    [diagnostic] = diagnostics
+    assert diagnostic.category == FailureCategory.INTERNAL
+    assert diagnostic.stage == FailureStage.STREAM
+    assert diagnostic.code == "unexpected_exception"
+    assert caplog.text.count("unexpected request failure") == 1
+    assert "OBSERVED_STREAM_SECRET" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_request_logging_middleware_passes_non_http_scope_through():
+    calls = []
+
+    async def app(scope, receive, send):
+        calls.append((scope, receive, send))
+
+    async def receive():
+        return {"type": "websocket.disconnect"}
+
+    async def send(_message):
+        return None
+
+    scope = {"type": "websocket"}
+    middleware = RequestLoggingMiddleware(app, None)
+
+    await middleware(scope, receive, send)
+
+    assert calls == [(scope, receive, send)]
+
+
+@pytest.mark.asyncio
+async def test_internal_oserror_before_send_is_failed_route_error(caplog):
+    error = OSError("INTERNAL_OSERROR_SECRET")
+    finalized = []
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "headers": [],
+        "state": {
+            REQUEST_FINALIZER: lambda *args: finalized.append(args),
+            REQUEST_LOG_CONTEXT: make_context(),
+        },
+    }
+
+    async def app(_scope, _receive, _send):
+        raise error
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message):
+        return None
+
+    middleware = RequestLoggingMiddleware(app, None)
+    with caplog.at_level(logging.ERROR, logger="claude_code_proxy.logging"):
+        with pytest.raises(OSError) as raised:
+            await middleware(scope, receive, send)
+
+    assert raised.value is error
+    assert len(finalized) == 1
+    outcome, diagnostic = finalized[0]
+    assert outcome == "failed"
+    assert diagnostic.stage == FailureStage.ROUTE
+    assert diagnostic.exception_type == "OSError"
+    assert caplog.text.count("unexpected request failure") == 1
+    assert "INTERNAL_OSERROR_SECRET" not in caplog.text

@@ -1,5 +1,4 @@
 import asyncio
-from dataclasses import replace
 import json
 import logging
 import re
@@ -9,26 +8,19 @@ import pytest
 
 from claude_code_proxy.domain.models import (
     ClientIdentity,
-    CompletionRequest,
-    Message,
     StreamComplete,
     StreamError,
     StreamStart,
     TextBlock,
     TextDelta,
     TokenUsage,
-    ToolDefinition,
 )
 from claude_code_proxy.failures import (
     FailureCategory,
     FailureDiagnostic,
     FailureStage,
 )
-from claude_code_proxy.logging import (
-    RequestLogContext,
-    SessionIdentity,
-    log_stream_failure,
-)
+from claude_code_proxy.logging import log_stream_failure
 from claude_code_proxy.providers.base import ProviderError
 from claude_code_proxy.providers.codex.orchestration import (
     AGENT_COMPLETION_POLICY,
@@ -40,255 +32,24 @@ from claude_code_proxy.providers.codex.provider import (
     CodexProvider,
 )
 from claude_code_proxy.providers.codex.translation import CodexEventTranslator
-from claude_code_proxy.reasoning import ReasoningPolicy
 from claude_code_proxy.service import _validated_stream
 
-
-class Auth:
-    def __init__(
-        self,
-        current=("secret-access", "account"),
-        recovered=None,
-        get_failure=None,
-        recovery_failure=None,
-        on_recover=None,
-    ):
-        self.current = current
-        self.recovered = recovered or current
-        self.get_failure = get_failure
-        self.recovery_failure = recovery_failure
-        self.on_recover = on_recover
-        self.rejected = []
-
-    async def get_auth(self):
-        if self.get_failure is not None:
-            raise self.get_failure
-        return self.current
-
-    async def recover_rejected(self, access_token):
-        self.rejected.append(access_token)
-        if self.on_recover is not None:
-            self.on_recover()
-        if self.recovery_failure is not None:
-            raise self.recovery_failure
-        return self.recovered
-
-
-class Response:
-    def __init__(
-        self,
-        status=200,
-        lines=(),
-        text=(),
-        headers=None,
-        line_error=None,
-        exit_error=None,
-        block_lines=False,
-    ):
-        self.status_code = status
-        self.headers = httpx.Headers(headers or {})
-        self.lines = lines
-        self.text = text
-        self.line_error = line_error
-        self.exit_error = exit_error
-        self.block_lines = block_lines
-        self.line_waiting = asyncio.Event()
-        self.text_reads = 0
-        self.text_chunk_size = None
-        self.entered = False
-        self.exited = False
-        self.exit_count = 0
-
-    async def __aenter__(self):
-        self.entered = True
-        return self
-
-    async def __aexit__(self, *args):
-        self.exited = True
-        self.exit_count += 1
-        if self.exit_error is not None:
-            raise self.exit_error
-
-    async def aiter_lines(self):
-        for line in self.lines:
-            yield line
-        if self.block_lines:
-            self.line_waiting.set()
-            await asyncio.Event().wait()
-        if self.line_error is not None:
-            raise self.line_error
-
-    async def aiter_text(self, chunk_size=None):
-        self.text_chunk_size = chunk_size
-        for part in self.text:
-            self.text_reads += 1
-            yield part
-
-    async def aiter_raw(self):
-        for part in self.text:
-            self.text_reads += 1
-            yield part.encode()
-
-
-class RawBodyStream(httpx.AsyncByteStream):
-    def __init__(self, chunks=(), error=None):
-        self.chunks = chunks
-        self.error = error
-        self.attempted = False
-        self.iterations = 0
-        self.closed = False
-
-    async def __aiter__(self):
-        self.attempted = True
-        for chunk in self.chunks:
-            self.iterations += 1
-            yield chunk
-        if self.error is not None:
-            raise self.error
-
-    async def aclose(self):
-        self.closed = True
-
-
-class EnterFailureContext:
-    def __init__(self, error):
-        self.error = error
-        self.entered = False
-
-    async def __aenter__(self):
-        self.entered = True
-        raise self.error
-
-    async def __aexit__(self, *args):
-        pass
-
-
-class RealResponseContext:
-    def __init__(self, response):
-        self.response = response
-        self.exited = False
-
-    async def __aenter__(self):
-        return self.response
-
-    async def __aexit__(self, *args):
-        self.exited = True
-        await self.response.aclose()
-
-
-def raw_response(status, stream, headers=None):
-    return httpx.Response(
-        status,
-        headers=headers,
-        stream=stream,
-        request=httpx.Request("POST", CODEX_RESPONSES_URL),
-    )
-
-
-class Client:
-    responses = []
-    requests = []
-
-    def __init__(self, **kwargs):
-        self._responses = iter(self.responses)
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        pass
-
-    def stream(self, method, url, **kwargs):
-        self.requests.append((method, url, kwargs))
-        response = next(self._responses)
-        if isinstance(response, BaseException):
-            raise response
-        return response
-
-
-class ExitClient(Client):
-    exit_error = None
-    exited = False
-    exit_count = 0
-
-    async def __aexit__(self, *args):
-        type(self).exited = True
-        type(self).exit_count += 1
-        if self.exit_error is not None:
-            raise self.exit_error
-
-
-@pytest.fixture(autouse=True)
-def reset_client():
-    Client.responses = []
-    Client.requests = []
-    ExitClient.responses = []
-    ExitClient.requests = []
-    ExitClient.exit_error = None
-    ExitClient.exited = False
-    ExitClient.exit_count = 0
-
-
-def log_context(provider="codex"):
-    return RequestLogContext(
-        session=SessionIdentity("session", "[session session]", False),
-        method="POST",
-        endpoint="/v1/messages",
-        original_model="claude",
-        upstream_model="openai/gpt-5",
-        provider=provider,
-        effort="default",
-    )
-
-
-def request(session_id=None, **changes):
-    base = CompletionRequest(
-        "claude",
-        "openai/gpt-5",
-        "claude",
-        100,
-        (Message("user", (TextBlock("hi"),)),),
-        ReasoningPolicy(None, None),
-        client_identity=ClientIdentity(session_id=session_id),
-    )
-    return replace(base, **changes)
-
-
-def orchestration_request():
-    return request(
-        system=(TextBlock("base system"),),
-        tools=(
-            ToolDefinition(
-                "Agent",
-                "Launch worker.",
-                {"type": "object", "properties": {"prompt": {"type": "string"}}},
-            ),
-            ToolDefinition(
-                "TaskOutput",
-                "Retrieve output.",
-                {"type": "object", "properties": {"task_id": {"type": "string"}}},
-            ),
-        ),
-    )
-
-
-def completed_response(input_tokens=0, output_tokens=0):
-    return Response(
-        lines=[
-            "event: response.completed",
-            (
-                'data: {"usage":{"input_tokens":'
-                f"{input_tokens},\"output_tokens\":{output_tokens}"
-                '},"status":"completed"}'
-            ),
-            "data: [DONE]",
-        ]
-    )
-
-
-async def collect(provider, completion_request=None):
-    completion_request = completion_request or request()
-    return [event async for event in provider.stream(completion_request)]
+from test.unit.providers.codex.provider_test_support import (
+    Auth,
+    Client,
+    EnterFailureContext,
+    ExitClient,
+    RawBodyStream,
+    RealResponseContext,
+    Response,
+    collect,
+    completed_response,
+    log_context,
+    orchestration_request,
+    raw_response,
+    request,
+    reset_client as reset_client,
+)
 
 
 async def test_stream_posts_headers_and_returns_semantic_events():
@@ -691,57 +452,6 @@ async def test_401_retry_reuses_generated_fallback_session_id():
     assert first["json"]["client_metadata"] == second["json"]["client_metadata"]
 
 
-async def test_401_recovers_credentials_after_closing_response_and_retries_once():
-    rejected = Response(status=401)
-    auth = Auth(
-        recovered=("new-access", "account"),
-        on_recover=lambda: rejected.exited
-        or pytest.fail("response must close before credential recovery"),
-    )
-    Client.responses = [rejected, completed_response()]
-
-    events = await collect(CodexProvider(auth, Client))
-
-    assert events == [
-        StreamStart(),
-        StreamComplete("end_turn", TokenUsage(0, 0)),
-    ]
-    assert auth.rejected == ["secret-access"]
-    assert len(Client.requests) == 2
-    assert (
-        Client.requests[0][2]["headers"]["Authorization"]
-        == "Bearer secret-access"
-    )
-    assert (
-        Client.requests[1][2]["headers"]["Authorization"]
-        == "Bearer new-access"
-    )
-
-
-async def test_second_401_returns_authentication_error_without_stream_start():
-    auth = Auth(recovered=("new-access", "account"))
-    Client.responses = [Response(status=401), Response(status=401)]
-
-    events = await collect(CodexProvider(auth, Client))
-
-    assert len(Client.requests) == 2
-    assert auth.rejected == ["secret-access"]
-    assert events == [
-        StreamError(
-            error_type="authentication_error",
-            message="Authentication failed",
-            status_code=401,
-            retryable=False,
-            provider="codex",
-            diagnostic=FailureDiagnostic(
-                FailureCategory.AUTHENTICATION,
-                FailureStage.CREDENTIALS,
-                "credentials_rejected",
-            ),
-        )
-    ]
-
-
 async def test_403_does_not_reload_or_expose_response_body():
     auth = Auth(recovered=("new-access", "account"))
     Client.responses = [Response(status=403, text=["forbidden secret"])]
@@ -771,8 +481,8 @@ async def test_403_does_not_reload_or_expose_response_body():
     ("body", "provider_code"),
     [
         ('{"error":{"code":"rate_limit_exceeded","message":"secret"}}', "rate_limit_exceeded"),
-        ('{"error":{"type":"quota_error","message":"secret"}}', "quota_error"),
-        ('{"error":{"code":"","type":"must_not_replace"}}', ""),
+        ('{"error":{"type":"quota_error","message":"secret"}}', None),
+        ('{"error":{"code":"","type":"must_not_replace"}}', None),
         ('{"error":{"code":{"nested":"not allowed"}}}', None),
         ('{"message":"not a recognized envelope"}', None),
         ("plain secret body", None),
@@ -856,7 +566,7 @@ async def test_non_200_without_content_length_does_not_read_body():
     assert stream.closed is True
 
 
-async def test_non_200_valid_bounded_content_length_extracts_code_and_closes():
+async def test_non_200_valid_bounded_content_length_omits_unknown_code():
     body = b'{"error":{"code":"bounded_code"}}'
     stream = RawBodyStream([body])
     context = RealResponseContext(
@@ -870,7 +580,7 @@ async def test_non_200_valid_bounded_content_length_extracts_code_and_closes():
 
     events = await collect(CodexProvider(Auth(), Client))
 
-    assert events[-1].diagnostic.provider_code == "bounded_code"
+    assert events[-1].diagnostic.provider_code is None
     assert stream.iterations == 1
     assert context.exited is True
     assert stream.closed is True
@@ -1040,63 +750,6 @@ async def test_optional_body_extraction_does_not_swallow_cancellation():
 
     assert context.exited is True
     assert stream.closed is True
-
-
-async def test_initial_credential_failure_returns_safe_structured_error():
-    auth = Auth(
-        get_failure=RuntimeError(
-            "access sample-access-token refresh sample-refresh-token"
-        )
-    )
-
-    events = await collect(CodexProvider(auth, Client))
-
-    assert Client.requests == []
-    assert events == [
-        StreamError(
-            error_type="authentication_error",
-            message="Authentication failed",
-            status_code=401,
-            retryable=False,
-            provider="codex",
-            diagnostic=FailureDiagnostic(
-                FailureCategory.AUTHENTICATION,
-                FailureStage.CREDENTIALS,
-                "credential_load_failed",
-            ),
-        )
-    ]
-    assert "sample-access-token" not in repr(events)
-    assert "sample-refresh-token" not in repr(events)
-
-
-async def test_recovery_failure_returns_safe_error_without_second_request():
-    rejected = Response(status=401)
-    auth = Auth(
-        recovery_failure=RuntimeError("sample-refresh-token was rejected"),
-        on_recover=lambda: rejected.exited
-        or pytest.fail("response must close before credential recovery"),
-    )
-    Client.responses = [rejected]
-
-    events = await collect(CodexProvider(auth, Client))
-
-    assert len(Client.requests) == 1
-    assert events == [
-        StreamError(
-            error_type="authentication_error",
-            message="Authentication failed",
-            status_code=401,
-            retryable=False,
-            provider="codex",
-            diagnostic=FailureDiagnostic(
-                FailureCategory.AUTHENTICATION,
-                FailureStage.CREDENTIALS,
-                "credential_recovery_failed",
-            ),
-        )
-    ]
-    assert "sample-refresh-token" not in repr(events)
 
 
 @pytest.mark.parametrize(
@@ -1521,8 +1174,8 @@ async def test_complete_preserves_stream_error_status_and_diagnostic():
         FailureCategory.UPSTREAM_HTTP,
         FailureStage.RESPONSE,
         "http_error",
-        "quota_exhausted",
     )
+    assert caught.value.diagnostic.provider_code is None
     assert "secret" not in repr(caught.value)
 
 
@@ -1576,7 +1229,7 @@ async def test_complete_buffers_stream():
 async def test_count_tokens_uses_local_counter_only():
     calls = []
 
-    async def local_counter(completion_request):
+    async def local_counter(completion_request, telemetry=None):
         calls.append(completion_request)
         return 8
 
@@ -1603,7 +1256,7 @@ async def test_stream_applies_codex_agent_completion_guidance():
 async def test_count_tokens_applies_codex_agent_completion_guidance():
     captured = []
 
-    async def count_tokens(completion_request):
+    async def count_tokens(completion_request, telemetry=None):
         captured.append(completion_request)
         return 17
 

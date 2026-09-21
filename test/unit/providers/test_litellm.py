@@ -1,7 +1,6 @@
 import asyncio
 from dataclasses import replace
 import logging
-from pathlib import Path
 import re
 
 import httpx
@@ -11,9 +10,8 @@ from litellm.types.utils import Usage as LiteLLMUsage
 
 from claude_code_proxy.api.schemas import MessagesRequest
 from claude_code_proxy.api.translation import normalize_request, serialize_stream
-from claude_code_proxy.config import Settings
 from claude_code_proxy.domain.models import (
-    ClientIdentity, CompletionRequest,
+    ClientIdentity,
     ImageBlock,
     Message,
     StreamComplete,
@@ -35,30 +33,20 @@ from claude_code_proxy.failures import (
     FailureDiagnostic,
     FailureStage,
 )
-from claude_code_proxy.logging import (
-    RequestLogContext,
-    SessionIdentity,
-    log_stream_failure,
-)
+from claude_code_proxy.logging import log_stream_failure
 from claude_code_proxy.providers.base import ProviderError
 from claude_code_proxy.providers.litellm import LiteLLMProvider, clean_gemini_schema
-from claude_code_proxy.reasoning import OutputConfig, ReasoningPolicy, ThinkingConfig
+from claude_code_proxy.reasoning import (
+    OutputConfig,
+    ThinkingConfig,
+)
 
-
-@pytest.fixture
-def settings():
-    return Settings(
-        anthropic_api_key="anthropic-key",
-        openai_api_key="openai-key",
-        gemini_api_key="gemini-key",
-        vertex_project="project",
-        vertex_location="region",
-        use_vertex_auth=False,
-        openai_base_url=None,
-        openai_transport="litellm",
-        opencode_data_dir=Path("/auth"),
-        model_mapping_path=Path("mapping.json"),
-    )
+from test.unit.providers.litellm_test_support import (
+    FakeClient,
+    log_context,
+    request,
+    settings as settings,
+)
 
 
 def assert_failure_evidence(
@@ -78,31 +66,6 @@ def assert_failure_evidence(
     )
 
 
-def log_context():
-    return RequestLogContext(
-        session=SessionIdentity("session", "[session session]", False),
-        method="POST",
-        endpoint="/v1/messages",
-        original_model="claude",
-        upstream_model="openai/gpt-5.6-sol",
-        provider="litellm",
-        effort="default",
-    )
-
-
-def request(model="openai/gpt-5.6-sol", **changes):
-    base = CompletionRequest(
-        original_model=model,
-        model=model,
-        response_model=model,
-        max_tokens=20000,
-        messages=(Message("user", (TextBlock("hello"),)),),
-        reasoning=ReasoningPolicy(True, "high"),
-    )
-    return replace(base, **changes)
-
-
-
 def test_build_request_does_not_forward_client_identity(settings):
     provider = LiteLLMProvider(settings, object())
     payload = provider.build_request(
@@ -118,6 +81,7 @@ def test_build_request_does_not_forward_client_identity(settings):
     assert "client_metadata" not in payload
     assert "prompt_cache_key" not in payload
 
+
 def test_build_request_preserves_tools_reasoning_and_auth(settings):
     provider = LiteLLMProvider(settings, object())
     payload = provider.build_request(request(
@@ -130,7 +94,6 @@ def test_build_request_preserves_tools_reasoning_and_auth(settings):
     assert payload["api_key"] == "openai-key"
 
 
-
 def test_openai_token_cap_does_not_depend_on_transport(settings):
     codex_settings = replace(settings, openai_transport="codex")
 
@@ -139,6 +102,7 @@ def test_openai_token_cap_does_not_depend_on_transport(settings):
     )
 
     assert payload["max_completion_tokens"] == 16_384
+
 
 def test_missing_selected_tool_falls_back_to_auto(settings):
     payload = LiteLLMProvider(settings, object()).build_request(request(
@@ -181,31 +145,13 @@ def test_anthropic_preserves_thinking_and_output_config(settings):
     assert "reasoning_effort" not in payload
 
 
-class FakeClient:
-    def __init__(self, response=None, chunks=(), token_count=9):
-        self.response = response
-        self.chunks = chunks
-        self.token_count = token_count
-        self.counter_args = None
-
-    def completion(self, **kwargs):
-        return self.response
-
-    async def acompletion(self, **kwargs):
-        async def generate():
-            for chunk in self.chunks:
-                yield chunk
-        return generate()
-
-    def token_counter(self, **kwargs):
-        self.counter_args = kwargs
-        return self.token_count
-
-
 @pytest.mark.asyncio
 async def test_complete_returns_normalized_text_and_usage(settings):
     client = FakeClient({"id": "response-1", "choices": [{"message": {"content": "hello", "tool_calls": None}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 4, "completion_tokens": 2}})
-    response = await LiteLLMProvider(settings, client).complete(request())
+    telemetry = object()
+    response = await LiteLLMProvider(settings, client).complete(
+        request(), telemetry=telemetry
+    )
     assert response.content == (TextBlock("hello"),)
     assert response.stop_reason == "end_turn"
     assert response.usage == TokenUsage(4, 2)
@@ -293,7 +239,13 @@ async def test_stream_returns_semantic_text_events(settings):
         {"choices": [{"delta": {"content": "hel"}, "finish_reason": None}]},
         {"choices": [{"delta": {"content": "lo"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 3, "completion_tokens": 2}},
     ])
-    events = [event async for event in LiteLLMProvider(settings, client).stream(request())]
+    telemetry = object()
+    events = [
+        event
+        async for event in LiteLLMProvider(settings, client).stream(
+            request(), telemetry=telemetry
+        )
+    ]
     assert events == [StreamStart(), TextDelta("hel"), TextDelta("lo"), StreamComplete("end_turn", TokenUsage(3, 2))]
 
 
@@ -879,7 +831,6 @@ def _typed_litellm_errors():
                 FailureCategory.UPSTREAM_HTTP,
                 FailureStage.REQUEST,
                 "upstream_http_error",
-                "provider-overloaded",
             ),
         ),
     ]
@@ -1196,7 +1147,13 @@ async def test_count_tokens_failure_has_distinct_stage_and_safe_message(settings
 @pytest.mark.asyncio
 async def test_count_tokens_uses_local_counter(settings):
     client = FakeClient(token_count=17)
-    assert await LiteLLMProvider(settings, client).count_tokens(request()) == 17
+    telemetry = object()
+    assert (
+        await LiteLLMProvider(settings, client).count_tokens(
+            request(), telemetry=telemetry
+        )
+        == 17
+    )
     assert client.counter_args["model"] == "openai/gpt-5.6-sol"
 
 

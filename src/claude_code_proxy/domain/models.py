@@ -39,6 +39,20 @@ ContentBlock: TypeAlias = (
     TextBlock | ImageBlock | RedactedThinkingBlock | ToolUseBlock | ToolResultBlock
 )
 ResponseBlock: TypeAlias = TextBlock | RedactedThinkingBlock | ToolUseBlock
+UsageField: TypeAlias = Literal[
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "thinking_tokens",
+]
+_USAGE_FIELDS = frozenset({
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "thinking_tokens",
+})
 
 
 @dataclass(frozen=True)
@@ -98,6 +112,32 @@ class TokenUsage:
     cache_creation_input_tokens: int = 0
     cache_read_input_tokens: int = 0
     thinking_tokens: int | None = None
+    observed_fields: frozenset[UsageField] | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        if self.observed_fields is not None:
+            observed_fields = frozenset(self.observed_fields)
+            unknown_fields = observed_fields - _USAGE_FIELDS
+            if unknown_fields:
+                raise ValueError(f"unknown usage fields: {unknown_fields}")
+            object.__setattr__(self, "observed_fields", observed_fields)
+            return
+
+        observed_fields: set[UsageField] = {
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        }
+        if self.thinking_tokens is not None:
+            observed_fields.add("thinking_tokens")
+        object.__setattr__(self, "observed_fields", frozenset(observed_fields))
+
+    @classmethod
+    def unavailable(cls) -> "TokenUsage":
+        return cls(0, 0, observed_fields=frozenset())
 
 
 @dataclass(frozen=True)

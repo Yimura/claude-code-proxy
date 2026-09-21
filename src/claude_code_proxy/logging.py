@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass
+import asyncio
 import hashlib
 import logging
+import math
 import os
+import uuid
+
+import anyio
+from collections.abc import AsyncIterator, Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
-import uuid
+
+from starlette.requests import ClientDisconnect, Request
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .console_logging import SeverityFormatter as _SeverityFormatter
 from .domain.models import ClientIdentity, StreamError, StreamEvent
@@ -21,6 +28,11 @@ from .failures import (
     unexpected_failure_diagnostic,
 )
 from .observability import SessionRegistry
+from .performance import (
+    Measurement,
+    RequestOutcome,
+    RequestPerformanceSnapshot,
+)
 from .providers.base import ProviderError
 from .reasoning import ReasoningPolicy
 from .text_safety import bounded_log_token, log_text
@@ -33,6 +45,7 @@ AGENT_HEADER = "x-claude-code-agent-id"
 PARENT_AGENT_HEADER = "x-claude-code-parent-agent-id"
 FAILURE_LOGGED = "failure_logged"
 REQUEST_LOG_CONTEXT = "request_log_context"
+REQUEST_FINALIZER = "request_finalizer"
 DIAGNOSTIC_FIELD_MAX_LENGTH = 128
 SESSION_COLORS = (
     "\033[96m",
@@ -193,6 +206,7 @@ def configure_logging() -> None:
     root.filters[:] = [
         item for item in root.filters if not isinstance(item, MessageFilter)
     ]
+    logger.setLevel(logging.INFO)
     session_logger.setLevel(logging.INFO)
     readiness_logger.setLevel(logging.INFO)
     for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
@@ -295,13 +309,13 @@ def _render_diagnostic(diagnostic: FailureDiagnostic) -> str:
     return " ".join(fields)
 
 
-def _provider_diagnostic(error: ProviderError) -> FailureDiagnostic:
+def provider_failure_diagnostic(error: ProviderError) -> FailureDiagnostic:
     return error.diagnostic or FailureDiagnostic(
         FailureCategory.UPSTREAM_HTTP, FailureStage.REQUEST, "provider_error"
     )
 
 
-def _stream_diagnostic(error: StreamError) -> FailureDiagnostic:
+def stream_failure_diagnostic(error: StreamError) -> FailureDiagnostic:
     if error.diagnostic is not None:
         return error.diagnostic
     category = (
@@ -320,7 +334,7 @@ def log_provider_failure(context: RequestLogContext, error: ProviderError) -> No
         _correlation(context),
         log_text(context.method),
         log_text(context.endpoint),
-        _render_diagnostic(_provider_diagnostic(error)),
+        _render_diagnostic(provider_failure_diagnostic(error)),
         error.status_code,
         retryable_status(error.status_code),
         _structured_log_token(context.original_model),
@@ -338,7 +352,7 @@ def log_stream_failure(context: RequestLogContext, error: StreamError) -> None:
         _correlation(context),
         log_text(context.method),
         log_text(context.endpoint),
-        _render_diagnostic(_stream_diagnostic(error)),
+        _render_diagnostic(stream_failure_diagnostic(error)),
         _structured_log_token(error.error_type),
         error.status_code,
         error.retryable,
@@ -367,6 +381,80 @@ def log_unexpected_failure(
         _structured_log_token(context.provider),
         _structured_log_token(context.effort),
     )
+
+
+def _measurement_text(measurement: Measurement) -> str:
+    if measurement.status != "observed":
+        return _structured_log_token(measurement.status)
+    return _structured_log_token(measurement.value)
+
+
+def _milliseconds_text(measurement: Measurement) -> str:
+    if measurement.status != "observed":
+        return _structured_log_token(measurement.status)
+    try:
+        seconds = float(measurement.value)
+        milliseconds = seconds * 1000.0
+    except (OverflowError, TypeError, ValueError):
+        return "unavailable"
+    if not math.isfinite(milliseconds):
+        return "unavailable"
+    return _structured_log_token(format(milliseconds, ".12g"))
+
+
+def _identity_text(identity: AgentIdentity | None, field: str) -> str:
+    if identity is None:
+        return "not_applicable"
+    value = identity.label if field == "agent" else identity.parent_label
+    return "not_applicable" if value is None else _structured_log_token(value)
+
+
+def _performance_fields(
+    snapshot: RequestPerformanceSnapshot,
+    context: RequestLogContext,
+) -> tuple[str, ...]:
+    return (
+        f"outcome={_structured_log_token(snapshot.outcome)}",
+        f"operation={_structured_log_token(snapshot.operation)}",
+        f"session={_structured_log_token(context.session.label)}",
+        f"agent={_identity_text(context.agent, 'agent')}",
+        f"parent={_identity_text(context.agent, 'parent')}",
+        f"request={_structured_log_token(snapshot.id)}",
+        f"duration_ms={_milliseconds_text(snapshot.duration)}",
+        f"upstream_ms={_milliseconds_text(snapshot.upstream_duration)}",
+        f"ttft_ms={_milliseconds_text(snapshot.ttft)}",
+        f"input_tokens={_measurement_text(snapshot.input_tokens)}",
+        f"output_tokens={_measurement_text(snapshot.output_tokens)}",
+        f"cache_read_tokens={_measurement_text(snapshot.cache_read_tokens)}",
+        "cache_creation_tokens="
+        f"{_measurement_text(snapshot.cache_creation_tokens)}",
+        f"reasoning_tokens={_measurement_text(snapshot.reasoning_tokens)}",
+        f"tools={_measurement_text(snapshot.tool_calls)}",
+        f"retries={_measurement_text(snapshot.retries)}",
+        f"peak_concurrency={_measurement_text(snapshot.peak_concurrency)}",
+        "reasoning_continuation="
+        f"{_structured_log_token(snapshot.reasoning_continuation)}",
+        f"model={_structured_log_token(context.original_model)}",
+        f"upstream={_structured_log_token(context.upstream_model)}",
+        f"provider={_structured_log_token(context.provider)}",
+        f"effort={_structured_log_token(context.effort)}",
+    )
+
+
+def log_performance(
+    snapshot: RequestPerformanceSnapshot,
+    context: RequestLogContext,
+) -> None:
+    """Emit one bounded request-performance record without affecting callers."""
+    try:
+        level = logging.WARNING if snapshot.outcome == "failed" else logging.INFO
+        fields = " ".join(_performance_fields(snapshot, context))
+        logger.log(level, "performance %s", fields)
+    except BaseException:
+        try:
+            logger.warning("performance logging failed")
+        except BaseException:
+            pass
 
 
 def _fallback_context_identity(
@@ -427,16 +515,18 @@ def log_http_failure(
 
 
 def log_middleware_exception(
-    request, sessions: SessionRegistry, error: Exception
-) -> None:
+    request,
+    sessions: SessionRegistry,
+    error: Exception,
+    *,
+    stage: FailureStage = FailureStage.ROUTE,
+) -> FailureDiagnostic:
+    diagnostic = unexpected_failure_diagnostic(error, stage=stage)
     context = getattr(request.state, REQUEST_LOG_CONTEXT, None)
     if context is not None:
-        log_unexpected_failure(context, error)
-        return
+        log_unexpected_failure(context, error, stage=stage)
+        return diagnostic
 
-    diagnostic = unexpected_failure_diagnostic(
-        error, stage=FailureStage.ROUTE
-    )
     session, agent = _fallback_context_identity(request, sessions)
     logger.error(
         "%s %s %s unexpected HTTP failure %s",
@@ -445,45 +535,223 @@ def log_middleware_exception(
         log_text(request.url.path),
         _render_diagnostic(diagnostic),
     )
+    return diagnostic
 
 
-def request_logging_middleware(sessions: SessionRegistry):
-    async def middleware(request, call_next):
+def log_telemetry_failure() -> None:
+    """Emit a fixed warning when request telemetry cannot be attached."""
+    try:
+        logger.warning("request telemetry setup failed")
+    except BaseException:
+        pass
+
+
+def log_finalization_failure() -> None:
+    """Emit a fixed internal warning without exposing failure details."""
+    try:
+        logger.warning("request finalization failed")
+    except BaseException:
+        pass
+
+
+def _invoke_state_finalizer(
+    request: Request,
+    outcome: str,
+    failure: FailureDiagnostic | None = None,
+) -> None:
+    finalizer = getattr(request.state, REQUEST_FINALIZER, None)
+    if not callable(finalizer):
+        return
+    try:
+        if failure is None:
+            finalizer(outcome)
+        else:
+            finalizer(outcome, failure)
+    except BaseException:
+        pass
+
+
+def _finalize_client_disconnect(request: Request) -> None:
+    _invoke_state_finalizer(request, "client_disconnected")
+
+
+async def cancelled_request_outcome(request: Request) -> RequestOutcome:
+    """Distinguish request cancellation from a disconnected client."""
+    try:
+        with anyio.CancelScope(shield=True):
+            disconnected = await request.is_disconnected()
+    except BaseException:
+        return "cancelled"
+    return "client_disconnected" if disconnected else "cancelled"
+
+
+class RequestLoggingMiddleware:
+    def __init__(self, app: ASGIApp, sessions: SessionRegistry) -> None:
+        self._app = app
+        self._sessions = sessions
+
+    async def __call__(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        request = Request(scope, receive=receive)
+        status_code: int | None = None
+        send_started = False
+        send_error: BaseException | None = None
+
+        async def tracked_send(message: Message) -> None:
+            nonlocal status_code, send_started, send_error
+            if message["type"] == "http.response.start":
+                send_started = True
+                status_code = message["status"]
+            try:
+                await send(message)
+            except BaseException as error:
+                send_error = error
+                raise
+
         try:
-            response = await call_next(request)
-        except Exception as error:
-            if not getattr(request.state, FAILURE_LOGGED, False):
-                log_middleware_exception(request, sessions, error)
-                setattr(request.state, FAILURE_LOGGED, True)
+            await self._app(scope, receive, tracked_send)
+        except ClientDisconnect:
+            _finalize_client_disconnect(request)
+            if isinstance(send_error, OSError):
+                raise send_error
             raise
+        except OSError as error:
+            if error is send_error:
+                _finalize_client_disconnect(request)
+                raise
+            diagnostic = self._record_exception(
+                request, error, send_started
+            )
+            _invoke_state_finalizer(request, "failed", diagnostic)
+            raise
+        except asyncio.CancelledError:
+            outcome = await cancelled_request_outcome(request)
+            _invoke_state_finalizer(request, outcome)
+            raise
+        except Exception as error:
+            diagnostic = self._record_exception(
+                request, error, send_started
+            )
+            _invoke_state_finalizer(request, "failed", diagnostic)
+            raise
+        _invoke_state_finalizer(request, "completed")
+        self._record_status(request, status_code)
 
-        if (
-            response.status_code >= 300
-            and not getattr(request.state, FAILURE_LOGGED, False)
-        ):
-            log_http_failure(request, sessions, response.status_code)
-            setattr(request.state, FAILURE_LOGGED, True)
-        return response
+    def _record_exception(
+        self, request: Request, error: Exception, send_started: bool
+    ) -> FailureDiagnostic | None:
+        if getattr(request.state, FAILURE_LOGGED, False):
+            return None
+        stage = (
+            FailureStage.CLIENT_TRANSLATION
+            if send_started
+            else FailureStage.ROUTE
+        )
+        diagnostic = unexpected_failure_diagnostic(error, stage=stage)
+        try:
+            log_middleware_exception(
+                request, self._sessions, error, stage=stage
+            )
+        except BaseException:
+            pass
+        setattr(request.state, FAILURE_LOGGED, True)
+        return diagnostic
 
-    return middleware
+    def _record_status(
+        self, request: Request, status_code: int | None
+    ) -> None:
+        if status_code is None or status_code < 300:
+            return
+        if getattr(request.state, FAILURE_LOGGED, False):
+            return
+        try:
+            log_http_failure(request, self._sessions, status_code)
+        except BaseException:
+            pass
+        setattr(request.state, FAILURE_LOGGED, True)
+
+
+def _call_observer_safely(
+    callback: Callable[..., None],
+    *args: object,
+    **kwargs: object,
+) -> None:
+    try:
+        callback(*args, **kwargs)
+    except BaseException:
+        pass
 
 
 async def observe_stream(
-    events: AsyncIterator[StreamEvent], context: RequestLogContext
+    events: AsyncIterator[StreamEvent],
+    context: RequestLogContext,
+    *,
+    on_error: Callable[[StreamError], None] | None = None,
+    on_exception: Callable[[FailureDiagnostic], None] | None = None,
+    on_provider_error: Callable[[ProviderError], None] | None = None,
 ) -> AsyncIterator[StreamEvent]:
     iterator = aiter(events)
+    original: BaseException | None = None
     try:
         async for event in iterator:
             if isinstance(event, StreamError):
-                log_stream_failure(context, event)
+                if on_error is not None:
+                    _call_observer_safely(on_error, event)
+                _call_observer_safely(log_stream_failure, context, event)
             yield event
     except ProviderError as error:
-        log_provider_failure(context, error)
+        original = error
+        _record_observed_provider_error(context, error, on_provider_error)
         raise
     except Exception as error:
-        log_unexpected_failure(context, error, stage=FailureStage.STREAM)
+        original = error
+        diagnostic = unexpected_failure_diagnostic(
+            error, stage=FailureStage.STREAM
+        )
+        if on_exception is not None:
+            _call_observer_safely(on_exception, diagnostic)
+        _call_observer_safely(
+            log_unexpected_failure,
+            context,
+            error,
+            stage=FailureStage.STREAM,
+        )
+        raise
+    except BaseException as error:
+        original = error
         raise
     finally:
-        close = getattr(iterator, "aclose", None)
-        if close is not None:
-            await close()
+        try:
+            await _close_observed_iterator(iterator, original)
+        except ProviderError as error:
+            _record_observed_provider_error(
+                context, error, on_provider_error
+            )
+            raise
+
+
+def _record_observed_provider_error(
+    context: RequestLogContext,
+    error: ProviderError,
+    callback: Callable[[ProviderError], None] | None,
+) -> None:
+    if callback is not None:
+        _call_observer_safely(callback, error)
+    _call_observer_safely(log_provider_failure, context, error)
+
+
+async def _close_observed_iterator(
+    iterator: object, original: BaseException | None
+) -> None:
+    close = getattr(iterator, "aclose", None)
+    if close is None:
+        return
+    try:
+        await close()
+    except BaseException:
+        if original is None:
+            raise

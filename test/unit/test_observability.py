@@ -13,53 +13,7 @@ from claude_code_proxy.observability import (
     SessionRegistry,
 )
 
-
-class Clock:
-    def __init__(self) -> None:
-        self.wall = datetime(2026, 1, 1, tzinfo=UTC)
-        self.monotonic = 100.0
-
-    def wall_now(self) -> datetime:
-        return self.wall
-
-    def monotonic_now(self) -> float:
-        return self.monotonic
-
-    def advance(self, seconds: float = 1.0) -> None:
-        self.wall += timedelta(seconds=seconds)
-        self.monotonic += seconds
-
-
-def metadata(
-    session_id: str | None = "sensitive-session",
-    agent_id: str | None = None,
-    parent_agent_id: str | None = None,
-    **changes,
-) -> SessionMetadata:
-    values = {
-        "client_identity": ClientIdentity(
-            session_id,
-            agent_id,
-            parent_agent_id,
-        ),
-        "client_model": "claude-opus",
-        "upstream_model": "openai/gpt-5.6-sol",
-        "provider": "openai",
-        "transport": "codex",
-        "effort": "high",
-        "context_window": 1_000_000,
-    }
-    values.update(changes)
-    return SessionMetadata(**values)
-
-
-def registry(clock: Clock, inactive_limit: int = 10) -> SessionRegistry:
-    return SessionRegistry(
-        inactive_limit=inactive_limit,
-        secret=b"test-secret",
-        wall_clock=clock.wall_now,
-        monotonic_clock=clock.monotonic_now,
-    )
+from test.unit.observability_test_support import Clock, metadata, registry
 
 
 def test_constructor_enforces_signed_64_inactive_limit() -> None:
@@ -73,7 +27,6 @@ def test_constructor_enforces_signed_64_inactive_limit() -> None:
 def test_constructor_rejects_negative_inactive_limit() -> None:
     with pytest.raises(ValueError, match="inactive_limit"):
         SessionRegistry(-1)
-
 
 
 def test_agents_share_root_aggregate_but_keep_independent_counts() -> None:
@@ -162,6 +115,7 @@ def test_request_scoped_agents_do_not_share_records() -> None:
 
     assert len(sessions.snapshots()) == 2
     assert first.agent_public_id != second.agent_public_id
+
 
 def test_public_id_is_stable_and_raw_id_is_not_exposed() -> None:
     clock = Clock()

@@ -16,11 +16,18 @@ from claude_code_proxy.control.client import (
     ControlUnavailable,
     IncompatibleProtocol,
 )
-from claude_code_proxy.control.schemas import HealthResponse, SessionResponse
-
+from claude_code_proxy.control.schemas import (
+    FailureDiagnosticResponse,
+    HealthResponse,
+    MetricAggregateResponse,
+    MetricResponse,
+    ProcessIdentityResponse,
+    SessionResponse,
+)
+from claude_code_proxy.failures import FailureCategory, FailureDiagnostic, FailureStage
+from claude_code_proxy.limits import MAX_CONTROL_INTEGER
 
 SOCKET_PATH = Path("/run/user/1000/claude-code-proxy/control.sock")
-
 
 def health_payload(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
@@ -35,7 +42,6 @@ def health_payload(**overrides: object) -> dict[str, object]:
     }
     payload.update(overrides)
     return payload
-
 
 def session_payload(identifier: str = "a" * 64) -> dict[str, object]:
     return {
@@ -55,13 +61,11 @@ def session_payload(identifier: str = "a" * 64) -> dict[str, object]:
         "last_result": None,
     }
 
-
 def session_list_payload() -> dict[str, object]:
     return {
         "captured_at": "2026-01-02T03:04:05Z",
         "sessions": [session_payload()],
     }
-
 
 class RecordingTransport(httpx.BaseTransport):
     def __init__(self, handler: Callable[[httpx.Request], httpx.Response]) -> None:
@@ -75,7 +79,6 @@ class RecordingTransport(httpx.BaseTransport):
 
     def close(self) -> None:
         self.close_count += 1
-
 
 def test_default_transport_uses_given_unix_socket(monkeypatch: pytest.MonkeyPatch) -> None:
     created: list[dict[str, object]] = []
@@ -95,7 +98,6 @@ def test_default_transport_uses_given_unix_socket(monkeypatch: pytest.MonkeyPatc
     assert created == [{"uds": str(SOCKET_PATH)}]
     assert transport.close_count == 1
 
-
 def test_health_parses_response_and_context_manager_closes_transport() -> None:
     transport = RecordingTransport(
         lambda request: httpx.Response(200, json=health_payload(), request=request)
@@ -107,7 +109,6 @@ def test_health_parses_response_and_context_manager_closes_transport() -> None:
         assert response.started_at == datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
 
     assert transport.close_count == 1
-
 
 @pytest.mark.parametrize("uptime", [float("nan"), float("inf"), float("-inf")])
 def test_health_rejects_non_finite_uptime(uptime: float) -> None:
@@ -126,7 +127,6 @@ def test_health_rejects_non_finite_uptime(uptime: float) -> None:
     with ControlClient(SOCKET_PATH, transport=transport) as client:
         with pytest.raises(ControlError, match="invalid health response"):
             client.health()
-
 
 @pytest.mark.parametrize(
     "overrides",
@@ -158,7 +158,6 @@ def test_health_rejects_out_of_range_numeric_fields(
 
     assert str(raised.value) == "Control API returned an invalid health response"
 
-
 def test_control_schemas_enforce_strict_signed_64_integer_fields() -> None:
     maximum = 2**63 - 1
     health = health_payload(
@@ -185,12 +184,10 @@ def test_control_schemas_enforce_strict_signed_64_integer_fields() -> None:
     with pytest.raises(ValidationError, match="context_window"):
         SessionResponse.model_validate(observed)
 
-
 def test_new_client_accepts_legacy_session_without_agents() -> None:
     parsed = SessionResponse.model_validate(session_payload())
 
     assert parsed.agents == ()
-
 
 def test_health_accepts_signed_64_maximum_integer_fields() -> None:
     maximum = 2**63 - 1
@@ -214,7 +211,6 @@ def test_health_accepts_signed_64_maximum_integer_fields() -> None:
     assert result.sessions.active == maximum
     assert result.sessions.retained == maximum
     assert result.inactive_limit == maximum
-
 
 @pytest.mark.parametrize(
     ("field", "nested", "value"),
@@ -247,7 +243,6 @@ def test_health_rejects_coerced_integer_wire_types(
 
     assert str(raised.value) == "Control API returned an invalid health response"
 
-
 @pytest.mark.parametrize("value", [True, "1.5"])
 def test_health_rejects_coerced_duration_wire_types(value: object) -> None:
     transport = RecordingTransport(
@@ -263,7 +258,6 @@ def test_health_rejects_coerced_duration_wire_types(value: object) -> None:
             client.health()
 
     assert str(raised.value) == "Control API returned an invalid health response"
-
 
 @pytest.mark.parametrize("value", [1, 1.5])
 def test_health_accepts_integer_and_float_duration_wire_types(
@@ -282,7 +276,6 @@ def test_health_accepts_integer_and_float_duration_wire_types(
 
     assert result.uptime_seconds == float(value)
     assert type(result.uptime_seconds) is float
-
 
 def test_default_timeout_is_finite_for_every_httpx_phase() -> None:
     observed: list[dict[str, float]] = []
@@ -306,7 +299,6 @@ def test_default_timeout_is_finite_for_every_httpx_phase() -> None:
         }
     ]
 
-
 def test_connect_error_is_not_retried() -> None:
     attempts = 0
 
@@ -323,7 +315,6 @@ def test_connect_error_is_not_retried() -> None:
             client.health()
 
     assert attempts == 1
-
 
 def test_sessions_sends_repeated_filters_in_order_after_health() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
@@ -346,7 +337,6 @@ def test_sessions_sends_repeated_filters_in_order_after_health() -> None:
         ("filter", "state=idle"),
     ]
 
-
 @pytest.mark.parametrize("elapsed", [float("nan"), float("inf"), float("-inf")])
 def test_sessions_rejects_non_finite_elapsed_seconds(elapsed: float) -> None:
     payload = session_list_payload()
@@ -367,7 +357,6 @@ def test_sessions_rejects_non_finite_elapsed_seconds(elapsed: float) -> None:
     ) as client:
         with pytest.raises(ControlError, match="invalid sessions response"):
             client.sessions()
-
 
 @pytest.mark.parametrize(
     ("field", "value"),
@@ -406,7 +395,6 @@ def test_sessions_rejects_out_of_range_numeric_fields(
     assert str(raised.value) == "Control API returned an invalid sessions response"
     assert str(value) not in str(raised.value)
 
-
 def test_sessions_accepts_signed_64_maximum_integer_fields() -> None:
     maximum = 2**63 - 1
     payload = session_list_payload()
@@ -432,7 +420,6 @@ def test_sessions_accepts_signed_64_maximum_integer_fields() -> None:
     assert observed.requests == maximum
     assert observed.context_window == maximum
 
-
 def test_sessions_rejects_active_requests_above_total_requests() -> None:
     payload = session_list_payload()
     payload["sessions"][0].update({"active_requests": 2, "requests": 1})
@@ -449,7 +436,6 @@ def test_sessions_rejects_active_requests_above_total_requests() -> None:
             client.sessions()
 
     assert str(raised.value) == "Control API returned an invalid sessions response"
-
 
 @pytest.mark.parametrize(
     ("field", "value"),
@@ -479,7 +465,6 @@ def test_sessions_rejects_coerced_integer_wire_types(
 
     assert str(raised.value) == "Control API returned an invalid sessions response"
 
-
 @pytest.mark.parametrize("value", [True, "1.5"])
 def test_sessions_rejects_coerced_duration_wire_types(value: object) -> None:
     payload = session_list_payload()
@@ -497,7 +482,6 @@ def test_sessions_rejects_coerced_duration_wire_types(value: object) -> None:
             client.sessions()
 
     assert str(raised.value) == "Control API returned an invalid sessions response"
-
 
 @pytest.mark.parametrize("value", [1, 1.5])
 def test_sessions_accepts_integer_and_float_duration_wire_types(
@@ -519,7 +503,6 @@ def test_sessions_accepts_integer_and_float_duration_wire_types(
     assert result.sessions[0].elapsed_seconds == float(value)
     assert type(result.sessions[0].elapsed_seconds) is float
 
-
 @pytest.mark.parametrize(
     ("field", "nested"),
     [("captured_at", False), ("first_seen", True), ("last_seen", True)],
@@ -539,7 +522,6 @@ def test_sessions_rejects_naive_datetimes(field: str, nested: bool) -> None:
     ) as client:
         with pytest.raises(ControlError, match="invalid sessions response"):
             client.sessions()
-
 
 def test_sessions_normalizes_all_datetimes_to_utc() -> None:
     payload = session_list_payload()
@@ -563,7 +545,6 @@ def test_sessions_normalizes_all_datetimes_to_utc() -> None:
     assert result.captured_at.tzinfo is UTC
     assert result.sessions[0].first_seen.tzinfo is UTC
     assert result.sessions[0].last_seen.tzinfo is UTC
-
 
 @pytest.mark.parametrize(
     ("field", "nested", "value"),
@@ -599,7 +580,6 @@ def test_sessions_maps_utc_conversion_overflow_to_safe_error(
     assert str(raised.value) == "Control API returned an invalid sessions response"
     assert "date value out of range" not in str(raised.value)
 
-
 def test_health_404_is_incompatible_protocol_not_generic_http_error() -> None:
     transport = RecordingTransport(
         lambda request: httpx.Response(
@@ -610,7 +590,6 @@ def test_health_404_is_incompatible_protocol_not_generic_http_error() -> None:
     with ControlClient(SOCKET_PATH, transport=transport) as client:
         with pytest.raises(IncompatibleProtocol, match="health endpoint.*404"):
             client.health()
-
 
 @pytest.mark.parametrize("version", [True, 1.0, "1", 2])
 def test_health_rejects_non_exact_protocol_version(version: object) -> None:
@@ -628,7 +607,6 @@ def test_health_rejects_non_exact_protocol_version(version: object) -> None:
 
     assert [request.url.path for request in transport.requests] == ["/v1/health"]
 
-
 def test_health_rejects_missing_protocol_version() -> None:
     payload = health_payload()
     del payload["protocol_version"]
@@ -641,7 +619,6 @@ def test_health_rejects_missing_protocol_version() -> None:
             client.health()
 
     assert [request.url.path for request in transport.requests] == ["/v1/health"]
-
 
 def test_sessions_rejects_missing_sessions_capability_before_query() -> None:
     transport = RecordingTransport(
@@ -658,7 +635,6 @@ def test_sessions_rejects_missing_sessions_capability_before_query() -> None:
 
     assert [request.url.path for request in transport.requests] == ["/v1/health"]
 
-
 def test_sessions_rejects_omitted_capabilities_before_query() -> None:
     payload = health_payload()
     del payload["capabilities"]
@@ -671,7 +647,6 @@ def test_sessions_rejects_omitted_capabilities_before_query() -> None:
             client.sessions()
 
     assert [request.url.path for request in transport.requests] == ["/v1/health"]
-
 
 @pytest.mark.parametrize(
     "exception_type",
@@ -696,7 +671,6 @@ def test_request_failures_map_to_control_unavailable_with_socket_path(
     assert "\\x0a" in str(raised.value)
     assert "\ntransport" not in str(raised.value)
 
-
 def test_unavailable_reason_truncation_never_splits_escape_token() -> None:
     error = ControlUnavailable(
         SOCKET_PATH,
@@ -708,7 +682,6 @@ def test_unavailable_reason_truncation_never_splits_escape_token() -> None:
     assert "\\x..." not in error.reason
     assert "\\x1..." not in error.reason
 
-
 def test_unavailable_reason_escapes_surrogate_and_nonprintable_codepoints() -> None:
     error = ControlUnavailable(
         SOCKET_PATH,
@@ -718,7 +691,6 @@ def test_unavailable_reason_escapes_surrogate_and_nonprintable_codepoints() -> N
     assert error.reason == "bad\\ud800\\U000e0001"
     error.reason.encode("utf-8", errors="strict")
     str(error).encode("utf-8", errors="strict")
-
 
 @pytest.mark.parametrize("status", [400, 503])
 def test_non_success_json_error_has_bounded_safe_detail(status: int) -> None:
@@ -739,7 +711,6 @@ def test_non_success_json_error_has_bounded_safe_detail(status: int) -> None:
     assert "bad\\x0arequest" in message
     assert "\n" not in message
     assert len(message) < 400
-
 
 def test_non_success_html_error_does_not_dump_body() -> None:
     body = "<html><body>secret internal stack" + "x" * 1000
@@ -764,7 +735,6 @@ def test_non_success_html_error_does_not_dump_body() -> None:
     assert "<html>" not in message
     assert "secret internal stack" not in message
     assert len(message) < 400
-
 
 @pytest.mark.parametrize(
     "body",
@@ -791,7 +761,6 @@ def test_success_json_parser_failures_are_safe(body: str) -> None:
 
     assert str(raised.value) == "Control API returned invalid JSON"
 
-
 @pytest.mark.parametrize(
     "body",
     [
@@ -816,7 +785,6 @@ def test_http_error_json_parser_failures_fall_back_to_status(body: str) -> None:
             client.health()
 
     assert str(raised.value) == "Control API returned HTTP 500"
-
 
 @pytest.mark.parametrize(
     ("response_factory", "match"),
@@ -843,7 +811,6 @@ def test_health_maps_malformed_responses_to_control_error(
         with pytest.raises(ControlError, match=match):
             client.health()
 
-
 def test_sessions_maps_schema_failure_to_control_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         payload: object = health_payload()
@@ -858,7 +825,6 @@ def test_sessions_maps_schema_failure_to_control_error() -> None:
         with pytest.raises(ControlError, match="invalid sessions response"):
             client.sessions()
 
-
 def test_close_is_idempotent_and_use_after_close_is_clear() -> None:
     transport = RecordingTransport(
         lambda request: httpx.Response(200, json=health_payload(), request=request)
@@ -871,3 +837,132 @@ def test_close_is_idempotent_and_use_after_close_is_clear() -> None:
     assert transport.close_count == 1
     with pytest.raises(ControlError, match="closed"):
         client.health()
+
+def metric_response_payload(
+    status: str = "observed", value: object = 0
+) -> dict[str, object]:
+    return {"status": status, "value": value}
+
+def metric_aggregate_payload(value: object = 0) -> dict[str, object]:
+    return {
+        "value": value,
+        "observed_samples": 1,
+        "unavailable_samples": 0,
+        "not_applicable_samples": 0,
+    }
+
+def test_metric_response_enforces_status_value_contract() -> None:
+    assert MetricResponse.model_validate(metric_response_payload()).value == 0
+    unavailable = MetricResponse.model_validate(
+        metric_response_payload("unavailable", None)
+    )
+    not_applicable = MetricResponse.model_validate(
+        metric_response_payload("not_applicable", None)
+    )
+    assert unavailable.value is None
+    assert not_applicable.value is None
+    for payload in (
+        metric_response_payload("observed", None),
+        metric_response_payload("unavailable", 0),
+        metric_response_payload("not_applicable", 0),
+    ):
+        with pytest.raises(ValidationError):
+            MetricResponse.model_validate(payload)
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,
+        -1,
+        "1",
+        MAX_CONTROL_INTEGER + 1,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+    ],
+)
+def test_metric_response_rejects_unsafe_numbers(value: object) -> None:
+    with pytest.raises(ValidationError):
+        MetricResponse.model_validate(metric_response_payload(value=value))
+
+def test_metric_aggregate_allows_large_total_but_bounds_samples() -> None:
+    assert MetricAggregateResponse.model_validate(
+        metric_aggregate_payload(MAX_CONTROL_INTEGER + 1)
+    ).value == MAX_CONTROL_INTEGER + 1
+    for value in (True, -1, "1", MAX_CONTROL_INTEGER + 1):
+        payload = metric_aggregate_payload()
+        payload["observed_samples"] = value
+        with pytest.raises(ValidationError):
+            MetricAggregateResponse.model_validate(payload)
+
+@pytest.mark.parametrize("value", [True, -1, "1", float("nan"), float("inf")])
+def test_metric_aggregate_rejects_invalid_values(value: object) -> None:
+    with pytest.raises(ValidationError):
+        MetricAggregateResponse.model_validate(metric_aggregate_payload(value))
+
+@pytest.mark.parametrize("value", ["0", "1e3", "-1"])
+def test_process_identity_rejects_numeric_datetime_strings(value: str) -> None:
+    with pytest.raises(ValidationError):
+        ProcessIdentityResponse.model_validate({"pid": 1, "started_at": value})
+
+def test_performance_datetimes_normalize_offsets_and_reject_naive_values() -> None:
+    utc = ProcessIdentityResponse.model_validate(
+        {"pid": 1, "started_at": "2026-01-02T03:04:05Z"}
+    )
+    offset = ProcessIdentityResponse.model_validate(
+        {"pid": 1, "started_at": "2026-01-02T05:04:05+02:00"}
+    )
+    assert utc.started_at == offset.started_at
+    assert offset.started_at.tzinfo is UTC
+    with pytest.raises(ValidationError):
+        ProcessIdentityResponse.model_validate(
+            {"pid": 1, "started_at": "2026-01-02T03:04:05"}
+        )
+
+def test_failure_diagnostic_maps_only_safe_structured_fields() -> None:
+    diagnostic = FailureDiagnostic(
+        FailureCategory.UPSTREAM_HTTP,
+        FailureStage.RESPONSE,
+        "provider_error",
+        provider_code="rate_limit_exceeded",
+        exception_type="ProviderError",
+        location="module:function:10",
+    )
+    response = FailureDiagnosticResponse.model_validate(diagnostic)
+    dumped = response.model_dump(mode="json")
+    assert dumped["category"] == "upstream_http"
+    assert dumped["stage"] == "response"
+    assert set(dumped) == set(FailureDiagnosticResponse.model_fields)
+    assert "message" not in dumped
+
+def test_metric_aggregate_requires_observation_for_positive_value() -> None:
+    zero = metric_aggregate_payload(0)
+    zero["observed_samples"] = 0
+    assert MetricAggregateResponse.model_validate(zero).value == 0
+    zero["value"] = 1
+    with pytest.raises(ValidationError):
+        MetricAggregateResponse.model_validate(zero)
+
+
+@pytest.mark.parametrize("method_name", ["health", "sessions"])
+def test_legacy_invalid_json_preserves_parser_cause(method_name: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if method_name == "sessions" and request.url.path == "/v1/health":
+            return httpx.Response(200, json=health_payload(), request=request)
+        return httpx.Response(
+            200,
+            content=b'{"secret":',
+            headers={"content-type": "application/json"},
+            request=request,
+        )
+
+    with ControlClient(
+        SOCKET_PATH,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(ControlError) as raised:
+            getattr(client, method_name)()
+
+    assert str(raised.value) == "Control API returned invalid JSON"
+    assert "secret" not in str(raised.value)
+    assert isinstance(raised.value.__cause__, json.JSONDecodeError)

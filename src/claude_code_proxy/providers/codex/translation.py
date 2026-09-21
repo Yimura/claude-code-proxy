@@ -8,6 +8,7 @@ from typing import Any
 from ...domain.models import (
     CompletionRequest,
     CompletionResponse,
+    ContentBlock,
     RedactedThinking,
     RedactedThinkingBlock,
     StreamComplete,
@@ -23,6 +24,7 @@ from ...domain.models import (
     ToolUseStart,
 )
 from ...failures import FailureCategory, FailureDiagnostic, FailureStage
+from ...performance import ReasoningContinuation
 from ..base import scalar_provider_code
 from ..usage import normalize_usage
 from .identity import CodexIdentity
@@ -45,6 +47,49 @@ def content_to_text(content: Any) -> str:
     if isinstance(content, dict):
         return content.get("text", json.dumps(content))
     return str(content)
+
+
+def reasoning_continuation_state(
+    request: CompletionRequest,
+) -> ReasoningContinuation:
+    if not request.reasoning.enabled:
+        return "not_applicable"
+
+    tool_continuations: dict[str, bool] = {}
+    latest_results: tuple[bool, ...] | None = None
+    for message in request.messages:
+        if message.role == "assistant":
+            _record_tool_continuations(
+                message.content, tool_continuations
+            )
+        result_states = tuple(
+            tool_continuations.get(block.tool_use_id, False)
+            for block in message.content
+            if isinstance(block, ToolResultBlock)
+        )
+        if result_states:
+            latest_results = result_states
+
+    if latest_results is None:
+        return "expected"
+    if all(latest_results):
+        return "restored"
+    return "missing"
+
+
+def _record_tool_continuations(
+    blocks: tuple[ContentBlock, ...],
+    continuations: dict[str, bool],
+) -> None:
+    carrier_available = False
+    for block in blocks:
+        if isinstance(block, RedactedThinkingBlock):
+            carrier_available = (
+                carrier_available
+                or decode_reasoning(block.data) is not None
+            )
+        elif isinstance(block, ToolUseBlock):
+            continuations[block.id] = carrier_available
 
 
 def build_request(
@@ -122,7 +167,7 @@ def _convert_tool_choice(choice, tools):
 class CodexEventTranslator:
     tool_slots: dict[int, str] = field(default_factory=dict)
     tool_arguments: dict[int, str] = field(default_factory=dict)
-    usage: TokenUsage = field(default_factory=lambda: TokenUsage(0, 0))
+    usage: TokenUsage = field(default_factory=lambda: TokenUsage.unavailable())
     stop_reason: str = "end_turn"
     completed: bool = False
 
@@ -234,7 +279,7 @@ def response_from_events(request: CompletionRequest, events: list[StreamEvent]) 
     text_segments: list[list[str]] = []
     tools: dict[str, dict[str, Any]] = {}
     order: list[tuple[str, int | str | RedactedThinkingBlock]] = []
-    complete = StreamComplete("end_turn", TokenUsage(0, 0))
+    complete = StreamComplete("end_turn", TokenUsage.unavailable())
     for event in events:
         if isinstance(event, TextDelta):
             if not order or order[-1][0] != "text":

@@ -27,6 +27,38 @@ class FailureStage(StrEnum):
     ROUTE = "route"
 
 
+_RECOGNIZED_PROVIDER_CODES = frozenset({
+    "ECONNRESET",
+    "api_error",
+    "authentication_error",
+    "billing_error",
+    "conflict_error",
+    "content_policy_violation",
+    "context_length_exceeded",
+    "insufficient_quota",
+    "invalid_prompt",
+    "invalid_request_error",
+    "model_not_found",
+    "not_found_error",
+    "overloaded",
+    "overloaded_error",
+    "permission_error",
+    "rate_limit_error",
+    "rate_limit_exceeded",
+    "request_too_large",
+    "server_error",
+    "service_unavailable",
+    "timeout_error",
+})
+
+
+def recognized_provider_code(value: object) -> str | None:
+    """Return an exact recognized provider category, never arbitrary detail."""
+    if not isinstance(value, str) or value not in _RECOGNIZED_PROVIDER_CODES:
+        return None
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class FailureDiagnostic:
     """Describe a provider failure without carrying untrusted detail text."""
@@ -37,6 +69,13 @@ class FailureDiagnostic:
     provider_code: str | None = None
     exception_type: str | None = None
     location: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "provider_code",
+            recognized_provider_code(self.provider_code),
+        )
 
 
 def retryable_status(status_code: int | None) -> bool:

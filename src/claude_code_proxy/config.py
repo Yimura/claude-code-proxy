@@ -1,6 +1,7 @@
 """Runtime configuration loading."""
 
 from dataclasses import dataclass
+from enum import Enum
 import json
 import logging
 import os
@@ -16,6 +17,12 @@ from .text_safety import log_text
 
 logger = logging.getLogger(__name__)
 OpenAITransport = Literal["litellm", "codex"]
+
+
+class PerformanceMode(str, Enum):
+    OFF = "off"
+    COLLECTOR = "collector"
+    LOGGING = "logging"
 
 
 class ModelDefinition(BaseModel):
@@ -80,6 +87,15 @@ class Settings:
     proxy_port: int = 8082
     control_socket_path: Path | None = None
     session_retention_limit: int = 1000
+    performance_mode: PerformanceMode = PerformanceMode.OFF
+
+    @property
+    def performance_enabled(self) -> bool:
+        return self.performance_mode is not PerformanceMode.OFF
+
+    @property
+    def performance_logging_enabled(self) -> bool:
+        return self.performance_mode is PerformanceMode.LOGGING
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -105,6 +121,7 @@ class Settings:
             proxy_port=_proxy_port_from_environment(),
             control_socket_path=_control_socket_path_from_environment(),
             session_retention_limit=_session_retention_limit_from_environment(),
+            performance_mode=PerformanceMode.OFF,
         )
 
 

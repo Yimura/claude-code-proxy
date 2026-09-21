@@ -55,7 +55,34 @@ The image starts through the installed `claude-code-proxy` executable; `uv run` 
 docker compose exec proxy claude-code-proxy ps
 ```
 
-The default control socket is container-local at `/run/claude-code-proxy/control.sock`. It is not published or mounted, so a CLI running on the host cannot query the container unless you deliberately change the deployment. On macOS and Windows hosts, run `ps` through `docker compose exec` as shown above; the source launcher and host-side control client are supported on Linux only.
+The image itself stays quiet: its `CMD` starts performance mode `off`. The repository's default Compose service overrides that complete `CMD` with collector mode:
+
+```yaml
+services:
+  proxy:
+    command: ["claude-code-proxy", "proxy", "--performance", "collector"]
+```
+
+This collects performance snapshots and events for `perf` and the future TUI without emitting terminal `performance outcome=...` records. Compose `command` replaces the image's complete `CMD`; it does not append arguments. Recreate the service after changing modes, then run snapshot or watch commands inside the container:
+
+```bash
+docker compose up --build -d --force-recreate
+docker compose exec proxy claude-code-proxy perf
+docker compose exec proxy claude-code-proxy perf --watch
+docker compose exec proxy claude-code-proxy perf --watch --format json
+```
+
+For terminal performance records as well as collection, use the logging variant, then recreate the service:
+
+```yaml
+services:
+  proxy:
+    command: ["claude-code-proxy", "proxy", "--performance", "logging"]
+```
+
+Do not add both commands or try to extend the original `CMD`.
+
+The default control socket is container-local at `/run/claude-code-proxy/control.sock`. It is not published or mounted, so a CLI running on the host cannot query the container unless you deliberately change the deployment. On macOS and Windows hosts, run `ps` or `perf` through `docker compose exec` as shown above; the source launcher and host-side control client are supported on Linux only.
 
 ### Connect Claude Code
 
@@ -93,6 +120,50 @@ The session registry excludes prompts and messages, system instructions, tool de
 
 The control app listens only on a local Unix socket and its routes are not added to the public TCP API. In Docker, that socket remains inside the container by default; use `docker compose exec proxy claude-code-proxy ps` to query it. A host-side CLI cannot access it unless you deliberately change the deployment.
 
+### Performance telemetry
+
+`ps` is always available, including when performance collection is disabled. Performance telemetry is an explicit process-start choice:
+
+| Mode | Default | Collection, history, endpoints, `perf`, and TUI data | Terminal performance records |
+|---|---:|---:|---:|
+| `off` | Yes | No | No |
+| `collector` | No | Yes | No |
+| `logging` | No | Yes | Yes |
+
+Start a source deployment in either enabled mode:
+
+```bash
+uv run claude-code-proxy proxy --performance collector
+uv run claude-code-proxy proxy --performance logging
+```
+
+In a second terminal, read a snapshot or start an append-only watch:
+
+```bash
+uv run claude-code-proxy perf
+uv run claude-code-proxy perf --filter state=active --filter provider=openai
+uv run claude-code-proxy perf --filter session_id=abc123 --format json
+uv run claude-code-proxy perf --format json
+uv run claude-code-proxy perf --watch
+uv run claude-code-proxy perf --watch --format json
+```
+
+Performance filters use the same `key=value` combination rules as `ps`; supported keys are `id`, `session_id`, `state`, `provider`, `transport`, `model`, and `effort`. The raw `session_id` filter is private control input that is HMAC-hashed before matching and is never returned.
+
+The snapshot table contains `SESSION`, `MODEL`, `STATE`, request and active counts, latest elapsed time and TTFT, input/output token totals, cache ratio, tool-call and retry totals, and the latest result. JSON preserves the full process identity, capture time, cursor, safe session/agent identity, active requests, the latest 20 finalized requests per retained session, outcome counts, lifetime aggregates, concurrency, measurements, and safe failure diagnostics. `messages` operations can report input, output, cache, reasoning, tool, retry, duration, upstream-duration, and TTFT measurements. `count_tokens` operations report counted input tokens; output, cache, reasoning, tools, and TTFT are not applicable.
+
+Every metric distinguishes three states. `observed` includes zero as a real value, `unavailable` means the provider or lifecycle did not expose a measurement, and `not_applicable` means the metric does not apply to that operation. Tables render the latter two as `—`, while JSON retains the status. TTFT starts at request acceptance and ends at the first non-empty client-visible text, reasoning, or tool event; a response with no such event remains unavailable rather than becoming observed zero. Cache ratio is cache-read tokens divided by total observed input plus cache-read and cache-creation tokens. `+?` marks a table aggregate or ratio as partial because at least one sample was unavailable; count-token samples make cache ratio not applicable.
+
+History and aggregates are memory-only. Each retained session keeps its latest 20 finalized requests plus current active requests; lifetime aggregates cover the retained session row for the current process. A restart clears every row, aggregate, cursor, and event. The process-wide 4,096-event journal feeds each watcher through a bounded 64-event subscriber queue. Ordinary events carry increasing `sequence` values. A reset frame contains a current snapshot and its `cursor`; cursor-control frames advance filtered streams when an ordinary event does not match. A stale cursor, process mismatch, restart, or subscriber overflow produces another reset instead of pretending continuity.
+
+`perf --watch` is snapshot-first when no valid resume cursor exists, then append-only. The CLI validates each NDJSON frame, emits each event once, does not reconnect, exits cleanly on an interrupt, and reports clean EOF rather than silently waiting on a replacement process.
+
+Performance capabilities and routes remain on the Unix-socket control boundary. With mode `off`, health omits `performance` and `performance_events`, both `/v1/performance` and `/v1/performance/events` return 404, and `perf` exits with collector startup guidance. The endpoints are never added to the public TCP API. In Docker the socket remains container-local unless an operator deliberately changes the deployment boundary.
+
+The privacy contract is exclusion-based. Captures, snapshots, journals, control JSON/NDJSON, CLI/TUI output, and structured performance records never retain or emit prompts, messages, system instructions, tool names, tool descriptions, tool schemas, tool inputs or results, credentials, authorization values, API keys, provider request or response payloads, exception messages or locals, encrypted reasoning, or raw client session, agent, or parent-agent IDs. Public session and agent IDs are process-local keyed HMAC values; request IDs are generated opaque values. Provider payloads still receive the content needed to execute the request, but that payload is not a telemetry surface.
+
+This boundary follows OWASP ASVS 5.0.0 V13.2.2, V16.2.5, and V16.4.1 ([standard](https://github.com/OWASP/ASVS/tree/v5.0.0)), plus the OWASP [Logging Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html) guidance to exclude or pseudonymize sensitive fields and safely encode log records, and the [Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html) guidance to correlate with a salted hash instead of a raw session ID. This mapping is implementation guidance, not compliance certification.
+
 ## Logging and Failure Diagnostics
 
 Console records use `timestamp - LEVEL - message`. Request records add an opaque, process-local `[session …]` or `[request …]` correlation label and, when present, an `[agent …]` label plus `parent=…`; request method, endpoint, client and upstream model names, provider, and effort provide operational context. These identifiers support correlation without recording prompt history or raw client session IDs.
@@ -104,7 +175,7 @@ Provider failure records use safe structured fields:
 - `category`: `authentication`, `transport`, `upstream_http`, `provider_protocol`, `translation`, or `internal`.
 - `stage`: `credentials`, `request`, `response`, `stream`, `provider_translation`, `client_translation`, or `route`.
 - `code`: a stable, application-local diagnostic code.
-- `provider_code`: optional provider error identity from an allowlisted scalar field.
+- `provider_code`: optional provider error identity retained only when it exactly matches a conservative recognized-category allowlist.
 - `status` and `retryable`: normalized HTTP/retry context when applicable.
 - Unhandled exceptions captured at route or stream boundaries may additionally include only the exception class and an application-relative `module:function:line` location.
 
@@ -114,17 +185,19 @@ For example, a plain-text server record can look like:
 2026-09-19 12:00:00,000 - WARNING - [session 4f2c9a8d1e03] POST /v1/messages provider request failed category=upstream_http stage=response code=http_error provider_code=rate_limit_exceeded status=429 retryable=True model=client-model upstream=provider-model provider=codex effort=high
 ```
 
-Diagnostic tokens are control-character encoded and bounded; `provider_code` is never a license to log an arbitrary provider body. For Codex non-200 responses, enrichment requires Content-Encoding to be absent or `identity`, an ASCII-decimal Content-Length no greater than 4096 that exactly matches the raw bytes, UTF-8 JSON, a top-level object containing a nested `error` object, and a string, boolean, integer, or finite numeric `error.code`; `error.type` is the fallback and accepts the same scalar types. Otherwise `provider_code` is omitted and the body is never emitted.
+Diagnostic tokens are control-character encoded and bounded; `provider_code` is never a license to log an arbitrary provider body. The frozen diagnostic boundary retains only exact recognized categorical strings, such as `rate_limit_exceeded`, `insufficient_quota`, `invalid_prompt`, `content_policy_violation`, `authentication_error`, `server_error`, or `ECONNRESET`; unknown or empty strings and boolean or numeric values become unavailable. For Codex non-200 responses, optional enrichment also requires Content-Encoding to be absent or `identity`, an ASCII-decimal Content-Length no greater than 4096 that exactly matches the raw bytes, UTF-8 JSON, and a top-level object containing a nested `error` object. A recognized string `error.code`, or recognized string `error.type` fallback, may then be retained. Otherwise `provider_code` is omitted and the body is never emitted.
 
 Application-managed request and provider diagnostic records exclude prompts/messages/system instructions; tool definitions, inputs, and results; request/response bodies; headers; access and refresh tokens; API keys; credentials; connection strings; encrypted reasoning; raw provider payloads; and exception messages, exception locals, and full exception traceback paths. Provider failures returned through the proxy's HTTP and SSE adapters use generic client messages; the structured diagnostic fields above are emitted only in server logs. Framework and dependency logs are outside this contract.
 
 Route middleware and provider/stream adapters coordinate exactly-once failure records at shared boundaries where the same failure propagates, but this boundary-level behavior is not a promise of global deduplication across processes, retries, or independently observed failures.
 
-This contract supports [OWASP ASVS 5.0.0](https://github.com/OWASP/ASVS/tree/v5.0.0) V16.1.1, V16.2.1, V16.2.5, V16.4.1, and V16.5.1, together with the OWASP [Logging Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html) and [Error Handling Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Error_Handling_Cheat_Sheet.html). This mapping is implementation guidance, not compliance certification; operators remain responsible for deployment-level log storage, access, transport, retention, monitoring, and review.
+Structured terminal performance records are emitted only in `logging` performance mode. `collector` keeps the same in-memory metrics and control endpoints without those records, while `off` disables both. Existing startup, request, provider, stream, and failure diagnostics always remain in every mode; performance selection never suppresses failure evidence.
+
+This contract supports OWASP ASVS 5.0.0 V13.2.2, V16.1.1, V16.2.1, V16.2.5, V16.4.1, and V16.5.1 ([standard](https://github.com/OWASP/ASVS/tree/v5.0.0)), together with the OWASP [Logging Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html), [Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html), and [Error Handling Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Error_Handling_Cheat_Sheet.html). This mapping is implementation guidance, not compliance certification; operators remain responsible for deployment-level log storage, access, transport, retention, monitoring, and review.
 
 ## Environment Variables
 
-Model selection belongs in `model_mapping.json`. Environment variables configure credentials, provider authentication, transport, and file locations.
+Model selection belongs in `model_mapping.json`. Environment variables configure credentials, provider authentication, transport, and file locations. No environment variable enables performance telemetry; start `proxy` with `--performance collector` or `--performance logging` for that process. An exported variable cannot silently change the default `off` mode.
 
 ### Variable reference
 
@@ -145,6 +218,7 @@ Model selection belongs in `model_mapping.json`. Environment variables configure
 | `PROXY_PORT` | Selects the public proxy TCP port; Compose applies it to the listener and loopback publication | Optional | `8082` |
 | `CONTROL_SOCKET_PATH` | Overrides the private local control Unix socket path | Optional for source; must be absolute with an existing private parent | Automatic XDG/private fallback for source; image uses `/run/claude-code-proxy/control.sock` |
 | `SESSION_RETENTION_LIMIT` | Sets the maximum inactive logical session rows retained in memory | Optional; must be an integer from `0` through `9223372036854775807` | `1000` |
+| None — CLI only | No environment variable configures performance collection or logging | Use `proxy --performance off\|collector\|logging` at each process start | `off` |
 
 Proxy startup uses LiteLLM's bundled model-cost metadata and does not refresh it over HTTP by default. The application sets `LITELLM_LOCAL_MODEL_COST_MAP=True` only when the variable is absent, so an explicit operator value is preserved. LiteLLM 1.101 recognizes only the case-insensitive literal `true` as local-only; set the variable explicitly to `False` to opt into LiteLLM's startup refresh, optionally from `LITELLM_MODEL_COST_MAP_URL`.
 

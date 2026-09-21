@@ -1,14 +1,15 @@
 """Shared provider contract and errors."""
 
 from collections.abc import AsyncIterator
-import math
 from typing import Protocol
 
 from ..domain.models import CompletionRequest, CompletionResponse, StreamError, StreamEvent
+from ..performance import ProviderTelemetry
 from ..failures import (
     FailureCategory,
     FailureDiagnostic,
     FailureStage,
+    recognized_provider_code,
     retryable_status,
     unexpected_failure_diagnostic,
 )
@@ -99,15 +100,8 @@ def public_error(status_code: int | None) -> tuple[str, str]:
 
 
 def scalar_provider_code(value: object) -> str | None:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float) and math.isfinite(value):
-        return str(value)
-    return None
+    """Retain only recognized provider categories at adapter boundaries."""
+    return recognized_provider_code(value)
 
 
 def _provider_error_fallback(status_code: int | None) -> FailureDiagnostic:
@@ -129,6 +123,20 @@ def _status_code(error: Exception) -> int | None:
 class Provider(Protocol):
     name: str
 
-    async def complete(self, request: CompletionRequest) -> CompletionResponse: ...
-    def stream(self, request: CompletionRequest) -> AsyncIterator[StreamEvent]: ...
-    async def count_tokens(self, request: CompletionRequest) -> int: ...
+    async def complete(
+        self,
+        request: CompletionRequest,
+        telemetry: ProviderTelemetry | None = None,
+    ) -> CompletionResponse: ...
+
+    def stream(
+        self,
+        request: CompletionRequest,
+        telemetry: ProviderTelemetry | None = None,
+    ) -> AsyncIterator[StreamEvent]: ...
+
+    async def count_tokens(
+        self,
+        request: CompletionRequest,
+        telemetry: ProviderTelemetry | None = None,
+    ) -> int: ...

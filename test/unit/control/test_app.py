@@ -1,9 +1,9 @@
-from datetime import UTC, datetime, timedelta, timezone
 import json
+from datetime import UTC, datetime, timedelta, timezone
 
+import pytest
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
-import pytest
 
 import claude_code_proxy.control.app as control_app_module
 from claude_code_proxy.control.app import create_control_app
@@ -36,7 +36,6 @@ class RegistryClock:
         self.wall += timedelta(seconds=seconds)
         self.monotonic += seconds
 
-
 def metadata(
     client_id: str,
     agent_id: str | None = None,
@@ -63,7 +62,6 @@ def metadata(
         context_window=context_window,
     )
 
-
 def registry(
     clock: RegistryClock, inactive_limit: int = 10
 ) -> SessionRegistry:
@@ -74,12 +72,10 @@ def registry(
         monotonic_clock=clock.monotonic_now,
     )
 
-
 def filtered_registry() -> tuple[SessionRegistry, dict[str, str]]:
     clock = RegistryClock()
     sessions = registry(clock)
     active = sessions.begin(metadata("raw-active"))
-
     clock.advance()
     idle = sessions.begin(
         metadata(
@@ -93,7 +89,6 @@ def filtered_registry() -> tuple[SessionRegistry, dict[str, str]]:
         )
     )
     sessions.finish(idle, "completed")
-
     clock.advance()
     failed = sessions.begin(
         metadata(
@@ -113,13 +108,11 @@ def filtered_registry() -> tuple[SessionRegistry, dict[str, str]]:
         "failed": failed.public_id,
     }
 
-
 async def request(app, path: str, params=None):
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://control"
     ) as client:
         return await client.get(path, params=params)
-
 
 async def test_session_response_includes_agent_snapshots() -> None:
     clock = RegistryClock()
@@ -130,16 +123,13 @@ async def test_session_response_includes_agent_snapshots() -> None:
         application_version="1.0",
         pid=123,
     )
-
     response = await request(app, "/v1/sessions")
-
     assert response.status_code == 200
     agent = response.json()["sessions"][0]["agents"][0]
     assert agent["id"] == handle.agent_public_id
     assert agent["parent_id"] == handle.parent_agent_public_id
     assert "client_session_id" not in agent
     assert "agent_id" not in agent
-
 
 async def test_health_counts_roots_not_agent_rows() -> None:
     clock = RegistryClock()
@@ -151,12 +141,14 @@ async def test_health_counts_roots_not_agent_rows() -> None:
         application_version="1.0",
         pid=123,
     )
-
     response = await request(app, "/v1/health")
-
-    assert response.json()["capabilities"] == ["sessions", "agents"]
+    assert response.json()["capabilities"] == [
+        "sessions",
+        "agents",
+        "performance",
+        "performance_events",
+    ]
     assert response.json()["sessions"] == {"active": 1, "retained": 1}
-
 
 async def test_health_reports_exact_version_process_time_limit_and_counts() -> None:
     registry_clock = RegistryClock()
@@ -173,9 +165,7 @@ async def test_health_reports_exact_version_process_time_limit_and_counts() -> N
         pid=4321,
         clock=lambda: now,
     )
-
     response = await request(app, "/v1/health")
-
     assert response.status_code == 200
     assert response.json() == {
         "protocol_version": 1,
@@ -183,11 +173,15 @@ async def test_health_reports_exact_version_process_time_limit_and_counts() -> N
         "pid": 4321,
         "started_at": "2026-01-02T03:04:05Z",
         "uptime_seconds": 12.5,
-        "capabilities": ["sessions", "agents"],
+        "capabilities": [
+            "sessions",
+            "agents",
+            "performance",
+            "performance_events",
+        ],
         "sessions": {"active": 1, "retained": 2},
         "inactive_limit": 7,
     }
-
 
 async def test_health_clamps_uptime_when_clock_precedes_start() -> None:
     clock = RegistryClock()
@@ -199,20 +193,15 @@ async def test_health_clamps_uptime_when_clock_precedes_start() -> None:
         pid=1,
         clock=lambda: started - timedelta(seconds=1),
     )
-
     response = await request(app, "/v1/health")
-
     assert response.json()["uptime_seconds"] == 0
-
 
 async def test_health_uses_installed_distribution_version(monkeypatch) -> None:
     clock = RegistryClock()
     requested_distributions: list[str] = []
-
     def version(distribution: str) -> str:
         requested_distributions.append(distribution)
         return "4.5.6"
-
     monkeypatch.setattr(control_app_module.metadata, "version", version)
     app = create_control_app(
         registry(clock),
@@ -220,12 +209,9 @@ async def test_health_uses_installed_distribution_version(monkeypatch) -> None:
         pid=1,
         clock=clock.wall_now,
     )
-
     response = await request(app, "/v1/health")
-
     assert response.json()["application_version"] == "4.5.6"
     assert requested_distributions == ["anthropic-proxy"]
-
 
 async def test_control_app_defaults_are_resolved_at_construction(monkeypatch) -> None:
     registry_clock = RegistryClock()
@@ -233,26 +219,20 @@ async def test_control_app_defaults_are_resolved_at_construction(monkeypatch) ->
     current = started + timedelta(seconds=3)
     times = iter((started, current))
     requested_distributions: list[str] = []
-
     monkeypatch.setattr(control_app_module, "_utc_now", lambda: next(times))
     monkeypatch.setattr(control_app_module.os, "getpid", lambda: 2468)
-
     def version(distribution: str) -> str:
         requested_distributions.append(distribution)
         return "7.8.9"
-
     monkeypatch.setattr(control_app_module.metadata, "version", version)
-
     app = create_control_app(registry(registry_clock))
     response = await request(app, "/v1/health")
-
     assert response.status_code == 200
     assert response.json()["started_at"] == "2026-04-05T06:07:08Z"
     assert response.json()["uptime_seconds"] == 3
     assert response.json()["application_version"] == "7.8.9"
     assert response.json()["pid"] == 2468
     assert requested_distributions == ["anthropic-proxy"]
-
 
 async def test_sessions_preserve_registry_order_and_one_capture_time() -> None:
     registry_clock = RegistryClock()
@@ -268,9 +248,7 @@ async def test_sessions_preserve_registry_order_and_one_capture_time() -> None:
         pid=1,
         clock=lambda: captured_at,
     )
-
     response = await request(app, "/v1/sessions")
-
     assert response.status_code == 200
     payload = response.json()
     assert payload["captured_at"] == "2026-02-03T04:05:06Z"
@@ -278,7 +256,6 @@ async def test_sessions_preserve_registry_order_and_one_capture_time() -> None:
         second.public_id,
         first.public_id,
     ]
-
 
 @pytest.mark.parametrize(
     ("entry", "expected_name"),
@@ -303,14 +280,11 @@ async def test_sessions_support_each_filter_key(
         application_version="1.0",
         pid=1,
     )
-
     response = await request(app, "/v1/sessions", [("filter", value)])
-
     assert response.status_code == 200
     assert [item["id"] for item in response.json()["sessions"]] == [
         ids[expected_name]
     ]
-
 
 async def test_session_id_filter_never_returns_raw_id() -> None:
     sessions, ids = filtered_registry()
@@ -320,20 +294,17 @@ async def test_session_id_filter_never_returns_raw_id() -> None:
         application_version="1.0",
         pid=1,
     )
-
     raw_id = "raw-idle"
     response = await request(
         app,
         "/v1/sessions",
         [("filter", f"session_id={raw_id}")],
     )
-
     assert response.status_code == 200
     assert [item["id"] for item in response.json()["sessions"]] == [
         ids["idle"]
     ]
     assert raw_id not in response.text
-
 
 async def test_repeated_filter_key_is_or_and_different_keys_are_and() -> None:
     sessions, ids = filtered_registry()
@@ -343,7 +314,6 @@ async def test_repeated_filter_key_is_or_and_different_keys_are_and() -> None:
         application_version="1.0",
         pid=1,
     )
-
     or_response = await request(
         app,
         "/v1/sessions",
@@ -354,7 +324,6 @@ async def test_repeated_filter_key_is_or_and_different_keys_are_and() -> None:
         "/v1/sessions",
         [("filter", "transport=litellm"), ("filter", "effort=medium")],
     )
-
     assert {item["id"] for item in or_response.json()["sessions"]} == {
         ids["idle"],
         ids["failed"],
@@ -362,7 +331,6 @@ async def test_repeated_filter_key_is_or_and_different_keys_are_and() -> None:
     assert [item["id"] for item in and_response.json()["sessions"]] == [
         ids["idle"]
     ]
-
 
 @pytest.mark.parametrize(
     "entry",
@@ -383,11 +351,8 @@ async def test_malformed_filter_entries_return_422(entry: str) -> None:
         application_version="1.0",
         pid=1,
     )
-
     response = await request(app, "/v1/sessions", [("filter", entry)])
-
     assert response.status_code == 422
-
 
 async def test_filter_entry_length_accepts_256_and_rejects_257_characters() -> None:
     sessions, _ = filtered_registry()
@@ -399,20 +364,17 @@ async def test_filter_entry_length_accepts_256_and_rejects_257_characters() -> N
     )
     exactly_256 = "model=" + "x" * 250
     exactly_257 = "model=" + "x" * 251
-
     accepted = await request(
         app, "/v1/sessions", [("filter", exactly_256)]
     )
     rejected = await request(
         app, "/v1/sessions", [("filter", exactly_257)]
     )
-
     assert len(exactly_256) == 256
     assert accepted.status_code == 200
     assert accepted.json()["sessions"] == []
     assert len(exactly_257) == 257
     assert rejected.status_code == 422
-
 
 async def test_invalid_session_id_filter_does_not_echo_raw_value() -> None:
     sessions, _ = filtered_registry()
@@ -423,17 +385,14 @@ async def test_invalid_session_id_filter_does_not_echo_raw_value() -> None:
         pid=1,
     )
     raw_id = "sensitive-session-" + "x" * 240
-
     response = await request(
         app,
         "/v1/sessions",
         [("filter", f"session_id={raw_id}")],
     )
-
     assert response.status_code == 422
     assert response.json() == {"detail": "Invalid session filter"}
     assert raw_id not in response.text
-
 
 async def test_exactly_32_filter_entries_are_accepted() -> None:
     sessions, ids = filtered_registry()
@@ -444,12 +403,9 @@ async def test_exactly_32_filter_entries_are_accepted() -> None:
         pid=1,
     )
     entries = [("filter", "state=idle") for _ in range(32)]
-
     response = await request(app, "/v1/sessions", entries)
-
     assert response.status_code == 200
     assert [item["id"] for item in response.json()["sessions"]] == [ids["idle"]]
-
 
 async def test_filter_whitespace_is_normalized() -> None:
     sessions, ids = filtered_registry()
@@ -459,14 +415,11 @@ async def test_filter_whitespace_is_normalized() -> None:
         application_version="1.0",
         pid=1,
     )
-
     response = await request(
         app, "/v1/sessions", [("filter", " state = idle ")]
     )
-
     assert response.status_code == 200
     assert [item["id"] for item in response.json()["sessions"]] == [ids["idle"]]
-
 
 async def test_more_than_32_filter_entries_returns_422() -> None:
     sessions, _ = filtered_registry()
@@ -477,11 +430,8 @@ async def test_more_than_32_filter_entries_returns_422() -> None:
         pid=1,
     )
     entries = [("filter", "state=idle") for _ in range(33)]
-
     response = await request(app, "/v1/sessions", entries)
-
     assert response.status_code == 422
-
 
 async def test_ambiguous_id_prefix_returns_safe_422() -> None:
     registry_clock = RegistryClock()
@@ -501,17 +451,14 @@ async def test_ambiguous_id_prefix_returns_safe_422() -> None:
         application_version="1.0",
         pid=1,
     )
-
     response = await request(
         app, "/v1/sessions", [("filter", f"id={collision}")]
     )
-
     assert response.status_code == 422
     assert response.json() == {"detail": "Session ID prefix is ambiguous"}
     serialized = response.text
     assert "raw-collision" not in serialized
     assert all(snapshot.id not in serialized for snapshot in sessions.snapshots())
-
 
 async def test_session_json_excludes_raw_ids_and_internal_fields() -> None:
     sessions, _ = filtered_registry()
@@ -521,9 +468,7 @@ async def test_session_json_excludes_raw_ids_and_internal_fields() -> None:
         application_version="1.0",
         pid=1,
     )
-
     response = await request(app, "/v1/sessions")
-
     assert response.status_code == 200
     serialized = json.dumps(response.json())
     assert "raw-active" not in serialized
@@ -548,7 +493,6 @@ async def test_session_json_excludes_raw_ids_and_internal_fields() -> None:
     }
     assert all(set(item) == expected_fields for item in response.json()["sessions"])
 
-
 @pytest.mark.parametrize(
     "path",
     [
@@ -569,11 +513,8 @@ async def test_control_app_exposes_only_versioned_control_routes(path: str) -> N
         application_version="1.0",
         pid=1,
     )
-
     response = await request(app, path)
-
     assert response.status_code == 404
-
 
 def test_health_schemas_are_frozen_and_protocol_version_is_literal_one() -> None:
     counts = SessionCounts(active=1, retained=2)
@@ -586,7 +527,6 @@ def test_health_schemas_are_frozen_and_protocol_version_is_literal_one() -> None
         "inactive_limit": 5,
     }
     health = HealthResponse(**values)
-
     assert health.protocol_version == 1
     with pytest.raises(ValidationError, match="frozen"):
         counts.active = 2
@@ -594,7 +534,6 @@ def test_health_schemas_are_frozen_and_protocol_version_is_literal_one() -> None
         health.pid = 456
     with pytest.raises(ValidationError, match="Input should be 1"):
         HealthResponse(protocol_version=2, **values)
-
 
 def test_session_response_validates_snapshot_attributes_and_is_frozen() -> None:
     snapshot = SessionSnapshot(
@@ -613,14 +552,11 @@ def test_session_response_validates_snapshot_attributes_and_is_frozen() -> None:
         elapsed_seconds=2.5,
         last_result="completed",
     )
-
     response = SessionResponse.model_validate(snapshot)
-
     assert response.model_dump() == snapshot.__dict__
     assert "client_session_id" not in SessionResponse.model_fields
     with pytest.raises(ValidationError, match="frozen"):
         response.requests = 4
-
 
 def test_session_list_response_stores_a_frozen_tuple() -> None:
     snapshot = SessionSnapshot(
@@ -640,17 +576,14 @@ def test_session_list_response_stores_a_frozen_tuple() -> None:
         last_result=None,
     )
     session = SessionResponse.model_validate(snapshot)
-
     response = SessionListResponse(
         captured_at=datetime(2026, 1, 1, tzinfo=UTC),
         sessions=[session],
     )
-
     assert response.sessions == (session,)
     assert isinstance(response.sessions, tuple)
     with pytest.raises(ValidationError, match="frozen"):
         response.sessions = ()
-
 
 async def test_control_app_normalizes_aware_datetimes_and_rejects_naive_ones() -> None:
     clock = RegistryClock()
@@ -662,9 +595,7 @@ async def test_control_app_normalizes_aware_datetimes_and_rejects_naive_ones() -
         pid=1,
         clock=lambda: datetime(2026, 1, 1, 3, tzinfo=offset),
     )
-
     response = await request(app, "/v1/health")
-
     assert response.json()["started_at"] == "2026-01-01T00:00:00Z"
     assert response.json()["uptime_seconds"] == 3600
     with pytest.raises(ValueError, match="started_at must be timezone-aware"):
@@ -674,7 +605,6 @@ async def test_control_app_normalizes_aware_datetimes_and_rejects_naive_ones() -
             application_version="1.0",
             pid=1,
         )
-
     naive_clock_app = create_control_app(
         registry(clock),
         started_at=clock.wall,

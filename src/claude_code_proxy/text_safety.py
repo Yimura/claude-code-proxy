@@ -4,6 +4,11 @@ from collections.abc import Callable
 import unicodedata
 
 
+TELEMETRY_MODEL_MAX_LENGTH = 256
+TELEMETRY_ATTRIBUTE_MAX_LENGTH = 64
+TELEMETRY_BLANK_TEXT = "<blank>"
+
+
 def scalar_text(value: str) -> str:
     """Return Unicode scalar text, escaping each unpaired surrogate."""
     return "".join(_scalar_atom(character) for character in value)
@@ -39,6 +44,19 @@ def log_text(value: str) -> str:
     return "".join(_log_atom(character) for character in value)
 
 
+def retained_telemetry_text(value: str, *, max_length: int) -> str:
+    """Return bounded printable telemetry text without splitting escapes."""
+    if type(value) is not str:
+        raise TypeError("telemetry text must be a string")
+    retained = TELEMETRY_BLANK_TEXT if not value.strip() else value
+    return _bounded_log_value(
+        retained,
+        max_length=max_length,
+        encode_atom=escaped_text_atom,
+        exact_suffix=True,
+    )
+
+
 def bounded_log_text(value: str, *, max_length: int) -> str:
     """Encode untrusted log text and bound its rendered length."""
     return _bounded_log_value(value, max_length=max_length, encode_atom=log_text)
@@ -52,7 +70,11 @@ def bounded_log_token(value: str, *, max_length: int) -> str:
 
 
 def _bounded_log_value(
-    value: str, *, max_length: int, encode_atom: Callable[[str], str]
+    value: str,
+    *,
+    max_length: int,
+    encode_atom: Callable[[str], str],
+    exact_suffix: bool = False,
 ) -> str:
     if max_length < 3:
         raise ValueError("max_length must be at least 3")
@@ -62,19 +84,31 @@ def _bounded_log_value(
     for character in value:
         atom = encode_atom(character)
         if rendered_length + len(atom) > max_length:
-            return _truncated_log_text(atoms, rendered_length, max_length)
+            return _truncated_log_text(
+                atoms,
+                rendered_length,
+                max_length,
+                exact_suffix=exact_suffix,
+            )
         atoms.append(atom)
         rendered_length += len(atom)
     return "".join(atoms)
 
 
 def _truncated_log_text(
-    atoms: list[str], rendered_length: int, max_length: int
+    atoms: list[str],
+    rendered_length: int,
+    max_length: int,
+    *,
+    exact_suffix: bool,
 ) -> str:
     prefix_limit = max_length - 3
     while rendered_length > prefix_limit:
         rendered_length -= len(atoms.pop())
-    return "".join(atoms) + "." * (max_length - rendered_length)
+    suffix = "..." if exact_suffix else "." * (
+        max_length - rendered_length
+    )
+    return "".join(atoms) + suffix
 
 
 def _log_atom(character: str) -> str:

@@ -38,7 +38,7 @@ def test_stream_error_preserves_safe_provider_error(status_code, error_type):
         FailureCategory.UPSTREAM_HTTP,
         FailureStage.RESPONSE,
         "http_error",
-        "provider-code",
+        "server_error",
     )
     error = ProviderError(
         "Safe provider message",
@@ -102,13 +102,20 @@ def test_provider_error_without_diagnostic_gets_structured_fallback():
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        ("provider-code", "provider-code"),
-        ("", ""),
-        (True, "true"),
-        (False, "false"),
-        (42, "42"),
-        (-3, "-3"),
-        (1.25, "1.25"),
+        ("rate_limit_exceeded", "rate_limit_exceeded"),
+        ("insufficient_quota", "insufficient_quota"),
+        ("invalid_prompt", "invalid_prompt"),
+        ("content_policy_violation", "content_policy_violation"),
+        ("server_error", "server_error"),
+        ("ECONNRESET", "ECONNRESET"),
+        ("provider-code", None),
+        ("bounded_code", None),
+        ("", None),
+        (True, None),
+        (False, None),
+        (42, None),
+        (-3, None),
+        (1.25, None),
         (float("nan"), None),
         (float("inf"), None),
         (float("-inf"), None),
@@ -117,8 +124,11 @@ def test_provider_error_without_diagnostic_gets_structured_fallback():
         (["nested"], None),
     ],
 )
-def test_scalar_provider_code_canonicalizes_only_finite_scalars(value, expected):
+def test_scalar_provider_code_preserves_only_recognized_categories(
+    value, expected
+):
     assert scalar_provider_code(value) == expected
+
 
 
 def test_protocol_error_uses_stable_code_and_requested_stage():

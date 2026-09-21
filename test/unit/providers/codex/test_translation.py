@@ -12,7 +12,12 @@ from claude_code_proxy.domain.models import (
 from claude_code_proxy.failures import FailureCategory, FailureDiagnostic, FailureStage
 from claude_code_proxy.providers.codex.identity import CodexIdentity
 from claude_code_proxy.providers.codex.reasoning import decode_reasoning, encode_reasoning
-from claude_code_proxy.providers.codex.translation import CodexEventTranslator, build_request, response_from_events
+from claude_code_proxy.providers.codex.translation import (
+    CodexEventTranslator,
+    build_request,
+    reasoning_continuation_state,
+    response_from_events,
+)
 from claude_code_proxy.reasoning import ReasoningPolicy
 
 
@@ -27,6 +32,179 @@ def request(**changes):
     )
     return replace(base, **changes)
 
+
+def test_reasoning_continuation_is_not_applicable_when_not_enabled():
+    assert reasoning_continuation_state(
+        request(reasoning=ReasoningPolicy(False, None))
+    ) == "not_applicable"
+    assert reasoning_continuation_state(
+        request(reasoning=ReasoningPolicy(None, None))
+    ) == "not_applicable"
+
+
+def test_reasoning_continuation_is_expected_without_tool_results():
+    carrier = encode_reasoning("sensitive-fresh-state", [])
+    prepared = request(messages=(
+        Message("assistant", (RedactedThinkingBlock(carrier),)),
+        Message("user", (TextBlock("next"),)),
+    ))
+
+    result = reasoning_continuation_state(prepared)
+
+    assert result == "expected"
+    assert "sensitive-fresh-state" not in repr(result)
+    assert carrier not in repr(result)
+
+
+def test_reasoning_continuation_is_restored_across_messages_and_blocks():
+    carrier = encode_reasoning(
+        "sensitive-restored-state",
+        [{"type": "summary_text", "text": "private"}],
+    )
+    prepared = request(
+        messages=(
+            Message(
+                "assistant",
+                (
+                    TextBlock("before"),
+                    RedactedThinkingBlock("foreign-carrier"),
+                ),
+            ),
+            Message(
+                "assistant",
+                (
+                    RedactedThinkingBlock(carrier),
+                    ToolUseBlock("call-1", "lookup", {}),
+                ),
+            ),
+            Message(
+                "user",
+                (
+                    TextBlock("result follows"),
+                    ToolResultBlock("call-1", "done"),
+                ),
+            ),
+        )
+    )
+
+    result = reasoning_continuation_state(prepared)
+
+    assert result == "restored"
+    assert "sensitive-restored-state" not in repr(result)
+    assert carrier not in repr(result)
+
+
+def test_reasoning_continuation_does_not_reuse_stale_carrier():
+    carrier = encode_reasoning("state-for-call-a", [])
+    prepared = request(
+        messages=(
+            Message(
+                "assistant",
+                (
+                    RedactedThinkingBlock(carrier),
+                    ToolUseBlock("call-a", "first", {}),
+                ),
+            ),
+            Message("user", (ToolResultBlock("call-a", "done"),)),
+            Message(
+                "assistant",
+                (ToolUseBlock("call-b", "second", {}),),
+            ),
+            Message("user", (ToolResultBlock("call-b", "done"),)),
+        )
+    )
+
+    assert reasoning_continuation_state(prepared) == "missing"
+
+
+def test_reasoning_continuation_requires_all_parallel_calls_restored():
+    carrier = encode_reasoning("state-for-second-call", [])
+    prepared = request(
+        messages=(
+            Message(
+                "assistant",
+                (
+                    ToolUseBlock("call-a", "first", {}),
+                    RedactedThinkingBlock(carrier),
+                    ToolUseBlock("call-b", "second", {}),
+                ),
+            ),
+            Message(
+                "user",
+                (
+                    ToolResultBlock("call-a", "first done"),
+                    ToolResultBlock("call-b", "second done"),
+                ),
+            ),
+        )
+    )
+
+    assert reasoning_continuation_state(prepared) == "missing"
+
+
+def test_reasoning_continuation_does_not_apply_carrier_after_call():
+    carrier = encode_reasoning("late-state", [])
+    prepared = request(
+        messages=(
+            Message(
+                "assistant",
+                (
+                    ToolUseBlock("call-a", "lookup", {}),
+                    RedactedThinkingBlock(carrier),
+                ),
+            ),
+            Message("user", (ToolResultBlock("call-a", "done"),)),
+        )
+    )
+
+    assert reasoning_continuation_state(prepared) == "missing"
+
+
+def test_reasoning_continuation_restores_parallel_calls_after_one_carrier():
+    carrier = encode_reasoning("parallel-state", [])
+    prepared = request(
+        messages=(
+            Message(
+                "assistant",
+                (
+                    RedactedThinkingBlock(carrier),
+                    ToolUseBlock("call-a", "first", {}),
+                    ToolUseBlock("call-b", "second", {}),
+                ),
+            ),
+            Message(
+                "user",
+                (
+                    ToolResultBlock("call-a", "first done"),
+                    ToolResultBlock("call-b", "second done"),
+                ),
+            ),
+        )
+    )
+
+    assert reasoning_continuation_state(prepared) == "restored"
+
+
+def test_reasoning_continuation_is_missing_without_valid_carrier():
+    for blocks in (
+        (),
+        (RedactedThinkingBlock("anthropic-ciphertext"),),
+        (RedactedThinkingBlock("codex-reasoning-v1:not-base64!"),),
+    ):
+        prepared = request(
+            messages=(
+                Message(
+                    "assistant",
+                    blocks + (ToolUseBlock("call-1", "lookup", {}),),
+                ),
+                Message(
+                    "user",
+                    (ToolResultBlock("call-1", "done"),),
+                ),
+            )
+        )
+
+        assert reasoning_continuation_state(prepared) == "missing"
 
 
 def test_build_request_adds_shared_cache_and_turn_metadata():
@@ -190,6 +368,20 @@ def test_event_translator_maps_text_tools_usage_and_stop():
     assert translator.finish() == StreamComplete("tool_use", TokenUsage(4, 2))
 
 
+def test_event_translator_without_usage_marks_fields_unavailable():
+    translator = CodexEventTranslator()
+
+    assert translator.usage.observed_fields == frozenset()
+    translator.feed("response.completed", {"status": "completed"})
+    assert translator.finish().usage.observed_fields == frozenset()
+
+
+def test_response_from_events_without_completion_marks_fields_unavailable():
+    response = response_from_events(request(), [])
+
+    assert response.usage.observed_fields == frozenset()
+
+
 def test_response_failed_excludes_message_and_preserves_scalar_code():
     events = CodexEventTranslator().feed(
         "response.failed",
@@ -217,7 +409,7 @@ def test_response_failed_excludes_message_and_preserves_scalar_code():
     assert "secret upstream detail" not in repr(events)
 
 
-def test_response_failed_falls_back_to_scalar_type_only():
+def test_response_failed_omits_unrecognized_numeric_type():
     event = CodexEventTranslator().feed(
         "response.failed",
         {"error": {"code": {"unsafe": "value"}, "type": 503}},
@@ -227,17 +419,16 @@ def test_response_failed_falls_back_to_scalar_type_only():
         FailureCategory.PROVIDER_PROTOCOL,
         FailureStage.STREAM,
         "response_failed",
-        "503",
     )
 
 
-def test_response_failed_preserves_empty_scalar_code():
+def test_response_failed_omits_empty_scalar_code():
     event = CodexEventTranslator().feed(
         "response.failed",
         {"error": {"code": "", "type": "must_not_replace"}},
     )[0]
 
-    assert event.diagnostic.provider_code == ""
+    assert event.diagnostic.provider_code is None
 
 
 def test_completion_maps_nested_cache_and_reasoning_usage():
