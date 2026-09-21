@@ -19,6 +19,7 @@ from claude_code_proxy.limits import MAX_CONTROL_INTEGER
 from claude_code_proxy.observability import (
     AmbiguousSessionId,
     InvalidSessionFilter,
+    ObservationHandle,
     SessionMetadata,
     SessionRegistry,
 )
@@ -88,6 +89,22 @@ def test_constructor_enforces_signed_64_inactive_limit() -> None:
 def test_constructor_rejects_negative_inactive_limit() -> None:
     with pytest.raises(ValueError, match="inactive_limit"):
         SessionRegistry(-1)
+
+
+def test_observation_handle_preserves_default_operation_and_positionals() -> None:
+    default = ObservationHandle("key", "request", "public", 1.0, False, False)
+    explicit = ObservationHandle(
+        "key",
+        "request",
+        "public",
+        1.0,
+        False,
+        False,
+        operation="count_tokens",
+    )
+
+    assert default.operation == "messages"
+    assert explicit.operation == "count_tokens"
 
 
 

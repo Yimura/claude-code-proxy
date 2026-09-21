@@ -77,10 +77,10 @@ class ObservationHandle:
     key: str
     request_id: str
     public_id: str
-    operation: OperationKind
     started_monotonic: float
     is_new: bool
     request_scoped: bool
+    operation: OperationKind = "messages"
     agent_key: str | None = None
     agent_public_id: str | None = None
     parent_agent_public_id: str | None = None
