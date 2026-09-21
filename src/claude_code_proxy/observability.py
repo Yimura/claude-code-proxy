@@ -12,28 +12,25 @@ import time
 from typing import Literal
 import uuid
 
-from .domain.models import (
-    ClientIdentity, CompletionResponse, StreamEvent, TokenUsage, ToolUseStart,
-)
-from .event_journal import (
-    EventJournal, EventReservation, EventType, JournalEvent, Subscription,
-)
+from .domain.models import ClientIdentity, CompletionResponse, StreamEvent
+from .domain.models import TokenUsage, ToolUseStart
+from .event_journal import EventJournal, EventReservation, EventType
+from .event_journal import JournalEvent, Subscription
 from .failures import FailureDiagnostic
 from .limits import MAX_CONTROL_INTEGER
-from .performance import (
-    OperationKind, ReasoningContinuation, RequestOutcome, RequestPerformance,
-    RequestPerformanceSnapshot, RequestTelemetryObserver, SessionPerformance,
-    SessionPerformanceSnapshot,
-)
+from .performance import OperationKind, ReasoningContinuation, RequestOutcome
+from .performance import RequestPerformance, RequestPerformanceSnapshot
+from .performance import RequestTelemetryObserver, SessionPerformance
+from .performance import SessionPerformanceSnapshot, validate_clock_sample
 from .text_safety import scalar_text
 
 SessionState = Literal["active", "idle", "failed"]
 SessionResult = Literal["completed", "failed"]
 SessionFilters = Mapping[str, Sequence[str]]
 
-_FILTER_FIELDS = frozenset({
-    "id", "session_id", "state", "provider", "transport", "model", "effort",
-})
+_FILTER_FIELDS = frozenset(
+    {"id", "session_id", "state", "provider", "transport", "model", "effort"}
+)
 
 
 @dataclass(frozen=True)
@@ -47,9 +44,7 @@ class SessionMetadata:
     context_window: int | None
 
     def __post_init__(self) -> None:
-        for name in (
-            "client_model", "upstream_model", "provider", "transport", "effort",
-        ):
+        for name in ("client_model", "upstream_model", "provider", "transport", "effort"):
             object.__setattr__(self, name, scalar_text(getattr(self, name)))
 
 
@@ -126,11 +121,11 @@ class PerformanceSubscription:
 
 
 class InvalidSessionFilter(ValueError):
-    """Raised when a session snapshot filter is malformed."""
+    pass
 
 
 class AmbiguousSessionId(ValueError):
-    """Raised when a public ID prefix identifies multiple sessions."""
+    pass
 
 
 @dataclass(frozen=True)
@@ -364,13 +359,14 @@ class SessionRegistry:
             if target is None:
                 return
             record, request = target
-            now = self._monotonic_clock()
+            occurred_at, now = self._sample_event_clocks_locked(request)
             publish = (
                 request.would_mark_upstream_started()
                 and self._progress_due(record, request, now)
             )
             self._update_upstream_locked(
-                record, request, request.mark_upstream_started, now, publish
+                record, request, request.mark_upstream_started,
+                occurred_at, now, publish,
             )
 
     def upstream_finished(self, handle: ObservationHandle) -> None:
@@ -379,18 +375,20 @@ class SessionRegistry:
             if target is None:
                 return
             record, request = target
-            now = self._monotonic_clock()
+            occurred_at, now = self._sample_event_clocks_locked(request)
             publish = (
                 request.would_mark_upstream_finished()
                 and self._progress_due(record, request, now)
             )
             self._update_upstream_locked(
-                record, request, request.mark_upstream_finished, now, publish
+                record, request, request.mark_upstream_finished,
+                occurred_at, now, publish,
             )
 
     def _update_upstream_locked(
         self, record: _SessionRecord, request: RequestPerformance,
-        mutation: Callable[[float], bool], now: float, publish: bool,
+        mutation: Callable[[float], bool], occurred_at: datetime,
+        now: float, publish: bool,
     ) -> None:
         if not publish:
             mutation(now)
@@ -399,7 +397,7 @@ class SessionRegistry:
             if mutation(now):
                 self._commit_events_locked(
                     reservation, record, request, ("progress",),
-                    self._wall_clock(), now,
+                    occurred_at, now,
                 )
 
     def stream_event(
@@ -410,7 +408,7 @@ class SessionRegistry:
             if target is None:
                 return
             record, request = target
-            now = self._monotonic_clock()
+            occurred_at, now = self._sample_event_clocks_locked(request)
             event_types = self._stream_event_plan(record, request, event, now)
             if not event_types:
                 request.observe_stream_event(event, now)
@@ -419,7 +417,7 @@ class SessionRegistry:
                 request.observe_stream_event(event, now)
                 self._commit_events_locked(
                     reservation, record, request, event_types,
-                    self._wall_clock(), now,
+                    occurred_at, now,
                 )
 
     def _stream_event_plan(
@@ -445,7 +443,7 @@ class SessionRegistry:
             if target is None:
                 return
             record, request = target
-            now = self._monotonic_clock()
+            occurred_at, now = self._sample_event_clocks_locked(request)
             if request.would_mark_response_output(response):
                 event_types: tuple[EventType, ...] = ("first_output",)
             elif self._progress_due(record, request, now):
@@ -453,12 +451,12 @@ class SessionRegistry:
             else:
                 event_types = ()
             self._observe_response_locked(
-                record, request, response, now, event_types
+                record, request, response, occurred_at, now, event_types
             )
 
     def _observe_response_locked(
         self, record: _SessionRecord, request: RequestPerformance,
-        response: CompletionResponse, now: float,
+        response: CompletionResponse, occurred_at: datetime, now: float,
         event_types: tuple[EventType, ...],
     ) -> None:
         if not event_types:
@@ -468,7 +466,7 @@ class SessionRegistry:
             request.observe_response(response, now)
             self._commit_events_locked(
                 reservation, record, request, event_types,
-                self._wall_clock(), now,
+                occurred_at, now,
             )
 
     def count_tokens(self, handle: ObservationHandle, value: int) -> None:
@@ -481,7 +479,7 @@ class SessionRegistry:
             if target is None:
                 return
             record, request = target
-            now = self._monotonic_clock()
+            occurred_at, now = self._sample_event_clocks_locked(request)
             if not self._progress_due(record, request, now):
                 request.record_usage(usage)
                 return
@@ -489,7 +487,7 @@ class SessionRegistry:
                 request.record_usage(usage)
                 self._commit_events_locked(
                     reservation, record, request, ("progress",),
-                    self._wall_clock(), now,
+                    occurred_at, now,
                 )
 
     def mark_retries_supported(self, handle: ObservationHandle) -> None:
@@ -504,12 +502,12 @@ class SessionRegistry:
             if target is None:
                 return
             record, request = target
-            now = self._monotonic_clock()
+            occurred_at, now = self._sample_event_clocks_locked(request)
             with self._events.reserve(1) as reservation:
                 request.record_retry()
                 self._commit_events_locked(
                     reservation, record, request, ("retry",),
-                    self._wall_clock(), now,
+                    occurred_at, now,
                 )
 
     def set_reasoning_continuation(
@@ -520,7 +518,7 @@ class SessionRegistry:
             if target is None:
                 return
             record, request = target
-            now = self._monotonic_clock()
+            occurred_at, now = self._sample_event_clocks_locked(request)
             if not self._progress_due(record, request, now):
                 request.set_reasoning_continuation(value)
                 return
@@ -528,7 +526,7 @@ class SessionRegistry:
                 request.set_reasoning_continuation(value)
                 self._commit_events_locked(
                     reservation, record, request, ("progress",),
-                    self._wall_clock(), now,
+                    occurred_at, now,
                 )
 
     def finish(
@@ -612,7 +610,8 @@ class SessionRegistry:
         """Copy snapshots and optionally filter their public fields."""
         normalized = _validate_filters(filters)
         with self._lock:
-            return self._session_snapshots_locked(normalized)
+            return self._session_snapshots_at_locked(
+                normalized, self._monotonic_clock())
 
     def performance_snapshots(
         self, filters: SessionFilters | None = None
@@ -641,8 +640,8 @@ class SessionRegistry:
     def _performance_capture_locked(
         self, filters: dict[str, tuple[str, ...]] | None
     ) -> PerformanceCapture:
-        now = self._monotonic_clock()
         captured_at = self._wall_clock()
+        now = validate_clock_sample(captured_at, self._monotonic_clock())
         sessions = self._session_snapshots_at_locked(filters, now)
         records = {record.public_id: record for record in self._records.values()}
         views = tuple(
@@ -653,13 +652,6 @@ class SessionRegistry:
             for session in sessions
         )
         return PerformanceCapture(captured_at, self._events.current_sequence, views)
-
-    def _session_snapshots_locked(
-        self, filters: dict[str, tuple[str, ...]] | None
-    ) -> list[SessionSnapshot]:
-        return self._session_snapshots_at_locked(
-            filters, self._monotonic_clock()
-        )
 
     def _session_snapshots_at_locked(
         self,
@@ -697,6 +689,14 @@ class SessionRegistry:
         if request is None or request.is_terminal:
             return None
         return record, request
+
+    def _sample_event_clocks_locked(
+        self, request: RequestPerformance
+    ) -> tuple[datetime, float]:
+        occurred_at = self._wall_clock()
+        now = validate_clock_sample(occurred_at, self._monotonic_clock())
+        request.snapshot(now)
+        return occurred_at, now
 
     @staticmethod
     def _progress_due(

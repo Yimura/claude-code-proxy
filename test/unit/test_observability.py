@@ -1198,3 +1198,135 @@ async def test_failed_initial_capture_unregisters_performance_subscription() -> 
         sessions.subscribe_performance({"id": [collision]}, after=None)
 
     assert events.subscriber_count == before
+
+
+def _prepare_observer_clock_case(case, sessions, handle, observer) -> None:
+    if case == "upstream_finished":
+        observer.upstream_started()
+    if case == "record_retry":
+        observer.mark_retries_supported()
+
+
+def _invoke_observer_clock_case(case, observer) -> None:
+    if case == "upstream_started":
+        observer.upstream_started()
+    elif case == "upstream_finished":
+        observer.upstream_finished()
+    elif case == "stream_event":
+        observer.stream_event(TextDelta("clock-secret"))
+    elif case == "response":
+        observer.response(
+            CompletionResponse(
+                "response-secret",
+                "model-secret",
+                (TextBlock("clock-secret"),),
+                "end_turn",
+                TokenUsage(7, 5),
+            )
+        )
+    elif case == "count_tokens":
+        observer.count_tokens(7)
+    elif case == "record_retry":
+        observer.record_retry()
+    else:
+        observer.set_reasoning_continuation("restored")
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "upstream_started",
+        "upstream_finished",
+        "stream_event",
+        "response",
+        "count_tokens",
+        "record_retry",
+        "set_reasoning_continuation",
+    ],
+)
+@pytest.mark.parametrize("invalid_clock", ["monotonic", "wall"])
+def test_observer_clock_failure_preserves_all_registry_state(
+    case: str, invalid_clock: str
+) -> None:
+    clock = Clock()
+    events = EventJournal()
+    sessions = registry(clock, events=events)
+    handle = sessions.begin(metadata())
+    observer = sessions.observer(handle)
+    _prepare_observer_clock_case(case, sessions, handle, observer)
+    before = sessions.performance_snapshots().sessions
+    cursor_before = events.current_sequence
+    progress_before = dict(
+        sessions._records[handle.key].progress_at  # type: ignore[attr-defined]
+    )
+    valid_wall = clock.wall
+    valid_monotonic = clock.monotonic
+    if invalid_clock == "monotonic":
+        clock.monotonic = 1e308
+    else:
+        clock.wall = datetime(2026, 1, 1)
+
+    with pytest.raises(ValueError):
+        _invoke_observer_clock_case(case, observer)
+
+    clock.wall = valid_wall
+    clock.monotonic = valid_monotonic
+    assert sessions.performance_snapshots().sessions == before
+    assert events.current_sequence == cursor_before
+    assert (  # type: ignore[attr-defined]
+        sessions._records[handle.key].progress_at == progress_before
+    )
+
+
+@pytest.mark.parametrize("case", ["count_tokens", "set_reasoning_continuation"])
+def test_coalesced_observer_update_validates_clock_before_mutation(case: str) -> None:
+    clock = Clock()
+    events = EventJournal()
+    sessions = registry(clock, events=events)
+    handle = sessions.begin(metadata())
+    observer = sessions.observer(handle)
+    record = sessions._records[handle.key]  # type: ignore[attr-defined]
+    record.progress_at[handle.request_id] = 1e308
+    before = sessions.performance_snapshots().sessions
+    cursor_before = events.current_sequence
+    progress_before = dict(record.progress_at)
+    clock.monotonic = 1e308
+
+    with pytest.raises(ValueError):
+        _invoke_observer_clock_case(case, observer)
+
+    clock.monotonic = 100.0
+    assert sessions.performance_snapshots().sessions == before
+    assert events.current_sequence == cursor_before
+    assert record.progress_at == progress_before
+
+
+def test_retry_unsafe_monotonic_preserves_observed_zero_and_cursor() -> None:
+    clock = Clock()
+    events = EventJournal()
+    sessions = registry(clock, events=events)
+    handle = sessions.begin(metadata())
+    observer = sessions.observer(handle)
+    observer.mark_retries_supported()
+    before = sessions.performance_snapshots().sessions[0].performance
+    cursor_before = events.current_sequence
+    assert before.active_requests[0].retries.value == 0
+    clock.monotonic = 1e308
+
+    with pytest.raises(ValueError):
+        observer.record_retry()
+
+    clock.monotonic = 100.0
+    after = sessions.performance_snapshots().sessions[0].performance
+    assert after.active_requests[0].retries.value == 0
+    assert events.current_sequence == cursor_before
+
+
+def test_performance_capture_rejects_naive_wall_clock() -> None:
+    clock = Clock()
+    sessions = registry(clock)
+    sessions.begin(metadata())
+    clock.wall = datetime(2026, 1, 1)
+
+    with pytest.raises(ValueError, match="wall"):
+        sessions.performance_snapshots()

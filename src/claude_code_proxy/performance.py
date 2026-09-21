@@ -739,6 +739,14 @@ class SessionPerformance:
         )
 
 
+def validate_clock_sample(
+    wall_time: datetime, monotonic_time: object
+) -> float:
+    """Validate one wall/monotonic pair before coordinated mutation."""
+    _require_utc_datetime("wall clock", wall_time)
+    return _require_finite_time("monotonic clock", monotonic_time)
+
+
 def _is_semantic_event(event: StreamEvent) -> bool:
     if isinstance(event, TextDelta):
         return bool(event.text)
