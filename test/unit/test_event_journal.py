@@ -2,7 +2,7 @@ from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta, timezone
 import asyncio
 import math
-from threading import Thread
+from threading import Event, Thread
 
 import pytest
 
@@ -10,6 +10,7 @@ from claude_code_proxy.event_journal import (
     OVERFLOW,
     EventJournal,
     JournalEvent,
+    Subscription,
 )
 from claude_code_proxy.limits import MAX_CONTROL_INTEGER
 from claude_code_proxy.performance import (
@@ -128,7 +129,74 @@ async def test_subscribe_registers_before_immediate_publish() -> None:
 
 
 @pytest.mark.asyncio
-async def test_slow_subscriber_gets_single_overflow_without_blocking_publish() -> None:
+async def test_concurrent_publish_dispatches_live_events_in_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal = EventJournal()
+    subscription = journal.subscribe(after=None)
+    first_offering = Event()
+    release_first = Event()
+    second_offered = Event()
+    original_offer = Subscription.offer
+
+    def gated_offer(target: Subscription, item: JournalEvent) -> None:
+        if target is subscription and item.sequence == 1:
+            first_offering.set()
+            release_first.wait(1)
+        if target is subscription and item.sequence == 2:
+            second_offered.set()
+        original_offer(target, item)
+
+    monkeypatch.setattr(Subscription, "offer", gated_offer)
+    first = Thread(target=lambda: journal.publish(event("request_started")))
+    second = Thread(target=lambda: journal.publish(event("progress")))
+    first.start()
+    assert first_offering.wait(1)
+    second.start()
+    overtook = second_offered.wait(0.1)
+    release_first.set()
+    first.join()
+    second.join()
+
+    received = [await subscription.receive(1), await subscription.receive(1)]
+    assert overtook is False
+    assert [item.sequence for item in received if isinstance(item, JournalEvent)] == [
+        1,
+        2,
+    ]
+    subscription.close()
+
+
+class GatedLoop:
+    def __init__(self) -> None:
+        self.scheduled: list[tuple[object, tuple[object, ...]]] = []
+
+    def call_soon_threadsafe(self, callback: object, *args: object) -> None:
+        self.scheduled.append((callback, args))
+
+
+@pytest.mark.asyncio
+async def test_worker_burst_bounds_ingress_and_schedules_one_wake() -> None:
+    journal = EventJournal(subscriber_capacity=4)
+    subscription = journal.subscribe(after=None)
+    gated_loop = GatedLoop()
+    object.__setattr__(subscription, "_loop", gated_loop)
+
+    worker = Thread(target=lambda: [journal.publish(event()) for _ in range(100)])
+    worker.start()
+    worker.join()
+
+    assert subscription.queue_size == 1
+    assert len(gated_loop.scheduled) == 1
+    assert journal.subscriber_count == 0
+    callback, args = gated_loop.scheduled[0]
+    callback(*args)  # type: ignore[operator]
+    assert await subscription.receive(0) is OVERFLOW
+    subscription.close()
+
+
+@pytest.mark.asyncio
+async def test_slow_subscriber_gets_one_terminal_overflow_episode() -> None:
     journal = EventJournal(subscriber_capacity=1)
     subscription = journal.subscribe(after=None)
 
@@ -137,7 +205,11 @@ async def test_slow_subscriber_gets_single_overflow_without_blocking_publish() -
     await asyncio.sleep(0)
 
     assert subscription.queue_size <= 1
+    assert journal.subscriber_count == 0
     assert await subscription.receive(1) is OVERFLOW
+    journal.publish(event())
+    await asyncio.sleep(0)
+    assert await subscription.receive(0) is None
     subscription.close()
     assert journal.subscriber_count == 0
 
@@ -191,6 +263,16 @@ async def test_receive_timeout_returns_none() -> None:
     subscription = EventJournal().subscribe(after=None)
 
     assert await subscription.receive(0) is None
+    subscription.close()
+
+
+@pytest.mark.asyncio
+async def test_receive_zero_returns_populated_pending_item_synchronously() -> None:
+    journal = EventJournal()
+    subscription = journal.subscribe(after=None)
+    published = journal.publish(event())
+
+    assert await subscription.receive(0) == published
     subscription.close()
 
 
@@ -259,6 +341,29 @@ def test_publish_rejects_an_already_published_event() -> None:
 
     with pytest.raises(ValueError, match="sequence"):
         journal.publish(replace(event(), sequence=1))
+
+    assert journal.current_sequence == 0
+
+
+def test_publish_rejects_mutable_event_subclass() -> None:
+    class MutableEvent(JournalEvent):
+        pass
+
+    original = event()
+    mutable = MutableEvent(
+        original.sequence,
+        original.occurred_at,
+        original.type,
+        original.session_id,
+        original.request_id,
+        original.request,
+        original.session,
+    )
+    mutable.extra = []
+    journal = EventJournal()
+
+    with pytest.raises(ValueError, match="JournalEvent"):
+        journal.publish(mutable)
 
     assert journal.current_sequence == 0
 

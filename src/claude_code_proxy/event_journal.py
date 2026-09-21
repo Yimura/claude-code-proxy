@@ -80,10 +80,16 @@ class Subscription:
     replay: tuple[JournalEvent, ...]
     reset_required: bool
     _journal: EventJournal = field(repr=False)
-    _queue: asyncio.Queue[QueueItem] = field(repr=False)
+    _capacity: int = field(repr=False)
+    _event: asyncio.Event = field(repr=False)
     _loop: asyncio.AbstractEventLoop = field(repr=False)
+    _pending: deque[QueueItem] = field(
+        default_factory=deque, init=False, repr=False
+    )
     _closed: bool = field(default=False, init=False, repr=False)
-    _overflowed: bool = field(default=False, init=False, repr=False)
+    _accepting: bool = field(default=True, init=False, repr=False)
+    _notified: bool = field(default=False, init=False, repr=False)
+    _wake_scheduled: bool = field(default=False, init=False, repr=False)
     _state_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
@@ -91,43 +97,63 @@ class Subscription:
     async def receive(self, timeout: float) -> QueueItem | None:
         """Wait up to timeout seconds for one live event or overflow marker."""
         validated = _require_timeout(timeout)
+        item = self._pop_pending()
+        if item is not None or validated == 0:
+            return item
         try:
-            return await asyncio.wait_for(self._queue.get(), validated)
+            await asyncio.wait_for(self._event.wait(), validated)
         except TimeoutError:
             return None
+        return self._pop_pending()
 
     def offer(self, event: JournalEvent) -> None:
-        """Schedule a nonblocking queue offer on the captured event loop."""
+        """Add one event to bounded ingress and schedule at most one wake."""
+        schedule_wake = False
+        unregister = False
         with self._state_lock:
-            if self._closed:
+            if self._closed or not self._accepting:
                 return
-            loop = self._loop
+            if len(self._pending) >= self._capacity:
+                self._pending.clear()
+                self._pending.append(OVERFLOW)
+                self._accepting = False
+                unregister = True
+            else:
+                self._pending.append(event)
+            if not self._notified:
+                self._notified = True
+                if not self._wake_scheduled:
+                    self._wake_scheduled = True
+                    schedule_wake = True
+        if unregister:
+            self._journal.unsubscribe(self)
+        if schedule_wake:
+            self._schedule_wake()
+
+    def _schedule_wake(self) -> None:
         try:
-            loop.call_soon_threadsafe(self._enqueue, event)
+            self._loop.call_soon_threadsafe(self._wake)
         except RuntimeError:
             self.close()
 
-    def _enqueue(self, event: JournalEvent) -> None:
+    def _wake(self) -> None:
         with self._state_lock:
-            if self._closed:
-                return
-        if self._overflowed:
-            self._restore_overflow_marker()
-            return
-        if not self._queue.full():
-            self._queue.put_nowait(event)
-            return
-        self._overflowed = True
-        self._drain_queue()
-        self._queue.put_nowait(OVERFLOW)
+            self._wake_scheduled = False
+            should_wake = (
+                not self._closed and self._notified and bool(self._pending)
+            )
+        if should_wake:
+            self._event.set()
 
-    def _restore_overflow_marker(self) -> None:
-        if self._queue.empty():
-            self._queue.put_nowait(OVERFLOW)
-
-    def _drain_queue(self) -> None:
-        while not self._queue.empty():
-            self._queue.get_nowait()
+    def _pop_pending(self) -> QueueItem | None:
+        with self._state_lock:
+            if not self._pending:
+                return None
+            item = self._pending.popleft()
+            if not self._pending:
+                self._notified = False
+                self._event.clear()
+            return item
 
     def close(self) -> None:
         """Close and unregister this subscription idempotently."""
@@ -135,11 +161,15 @@ class Subscription:
             if self._closed:
                 return
             self._closed = True
+            self._accepting = False
+            self._pending.clear()
+            self._notified = False
         self._journal.unsubscribe(self)
 
     @property
     def queue_size(self) -> int:
-        return self._queue.qsize()
+        with self._state_lock:
+            return len(self._pending)
 
 
 class EventJournal:
@@ -148,6 +178,7 @@ class EventJournal:
     __slots__ = (
         "_capacity",
         "_subscriber_capacity",
+        "_dispatch_lock",
         "_lock",
         "_events",
         "_sequence",
@@ -161,6 +192,7 @@ class EventJournal:
         )
         self._capacity = capacity
         self._subscriber_capacity = subscriber_capacity
+        self._dispatch_lock = threading.Lock()
         self._lock = threading.Lock()
         self._events: deque[JournalEvent] = deque(maxlen=capacity)
         self._sequence = 0
@@ -178,17 +210,20 @@ class EventJournal:
 
     def publish(self, event: JournalEvent) -> JournalEvent:
         """Sequence, retain, and offer an unpublished event to subscribers."""
-        if not isinstance(event, JournalEvent) or event.sequence != 0:
+        if type(event) is not JournalEvent:
+            raise ValueError("publish requires an exact JournalEvent")
+        if event.sequence != 0:
             raise ValueError("publish requires an event with sequence 0")
-        with self._lock:
-            if self._sequence >= MAX_CONTROL_INTEGER:
-                raise ValueError("event sequence exceeds the control limit")
-            published = replace(event, sequence=self._sequence + 1)
-            self._sequence = published.sequence
-            self._events.append(published)
-            subscribers = tuple(self._subscribers)
-        for subscription in subscribers:
-            subscription.offer(published)
+        with self._dispatch_lock:
+            with self._lock:
+                if self._sequence >= MAX_CONTROL_INTEGER:
+                    raise ValueError("event sequence exceeds the control limit")
+                published = replace(event, sequence=self._sequence + 1)
+                self._sequence = published.sequence
+                self._events.append(published)
+                subscribers = tuple(self._subscribers)
+            for subscription in subscribers:
+                subscription.offer(published)
         return published
 
     def subscribe(self, after: int | None) -> Subscription:
@@ -202,7 +237,8 @@ class EventJournal:
                 replay,
                 reset_required,
                 self,
-                asyncio.Queue(maxsize=self._subscriber_capacity),
+                self._subscriber_capacity,
+                asyncio.Event(),
                 loop,
             )
             self._subscribers.add(subscription)
