@@ -1,15 +1,16 @@
 """Anthropic-compatible HTTP routes."""
 
 import asyncio
-import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 
 import anyio
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.requests import ClientDisconnect
+from starlette.types import Message, Receive
 
 from ..domain.models import CompletionRequest, StreamError
 from ..failures import (
@@ -56,14 +57,6 @@ from .translation import (
 )
 
 
-def _utc_now() -> datetime:
-    return datetime.now(UTC)
-
-
-def _monotonic_now() -> float:
-    return time.monotonic()
-
-
 def build_router(service: ProxyService, sessions: SessionRegistry) -> APIRouter:
     router = APIRouter()
     router.add_api_route(
@@ -83,8 +76,7 @@ def build_router(service: ProxyService, sessions: SessionRegistry) -> APIRouter:
 
 def _message_handler(service: ProxyService, sessions: SessionRegistry):
     async def create_message(request: MessagesRequest, raw_request: Request):
-        started_at = _utc_now()
-        started_monotonic = _monotonic_now()
+        started_at, started_monotonic = sessions.sample_clocks()
         normalized = normalize_request(
             request,
             client_identity=client_identity_from_headers(raw_request.headers),
@@ -127,8 +119,7 @@ def _message_handler(service: ProxyService, sessions: SessionRegistry):
 
 def _count_handler(service: ProxyService, sessions: SessionRegistry):
     async def count_tokens(request: TokenCountRequest, raw_request: Request):
-        started_at = _utc_now()
-        started_monotonic = _monotonic_now()
+        started_at, started_monotonic = sessions.sample_clocks()
         normalized = normalize_request(
             _as_messages_request(request),
             client_identity=client_identity_from_headers(raw_request.headers),
@@ -177,9 +168,7 @@ async def _complete_response(
     telemetry: RequestTelemetry | None,
 ):
     try:
-        response = to_api_response(
-            await service.complete_prepared(prepared, telemetry)
-        )
+        completed = await service.complete_prepared(prepared, telemetry)
     except ProviderError as error:
         _log_provider_error(raw_request, context, error)
         _finalize_request(
@@ -196,6 +185,23 @@ async def _complete_response(
     except Exception as error:
         _log_unexpected_error(raw_request, context, error)
         _finalize_unexpected(sessions, observation, context, error)
+        raise
+    try:
+        response = _json_response(to_api_response(completed))
+    except Exception as error:
+        _log_unexpected_error(
+            raw_request,
+            context,
+            error,
+            stage=FailureStage.CLIENT_TRANSLATION,
+        )
+        _finalize_unexpected(
+            sessions,
+            observation,
+            context,
+            error,
+            stage=FailureStage.CLIENT_TRANSLATION,
+        )
         raise
     _finalize_request(sessions, observation, context, "completed")
     return response
@@ -213,7 +219,7 @@ async def _count_response(
     try:
         count = await service.count_tokens_prepared(prepared, telemetry)
         notify_telemetry(telemetry, "count_tokens", count)
-        response = TokenCountResponse(input_tokens=count)
+        response = _json_response(TokenCountResponse(input_tokens=count))
     except ProviderError as error:
         _log_provider_error(raw_request, context, error)
         _finalize_request(
@@ -235,6 +241,75 @@ async def _count_response(
     return response
 
 
+def _json_response(content: object) -> JSONResponse:
+    return JSONResponse(jsonable_encoder(content))
+
+
+class _DisconnectTrackingReceive:
+    def __init__(self, receive: Receive) -> None:
+        self._receive = receive
+        self.disconnected = False
+
+    async def __call__(self) -> Message:
+        message = await self._receive()
+        if message["type"] == "http.disconnect":
+            self.disconnected = True
+        return message
+
+
+class _LifecycleStreamingResponse(StreamingResponse):
+    def __init__(
+        self,
+        content: AsyncIterator[str],
+        raw_request: Request,
+        context: RequestLogContext,
+    ) -> None:
+        super().__init__(content, media_type="text/event-stream")
+        self._raw_request = raw_request
+        self._context = context
+
+    async def __call__(self, scope, receive, send) -> None:
+        outcome: RequestOutcome | None = None
+        failure: FailureDiagnostic | None = None
+        original: BaseException | None = None
+        tracked_receive = _DisconnectTrackingReceive(receive)
+        try:
+            await super().__call__(scope, tracked_receive, send)
+            state = _stream_terminal_state(self._raw_request)
+            if tracked_receive.disconnected and not state.finalized:
+                outcome = "client_disconnected"
+                _set_stream_response_outcome(self._raw_request, outcome)
+        except (OSError, ClientDisconnect) as error:
+            original = error
+            outcome = "client_disconnected"
+            _set_stream_response_outcome(self._raw_request, outcome)
+            raise
+        except asyncio.CancelledError as error:
+            original = error
+            outcome = await _cancelled_outcome(self._raw_request)
+            _set_stream_response_outcome(self._raw_request, outcome)
+            raise
+        except Exception as error:
+            original = error
+            outcome = "failed"
+            failure = _record_unexpected_stream_exception(
+                self._raw_request,
+                self._context,
+                error,
+                stage=FailureStage.CLIENT_TRANSLATION,
+            )
+            raise
+        finally:
+            try:
+                await _close_stream_iterator(self.body_iterator, original)
+            finally:
+                state = _stream_terminal_state(self._raw_request)
+                if outcome is not None and not state.finalized:
+                    _invoke_request_finalizer(
+                        self._raw_request, outcome, failure
+                    )
+
+
 def _streaming_response(
     raw_request: Request,
     prepared: CompletionRequest,
@@ -250,6 +325,12 @@ def _streaming_response(
             events,
             context,
             on_error=lambda error: _mark_stream_error(raw_request, error),
+            on_exception=lambda diagnostic: _mark_observed_stream_exception(
+                raw_request, diagnostic
+            ),
+            on_provider_error=lambda error: _mark_observed_provider_error(
+                raw_request, error
+            ),
         )
         serialized = serialize_stream(
             prepared,
@@ -261,7 +342,7 @@ def _streaming_response(
         lifecycle = _record_stream_lifecycle(
             serialized, raw_request, context, sessions, observation
         )
-        return StreamingResponse(lifecycle, media_type="text/event-stream")
+        return _LifecycleStreamingResponse(lifecycle, raw_request, context)
     except ProviderError as error:
         _log_provider_error(raw_request, context, error)
         _finalize_request(
@@ -294,23 +375,11 @@ async def _record_stream_lifecycle(
             if frame == DONE_FRAME:
                 outcome = "completed"
             yield frame
-    except GeneratorExit as error:
-        original = error
-        if not stream_state.has_error:
-            outcome = "client_disconnected"
-        raise
-    except ClientDisconnect as error:
-        original = error
-        if not stream_state.has_error:
-            outcome = "client_disconnected"
-        raise
-    except asyncio.CancelledError as error:
-        original = error
-        if not stream_state.has_error:
-            outcome = await _cancelled_outcome(raw_request)
-        raise
     except BaseException as error:
         original = error
+        outcome = await _classify_stream_exception(
+            raw_request, context, stream_state, error, outcome
+        )
         raise
     finally:
         try:
@@ -321,6 +390,33 @@ async def _record_stream_lifecycle(
             )
 
 
+async def _classify_stream_exception(
+    raw_request: Request,
+    context: RequestLogContext,
+    state: "_StreamTerminalState",
+    error: BaseException,
+    outcome: RequestOutcome,
+) -> RequestOutcome:
+    if isinstance(error, (GeneratorExit, ClientDisconnect)):
+        if state.has_error:
+            return outcome
+        return state.response_outcome or "client_disconnected"
+    if isinstance(error, asyncio.CancelledError):
+        if state.has_error:
+            return outcome
+        if state.response_outcome is not None:
+            return state.response_outcome
+        return await _cancelled_outcome(raw_request)
+    if isinstance(error, Exception) and not state.exception_logged:
+        _record_unexpected_stream_exception(
+            raw_request,
+            context,
+            error,
+            stage=FailureStage.CLIENT_TRANSLATION,
+        )
+    return outcome
+
+
 _STREAM_TERMINAL_STATE = "stream_terminal_state"
 
 
@@ -328,6 +424,9 @@ _STREAM_TERMINAL_STATE = "stream_terminal_state"
 class _StreamTerminalState:
     has_error: bool = False
     failure: FailureDiagnostic | None = None
+    exception_logged: bool = False
+    response_outcome: RequestOutcome | None = None
+    finalized: bool = False
 
 
 def _stream_terminal_state(raw_request: Request) -> _StreamTerminalState:
@@ -339,11 +438,39 @@ def _stream_terminal_state(raw_request: Request) -> _StreamTerminalState:
     return state
 
 
+def _set_stream_response_outcome(
+    raw_request: Request, outcome: RequestOutcome
+) -> None:
+    _stream_terminal_state(raw_request).response_outcome = outcome
+
+
 def _mark_stream_error(raw_request: Request, error: StreamError) -> None:
     state = _stream_terminal_state(raw_request)
     state.has_error = True
     if state.failure is None:
         state.failure = stream_failure_diagnostic(error)
+
+
+def _mark_observed_provider_error(
+    raw_request: Request, error: ProviderError
+) -> None:
+    state = _stream_terminal_state(raw_request)
+    state.has_error = True
+    if state.failure is None:
+        state.failure = provider_failure_diagnostic(error)
+    state.exception_logged = True
+    setattr(raw_request.state, FAILURE_LOGGED, True)
+
+
+def _mark_observed_stream_exception(
+    raw_request: Request, diagnostic: FailureDiagnostic
+) -> None:
+    state = _stream_terminal_state(raw_request)
+    state.has_error = True
+    if state.failure is None:
+        state.failure = diagnostic
+    state.exception_logged = True
+    setattr(raw_request.state, FAILURE_LOGGED, True)
 
 
 def _record_stream_error(
@@ -356,6 +483,25 @@ def _record_stream_error(
         log_stream_failure(context, error)
     except BaseException:
         pass
+
+
+def _record_unexpected_stream_exception(
+    raw_request: Request,
+    context: RequestLogContext,
+    error: Exception,
+    *,
+    stage: FailureStage,
+) -> FailureDiagnostic:
+    state = _stream_terminal_state(raw_request)
+    if state.exception_logged and state.failure is not None:
+        return state.failure
+    diagnostic = unexpected_failure_diagnostic(error, stage=stage)
+    state.has_error = True
+    if state.failure is None:
+        state.failure = diagnostic
+    state.exception_logged = True
+    _log_unexpected_error(raw_request, context, error, stage=stage)
+    return state.failure
 
 
 async def _cancelled_outcome(raw_request: Request) -> RequestOutcome:
@@ -478,6 +624,20 @@ def _record_context(raw_request: Request, context: RequestLogContext) -> None:
         log_agent_started(context)
 
 
+def _invoke_request_finalizer(
+    raw_request: Request,
+    outcome: RequestOutcome,
+    failure: FailureDiagnostic | None = None,
+) -> None:
+    finalizer = getattr(raw_request.state, REQUEST_FINALIZER, None)
+    if not callable(finalizer):
+        return
+    try:
+        finalizer(outcome, failure)
+    except BaseException:
+        pass
+
+
 def _install_finalizer(
     raw_request: Request,
     sessions: SessionRegistry,
@@ -507,12 +667,16 @@ def _finalize_stream_request(
     context: RequestLogContext,
     outcome: RequestOutcome,
     failure: FailureDiagnostic | None = None,
-) -> None:
-    stream_state = getattr(raw_request.state, _STREAM_TERMINAL_STATE, None)
-    if isinstance(stream_state, _StreamTerminalState) and stream_state.has_error:
+) -> bool:
+    stream_state = _stream_terminal_state(raw_request)
+    if stream_state.has_error:
         outcome = "failed"
         failure = stream_state.failure or failure
-    _finalize_request(sessions, observation, context, outcome, failure)
+    finalized = _finalize_request(
+        sessions, observation, context, outcome, failure
+    )
+    stream_state.finalized = stream_state.finalized or finalized
+    return finalized
 
 
 def _finalize_unexpected(
@@ -520,8 +684,10 @@ def _finalize_unexpected(
     observation: ObservationHandle,
     context: RequestLogContext,
     error: Exception,
+    *,
+    stage: FailureStage = FailureStage.ROUTE,
 ) -> None:
-    diagnostic = unexpected_failure_diagnostic(error, stage=FailureStage.ROUTE)
+    diagnostic = unexpected_failure_diagnostic(error, stage=stage)
     _finalize_request(sessions, observation, context, "failed", diagnostic)
 
 
@@ -531,13 +697,16 @@ def _finalize_request(
     context: RequestLogContext,
     outcome: RequestOutcome,
     failure: FailureDiagnostic | None = None,
-) -> None:
+) -> bool:
     try:
         snapshot = sessions.finish(observation, outcome, failure)
-        if snapshot is not None:
-            log_performance(snapshot, context)
+        if snapshot is None:
+            return False
+        log_performance(snapshot, context)
+        return True
     except BaseException:
         log_finalization_failure()
+        return False
 
 
 def _log_provider_error(
@@ -551,10 +720,14 @@ def _log_provider_error(
 
 
 def _log_unexpected_error(
-    raw_request: Request, context: RequestLogContext, error: Exception
+    raw_request: Request,
+    context: RequestLogContext,
+    error: Exception,
+    *,
+    stage: FailureStage = FailureStage.ROUTE,
 ) -> None:
     try:
-        log_unexpected_failure(context, error)
+        log_unexpected_failure(context, error, stage=stage)
     except BaseException:
         pass
     setattr(raw_request.state, FAILURE_LOGGED, True)

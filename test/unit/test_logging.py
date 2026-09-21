@@ -968,3 +968,55 @@ async def test_middleware_finalizes_client_disconnect_without_unexpected_log(cap
 
     assert outcomes == ["client_disconnected"]
     assert "unexpected" not in caplog.text
+
+
+class CancellingCloseFailureEvents:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise asyncio.CancelledError
+
+    async def aclose(self):
+        self.close_calls += 1
+        raise RuntimeError("CLOSE_SECRET")
+
+
+@pytest.mark.asyncio
+async def test_observe_stream_preserves_cancellation_over_close_failure():
+    events = CancellingCloseFailureEvents()
+
+    with pytest.raises(asyncio.CancelledError):
+        await anext(observe_stream(events, make_context()))
+
+    assert events.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_observe_stream_reports_safe_unexpected_diagnostic_once(caplog):
+    diagnostics = []
+
+    async def failing_events():
+        raise RuntimeError("OBSERVED_STREAM_SECRET")
+        yield
+
+    with caplog.at_level(logging.ERROR, logger="claude_code_proxy.logging"):
+        with pytest.raises(RuntimeError, match="OBSERVED_STREAM_SECRET"):
+            await anext(
+                observe_stream(
+                    failing_events(),
+                    make_context(),
+                    on_exception=diagnostics.append,
+                )
+            )
+
+    assert len(diagnostics) == 1
+    [diagnostic] = diagnostics
+    assert diagnostic.category == FailureCategory.INTERNAL
+    assert diagnostic.stage == FailureStage.STREAM
+    assert diagnostic.code == "unexpected_exception"
+    assert caplog.text.count("unexpected request failure") == 1
+    assert "OBSERVED_STREAM_SECRET" not in caplog.text

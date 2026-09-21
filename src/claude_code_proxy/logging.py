@@ -589,8 +589,11 @@ async def observe_stream(
     context: RequestLogContext,
     *,
     on_error: Callable[[StreamError], None] | None = None,
+    on_exception: Callable[[FailureDiagnostic], None] | None = None,
+    on_provider_error: Callable[[ProviderError], None] | None = None,
 ) -> AsyncIterator[StreamEvent]:
     iterator = aiter(events)
+    original: BaseException | None = None
     try:
         async for event in iterator:
             if isinstance(event, StreamError):
@@ -599,9 +602,16 @@ async def observe_stream(
                 _call_observer_safely(log_stream_failure, context, event)
             yield event
     except ProviderError as error:
-        _call_observer_safely(log_provider_failure, context, error)
+        original = error
+        _record_observed_provider_error(context, error, on_provider_error)
         raise
     except Exception as error:
+        original = error
+        diagnostic = unexpected_failure_diagnostic(
+            error, stage=FailureStage.STREAM
+        )
+        if on_exception is not None:
+            _call_observer_safely(on_exception, diagnostic)
         _call_observer_safely(
             log_unexpected_failure,
             context,
@@ -609,7 +619,37 @@ async def observe_stream(
             stage=FailureStage.STREAM,
         )
         raise
+    except BaseException as error:
+        original = error
+        raise
     finally:
-        close = getattr(iterator, "aclose", None)
-        if close is not None:
-            await close()
+        try:
+            await _close_observed_iterator(iterator, original)
+        except ProviderError as error:
+            _record_observed_provider_error(
+                context, error, on_provider_error
+            )
+            raise
+
+
+def _record_observed_provider_error(
+    context: RequestLogContext,
+    error: ProviderError,
+    callback: Callable[[ProviderError], None] | None,
+) -> None:
+    if callback is not None:
+        _call_observer_safely(callback, error)
+    _call_observer_safely(log_provider_failure, context, error)
+
+
+async def _close_observed_iterator(
+    iterator: object, original: BaseException | None
+) -> None:
+    close = getattr(iterator, "aclose", None)
+    if close is None:
+        return
+    try:
+        await close()
+    except BaseException:
+        if original is None:
+            raise

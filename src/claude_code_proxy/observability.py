@@ -14,23 +14,20 @@ import uuid
 
 from .domain.models import ClientIdentity, CompletionResponse, StreamEvent
 from .domain.models import TokenUsage, ToolUseStart
-from .event_journal import EventJournal, EventReservation, EventType
-from .event_journal import JournalEvent, Subscription
+from .event_journal import EventJournal, EventReservation, EventType, JournalEvent, Subscription
 from .failures import FailureDiagnostic
 from .limits import MAX_CONTROL_INTEGER
-from .performance import OperationKind, ReasoningContinuation, RequestOutcome
-from .performance import RequestPerformance, RequestPerformanceSnapshot
-from .performance import RequestTelemetryObserver, SessionPerformance
-from .performance import SessionPerformanceSnapshot, validate_clock_sample
+from .performance import OperationKind, ReasoningContinuation, RequestOutcome, RequestPerformance, RequestPerformanceSnapshot
+from .performance import RequestTelemetryObserver, SessionPerformance, SessionPerformanceSnapshot, validate_clock_sample
 from .text_safety import scalar_text
 
 SessionState = Literal["active", "idle", "failed"]
 SessionResult = Literal["completed", "failed"]
 SessionFilters = Mapping[str, Sequence[str]]
 
-_FILTER_FIELDS = frozenset(
-    {"id", "session_id", "state", "provider", "transport", "model", "effort"}
-)
+_FILTER_FIELDS = frozenset({
+    "id", "session_id", "state", "provider", "transport", "model", "effort",
+})
 
 
 @dataclass(frozen=True)
@@ -211,6 +208,13 @@ class SessionRegistry:
     def events(self) -> EventJournal:
         return self._events
 
+    def sample_clocks(self) -> tuple[datetime, float]:
+        """Sample and validate the registry's clock domain atomically."""
+        with self._lock:
+            wall = self._wall_clock()
+            monotonic = validate_clock_sample(wall, self._monotonic_clock())
+            return wall, monotonic
+
     def public_id(self, identifier: str) -> str:
         """Return this process's stable opaque ID for an identifier."""
         normalized = identifier.strip()
@@ -226,9 +230,7 @@ class SessionRegistry:
         return self.public_id(f"agent:{normalized_root}\0{normalized_agent}")
 
     def _agent_identity(
-        self,
-        root_identifier: str,
-        identity: ClientIdentity,
+        self, root_identifier: str, identity: ClientIdentity,
     ) -> tuple[str, str, str | None] | None:
         agent_id = (identity.agent_id or "").strip()
         if not agent_id:
@@ -281,11 +283,7 @@ class SessionRegistry:
     ) -> ObservationHandle:
         context = self._begin_context(metadata)
         with self._lock:
-            monotonic = (
-                self._monotonic_clock()
-                if started_monotonic is None
-                else started_monotonic
-            )
+            monotonic = started_monotonic if started_monotonic is not None else self._monotonic_clock()
             wall = self._wall_clock() if started_at is None else started_at
             request = RequestPerformance(
                 context.request_id,

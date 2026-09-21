@@ -1330,3 +1330,41 @@ def test_performance_capture_rejects_naive_wall_clock() -> None:
 
     with pytest.raises(ValueError, match="wall"):
         sessions.performance_snapshots()
+
+
+def test_sample_clocks_returns_injected_validated_pair() -> None:
+    clock = Clock()
+    clock.wall = datetime(2000, 1, 1, tzinfo=UTC)
+    clock.monotonic = 10.0
+    sessions = registry(clock)
+
+    assert sessions.sample_clocks() == (clock.wall, 10.0)
+
+
+def test_begin_reuses_supplied_monotonic_without_resampling() -> None:
+    wall = datetime(2000, 1, 1, tzinfo=UTC)
+    calls = 0
+
+    def monotonic_clock():
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise RuntimeError("monotonic sampled twice")
+        return 10.0
+
+    sessions = SessionRegistry(
+        inactive_limit=10,
+        secret=b"test-secret",
+        wall_clock=lambda: wall,
+        monotonic_clock=monotonic_clock,
+    )
+    started_at, started_monotonic = sessions.sample_clocks()
+
+    handle = sessions.begin(
+        metadata(),
+        started_at=started_at,
+        started_monotonic=started_monotonic,
+    )
+
+    assert handle.started_monotonic == 10.0
+    assert calls == 1

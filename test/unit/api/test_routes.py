@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import json
 import logging
 from datetime import UTC, datetime
@@ -8,7 +9,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
-from starlette.requests import ClientDisconnect
+from starlette.requests import ClientDisconnect, Request
 
 import claude_code_proxy.api.routes as routes_module
 import claude_code_proxy.logging as logging_module
@@ -25,6 +26,7 @@ from claude_code_proxy.domain.models import (
     TextBlock,
     TextDelta,
     TokenUsage,
+    ToolUseBlock,
     ToolUseStart,
 )
 from claude_code_proxy.failures import (
@@ -97,8 +99,13 @@ class Provider:
 
 
 class RecordingSessionRegistry(SessionRegistry):
-    def __init__(self) -> None:
-        super().__init__(100, secret=b"x" * 32)
+    def __init__(self, *, wall_clock=None, monotonic_clock=None) -> None:
+        super().__init__(
+            100,
+            secret=b"x" * 32,
+            wall_clock=wall_clock,
+            monotonic_clock=monotonic_clock,
+        )
         self.finish_calls: list[tuple[ObservationHandle, RequestOutcome]] = []
         self.finish_failures: list[FailureDiagnostic | None] = []
 
@@ -1517,30 +1524,44 @@ def test_count_success_records_distinct_metrics_and_preserves_response(caplog):
     assert "input_tokens=7" in caplog.text
 
 
-def test_route_samples_start_before_normalization(monkeypatch):
+def test_route_uses_registry_clock_domain_before_normalization(monkeypatch):
     calls = []
+    wall = datetime(2000, 1, 1, tzinfo=UTC)
     original_normalize = routes_module.normalize_request
 
     def wall_clock():
-        calls.append("wall")
-        return datetime(2026, 1, 1, tzinfo=UTC)
+        return wall
 
     def monotonic_clock():
-        calls.append("monotonic")
-        return 1.0
+        return 10.0
 
     def tracked_normalize(*args, **kwargs):
         calls.append("normalize")
         return original_normalize(*args, **kwargs)
 
-    monkeypatch.setattr(routes_module, "_utc_now", wall_clock)
-    monkeypatch.setattr(routes_module, "_monotonic_now", monotonic_clock)
+    sessions = RecordingSessionRegistry(
+        wall_clock=wall_clock,
+        monotonic_clock=monotonic_clock,
+    )
+    original_sample = sessions.sample_clocks
+
+    def tracked_sample():
+        calls.append("sample")
+        return original_sample()
+
+    monkeypatch.setattr(sessions, "sample_clocks", tracked_sample)
     monkeypatch.setattr(routes_module, "normalize_request", tracked_normalize)
 
-    response = client().post("/v1/messages", json=messages_payload(messages=[]))
+    response = client(sessions=sessions).post(
+        "/v1/messages", json=messages_payload(messages=[])
+    )
 
     assert response.status_code == 200
-    assert calls[:3] == ["wall", "monotonic", "normalize"]
+    assert calls[:2] == ["sample", "normalize"]
+    performance = latest_performance(sessions)
+    assert performance.started_at == wall
+    assert performance.finished_at == wall
+    assert performance.duration.value == 0
 
 
 def test_provider_failure_preserves_status_and_records_safe_diagnostic_once(caplog):
@@ -1857,3 +1878,422 @@ def test_diagnosticless_semantic_stream_retains_logged_fallback(caplog):
     _assert_diagnostic_rendered(caplog.text, expected)
     assert caplog.text.count("provider stream failed") == 1
     assert caplog.text.count("performance outcome=failed") == 1
+
+
+class CancellingCloseFailureFrames:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise asyncio.CancelledError
+
+    async def aclose(self):
+        self.close_calls += 1
+        raise RuntimeError("CLOSE_SECRET")
+
+
+@pytest.mark.asyncio
+async def test_full_stream_chain_preserves_cancellation_over_close_failure():
+    events = CancellingCloseFailureFrames()
+    sessions = registry()
+    observation = sessions.begin(stream_metadata())
+    request = DisconnectRequest(False)
+    context = stream_context()
+    prepared = routes_module.normalize_request(
+        routes_module.MessagesRequest(
+            model="claude-sonnet", max_tokens=10, messages=[]
+        )
+    )
+    observed = observe_stream(events, context)
+    serialized = routes_module.serialize_stream(prepared, observed)
+    stream = routes_module._record_stream_lifecycle(
+        serialized, request, context, sessions, observation
+    )
+
+    await anext(stream)
+    await anext(stream)
+    with pytest.raises(asyncio.CancelledError):
+        await anext(stream)
+
+    assert events.close_calls == 1
+    assert latest_performance(sessions).outcome == "cancelled"
+
+
+class UnsupportedStreamEvent:
+    pass
+
+
+def test_unsupported_stream_event_records_client_translation_failure_once(caplog):
+    sessions = registry()
+    provider = Provider(stream_events=[UnsupportedStreamEvent()])
+
+    with caplog.at_level(logging.ERROR, logger="claude_code_proxy.logging"):
+        with pytest.raises(TypeError, match="Unsupported stream event") as raised:
+            client(provider, sessions=sessions, with_middleware=True).post(
+                "/v1/messages",
+                json=messages_payload(stream=True, messages=[]),
+            )
+
+    assert type(raised.value) is TypeError
+    assert caplog.text.count("unexpected request failure") == 1
+    performance = latest_performance(sessions)
+    assert performance.outcome == "failed"
+    assert performance.failure is not None
+    assert performance.failure.category == FailureCategory.INTERNAL
+    assert performance.failure.stage == FailureStage.CLIENT_TRANSLATION
+    assert performance.failure.code == "unexpected_exception"
+    assert performance.failure.exception_type == "TypeError"
+    assert "Unsupported stream event" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_observed_stream_exception_is_not_logged_twice_by_lifecycle(caplog):
+    sessions = registry()
+    observation = sessions.begin(stream_metadata())
+    request = DisconnectRequest(False)
+    context = stream_context()
+    prepared = routes_module.normalize_request(
+        routes_module.MessagesRequest(
+            model="claude-sonnet", max_tokens=10, messages=[]
+        )
+    )
+
+    async def failing_events():
+        raise RuntimeError("OBSERVED_CHAIN_SECRET")
+        yield
+
+    observed = observe_stream(
+        failing_events(),
+        context,
+        on_exception=lambda diagnostic: (
+            routes_module._mark_observed_stream_exception(
+                request, diagnostic
+            )
+        ),
+    )
+    serialized = routes_module.serialize_stream(prepared, observed)
+    stream = routes_module._record_stream_lifecycle(
+        serialized, request, context, sessions, observation
+    )
+
+    with caplog.at_level(logging.ERROR, logger="claude_code_proxy.logging"):
+        await anext(stream)
+        await anext(stream)
+        with pytest.raises(RuntimeError, match="OBSERVED_CHAIN_SECRET"):
+            await anext(stream)
+
+    assert caplog.text.count("unexpected request failure") == 1
+    performance = latest_performance(sessions)
+    assert performance.failure is not None
+    assert performance.failure.stage == FailureStage.STREAM
+    assert performance.failure.exception_type == "RuntimeError"
+    assert "OBSERVED_CHAIN_SECRET" not in caplog.text
+
+
+class UnsupportedJsonValue:
+    __slots__ = ()
+
+
+def test_nonstream_json_render_failure_finalizes_failed_not_completed(caplog):
+    provider = Provider()
+
+    async def complete_with_unserializable_tool(request, telemetry=None):
+        return CompletionResponse(
+            "msg-render-failure",
+            request.response_model,
+            (
+                ToolUseBlock(
+                    "tool-1",
+                    "lookup",
+                    {"unsupported": UnsupportedJsonValue()},
+                ),
+            ),
+            "tool_use",
+            TokenUsage(2, 1),
+        )
+
+    provider.complete = complete_with_unserializable_tool
+    sessions = registry()
+
+    with caplog.at_level(logging.INFO, logger="claude_code_proxy.logging"):
+        with pytest.raises(Exception) as raised:
+            client(provider, sessions=sessions, with_middleware=True).post(
+                "/v1/messages",
+                json=messages_payload(messages=[]),
+            )
+
+    assert type(raised.value).__name__ == "PydanticSerializationError"
+    performance = latest_performance(sessions)
+    assert performance.outcome == "failed"
+    assert performance.failure is not None
+    assert performance.failure.category == FailureCategory.INTERNAL
+    assert performance.failure.stage == FailureStage.CLIENT_TRANSLATION
+    assert performance.failure.code == "unexpected_exception"
+    assert caplog.text.count("performance outcome=completed") == 0
+    assert caplog.text.count("performance outcome=failed") == 1
+    assert "UnsupportedJsonValue" not in caplog.text
+
+
+def test_nonstream_json_bytes_and_headers_remain_exact():
+    response = client().post("/v1/messages", json=messages_payload())
+
+    assert response.headers["content-type"] == "application/json"
+    assert response.content == (
+        b'{"id":"msg-1","model":"claude-sonnet","role":"assistant",'
+        b'"content":[{"type":"text","text":"hello"}],"type":"message",'
+        b'"stop_reason":"end_turn","stop_sequence":null,"usage":'
+        b'{"input_tokens":2,"output_tokens":1,'
+        b'"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}'
+    )
+
+
+def _asgi_scope(path: str = "/v1/messages"):
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", b"testserver")],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+    }
+
+
+async def _streaming_route_response(
+    provider, sessions, *, disconnected: bool = True
+):
+    app = application(provider, sessions=sessions)
+    included = next(
+        route for route in app.routes if hasattr(route, "original_router")
+    )
+    endpoint = next(
+        route.endpoint
+        for route in included.original_router.routes
+        if getattr(route, "path", None) == "/v1/messages"
+    )
+    scope = _asgi_scope()
+
+    async def receive():
+        if disconnected:
+            return {"type": "http.disconnect"}
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    raw_request = Request(scope, receive)
+    request = routes_module.MessagesRequest(
+        model="claude-sonnet",
+        max_tokens=10,
+        messages=[],
+        stream=True,
+    )
+    response = await endpoint(request, raw_request)
+    return response, scope, receive
+
+
+@pytest.mark.asyncio
+async def test_send_failure_before_body_start_finalizes_disconnected(caplog):
+    sessions = registry()
+    response, scope, receive = await _streaming_route_response(
+        Provider(), sessions
+    )
+
+    async def send(_message):
+        raise OSError("SEND_SECRET")
+
+    with caplog.at_level(logging.INFO, logger="claude_code_proxy.logging"):
+        with pytest.raises(ClientDisconnect):
+            await response(scope, receive, send)
+
+    gc.collect()
+    performance = sessions.performance_snapshots().sessions[0].performance
+    assert performance.current_concurrency == 0
+    assert len(performance.recent_requests) == 1
+    assert performance.recent_requests[0].outcome == "client_disconnected"
+    assert caplog.text.count("performance outcome=client_disconnected") == 1
+    assert "unexpected request failure" not in caplog.text
+    assert "SEND_SECRET" not in caplog.text
+
+
+class ClosingSendFailureProvider(Provider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_calls = 0
+
+    async def stream(self, request, telemetry=None):
+        try:
+            yield TextDelta("hello")
+            yield StreamComplete("end_turn", TokenUsage(2, 1))
+        finally:
+            self.close_calls += 1
+
+
+@pytest.mark.asyncio
+async def test_body_send_failure_closes_provider_once_and_finalizes_disconnected(caplog):
+    sessions = registry()
+    provider = ClosingSendFailureProvider()
+    response, scope, receive = await _streaming_route_response(
+        provider, sessions
+    )
+    body_messages = 0
+
+    async def send(message):
+        nonlocal body_messages
+        if message["type"] != "http.response.body":
+            return
+        body_messages += 1
+        if body_messages == 3:
+            raise OSError("BODY_SEND_SECRET")
+
+    with caplog.at_level(logging.INFO, logger="claude_code_proxy.logging"):
+        with pytest.raises(ClientDisconnect):
+            await response(scope, receive, send)
+
+    gc.collect()
+    performance = sessions.performance_snapshots().sessions[0].performance
+    assert body_messages == 3
+    assert provider.close_calls == 1
+    assert performance.current_concurrency == 0
+    assert len(performance.recent_requests) == 1
+    assert performance.recent_requests[0].outcome == "client_disconnected"
+    assert caplog.text.count("performance outcome=client_disconnected") == 1
+    assert "unexpected request failure" not in caplog.text
+    assert "BODY_SEND_SECRET" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("disconnected", "expected"),
+    [(False, "cancelled"), (True, "client_disconnected")],
+)
+@pytest.mark.asyncio
+async def test_send_cancellation_uses_request_disconnect_state(
+    disconnected, expected
+):
+    sessions = registry()
+    response, scope, receive = await _streaming_route_response(
+        Provider(), sessions, disconnected=disconnected
+    )
+
+    async def send(_message):
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await response(scope, receive, send)
+
+    assert latest_performance(sessions).outcome == expected
+
+
+@pytest.mark.asyncio
+async def test_unexpected_send_failure_records_client_translation_diagnostic(caplog):
+    sessions = registry()
+    response, scope, receive = await _streaming_route_response(
+        Provider(), sessions
+    )
+
+    async def send(_message):
+        raise ValueError("SEND_VALUE_SECRET")
+
+    with caplog.at_level(logging.ERROR, logger="claude_code_proxy.logging"):
+        with pytest.raises(ValueError, match="SEND_VALUE_SECRET"):
+            await response(scope, receive, send)
+
+    performance = latest_performance(sessions)
+    assert performance.outcome == "failed"
+    assert performance.failure is not None
+    assert performance.failure.stage == FailureStage.CLIENT_TRANSLATION
+    assert performance.failure.exception_type == "ValueError"
+    assert caplog.text.count("unexpected request failure") == 1
+    assert "SEND_VALUE_SECRET" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_asgi_23_disconnect_before_body_pull_finalizes_disconnected(caplog):
+    sessions = registry()
+    response, scope, _ = await _streaming_route_response(
+        Provider(), sessions
+    )
+    scope["asgi"]["spec_version"] = "2.3"
+    sent = []
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+        await asyncio.sleep(0)
+
+    with caplog.at_level(logging.INFO, logger="claude_code_proxy.logging"):
+        await response(scope, receive, send)
+
+    gc.collect()
+    assert [message["type"] for message in sent] == ["http.response.start"]
+    performance = sessions.performance_snapshots().sessions[0].performance
+    assert performance.current_concurrency == 0
+    assert len(performance.recent_requests) == 1
+    assert performance.recent_requests[0].outcome == "client_disconnected"
+    assert caplog.text.count("performance outcome=client_disconnected") == 1
+
+
+class ProviderCloseErrorEvents:
+    def __init__(self, error: ProviderError) -> None:
+        self.error = error
+        self.close_calls = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+    async def aclose(self):
+        self.close_calls += 1
+        raise self.error
+
+
+@pytest.mark.asyncio
+async def test_observer_close_provider_error_stays_provider_failure(caplog):
+    error = ProviderError("PROVIDER_CLOSE_SECRET", provider="fake")
+    events = ProviderCloseErrorEvents(error)
+    sessions = registry()
+    observation = sessions.begin(stream_metadata())
+    request = DisconnectRequest(False)
+    context = stream_context()
+    prepared = routes_module.normalize_request(
+        routes_module.MessagesRequest(
+            model="claude-sonnet", max_tokens=10, messages=[]
+        )
+    )
+    observed = observe_stream(
+        events,
+        context,
+        on_provider_error=lambda provider_error: (
+            routes_module._mark_observed_provider_error(
+                request, provider_error
+            )
+        ),
+    )
+    serialized = routes_module.serialize_stream(prepared, observed)
+    stream = routes_module._record_stream_lifecycle(
+        serialized, request, context, sessions, observation
+    )
+
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
+        await anext(stream)
+        await anext(stream)
+        with pytest.raises(ProviderError) as raised:
+            await anext(stream)
+
+    assert raised.value is error
+    assert events.close_calls == 1
+    assert caplog.text.count("provider request failed") == 1
+    assert "unexpected request failure" not in caplog.text
+    performance = latest_performance(sessions)
+    assert performance.outcome == "failed"
+    assert performance.failure == logging_module.provider_failure_diagnostic(error)
+    assert "PROVIDER_CLOSE_SECRET" not in caplog.text
