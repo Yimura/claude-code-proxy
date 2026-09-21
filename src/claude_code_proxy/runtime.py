@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from .config import Settings, load_model_mapping
+from .event_journal import EventJournal
 from .model_mapping import ModelResolver
 from .observability import SessionRegistry
 from .providers.codex.auth import CodexAuth
@@ -20,6 +21,7 @@ class RuntimeServices:
     service: ProxyService
     codex_auth: CodexAuth
     sessions: SessionRegistry
+    events: EventJournal
     started_at: datetime
 
 
@@ -39,12 +41,16 @@ def create_runtime(settings: Settings | None = None) -> RuntimeServices:
         litellm_provider,
         codex_provider,
     )
-    sessions = SessionRegistry(configured.session_retention_limit)
+    events = EventJournal(4096, 64)
+    sessions = SessionRegistry(
+        configured.session_retention_limit, events=events
+    )
     started_at = datetime.now(UTC)
     return RuntimeServices(
         settings=configured,
         service=service,
         codex_auth=codex_auth,
         sessions=sessions,
+        events=events,
         started_at=started_at,
     )

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import math
 from types import MappingProxyType
-from typing import Literal, TypeAlias
+from typing import Literal, Protocol, TypeAlias
 
 from .domain.models import (
     CompletionResponse,
@@ -41,6 +41,72 @@ ReasoningContinuation: TypeAlias = Literal[
     "not_applicable",
     "unavailable",
 ]
+
+
+class ProviderTelemetry(Protocol):
+    """Provider-facing telemetry controls without request content fields."""
+
+    def mark_retries_supported(self) -> None: ...
+
+    def record_retry(self) -> None: ...
+
+    def set_reasoning_continuation(
+        self, value: ReasoningContinuation
+    ) -> None: ...
+
+
+class _TelemetryRegistry(Protocol):
+    def upstream_started(self, handle: object) -> None: ...
+
+    def upstream_finished(self, handle: object) -> None: ...
+
+    def stream_event(self, handle: object, event: StreamEvent) -> None: ...
+
+    def response(self, handle: object, response: CompletionResponse) -> None: ...
+
+    def count_tokens(self, handle: object, value: int) -> None: ...
+
+    def mark_retries_supported(self, handle: object) -> None: ...
+
+    def record_retry(self, handle: object) -> None: ...
+
+    def set_reasoning_continuation(
+        self, handle: object, value: ReasoningContinuation
+    ) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RequestTelemetryObserver:
+    """Delegate provider observations to one registry-owned request."""
+
+    _registry: _TelemetryRegistry
+    _handle: object
+
+    def upstream_started(self) -> None:
+        self._registry.upstream_started(self._handle)
+
+    def upstream_finished(self) -> None:
+        self._registry.upstream_finished(self._handle)
+
+    def stream_event(self, event: StreamEvent) -> None:
+        self._registry.stream_event(self._handle, event)
+
+    def response(self, response: CompletionResponse) -> None:
+        self._registry.response(self._handle, response)
+
+    def count_tokens(self, value: int) -> None:
+        self._registry.count_tokens(self._handle, value)
+
+    def mark_retries_supported(self) -> None:
+        self._registry.mark_retries_supported(self._handle)
+
+    def record_retry(self) -> None:
+        self._registry.record_retry(self._handle)
+
+    def set_reasoning_continuation(
+        self, value: ReasoningContinuation
+    ) -> None:
+        self._registry.set_reasoning_continuation(self._handle, value)
 
 _METRIC_STATUSES = frozenset({"observed", "unavailable", "not_applicable"})
 _OPERATIONS = frozenset({"messages", "count_tokens"})
@@ -309,6 +375,14 @@ class RequestPerformance:
         return self._session_id
 
     @property
+    def operation(self) -> OperationKind:
+        return self._operation
+
+    @property
+    def started_monotonic(self) -> float:
+        return self._started_monotonic
+
+    @property
     def is_terminal(self) -> bool:
         return self._is_terminal
 
@@ -558,6 +632,10 @@ class SessionPerformance:
         self._requests = requests
         self._peak_concurrency = max(self._peak_concurrency, concurrency)
         return concurrency
+
+    def request(self, request_id: str) -> RequestPerformance | None:
+        """Return one exact reducer for registry coordination only."""
+        return self._pending.get(request_id)
 
     def add_finalized(
         self, request: RequestPerformance

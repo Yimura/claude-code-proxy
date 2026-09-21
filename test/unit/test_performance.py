@@ -1004,3 +1004,12 @@ def test_session_history_never_retains_sensitive_request_content() -> None:
     rendered = repr(session.snapshot(3.0))
     for secret in ("content-secret", "slot-secret", "credential-secret"):
         assert secret not in rendered
+
+
+def test_session_request_lookup_returns_only_exact_internal_reducer() -> None:
+    session = SessionPerformance("session-1")
+    item = session_request(1)
+    session.start(item)
+
+    assert session.request("request-1") is item
+    assert session.request("missing") is None

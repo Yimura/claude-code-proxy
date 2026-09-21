@@ -5,7 +5,17 @@ import threading
 
 import pytest
 
-from claude_code_proxy.domain.models import ClientIdentity
+from claude_code_proxy.domain.models import (
+    ClientIdentity,
+    CompletionResponse,
+    TextBlock,
+    TextDelta,
+    TokenUsage,
+    ToolInputDelta,
+    ToolUseStart,
+)
+from claude_code_proxy.event_journal import EventJournal
+from claude_code_proxy.limits import MAX_CONTROL_INTEGER
 from claude_code_proxy.observability import (
     AmbiguousSessionId,
     InvalidSessionFilter,
@@ -53,12 +63,17 @@ def metadata(
     return SessionMetadata(**values)
 
 
-def registry(clock: Clock, inactive_limit: int = 10) -> SessionRegistry:
+def registry(
+    clock: Clock,
+    inactive_limit: int = 10,
+    events: EventJournal | None = None,
+) -> SessionRegistry:
     return SessionRegistry(
         inactive_limit=inactive_limit,
         secret=b"test-secret",
         wall_clock=clock.wall_now,
         monotonic_clock=clock.monotonic_now,
+        events=events,
     )
 
 
@@ -710,3 +725,334 @@ def test_last_seen_does_not_decrease_when_wall_clock_moves_backward() -> None:
     assert updated.first_seen == initial.first_seen
     assert updated.last_seen == initial.last_seen
     assert updated.first_seen <= updated.last_seen
+
+
+@pytest.mark.asyncio
+async def test_performance_begin_and_finish_publish_safe_shared_snapshots() -> None:
+    clock = Clock()
+    events = EventJournal()
+    sessions = registry(clock, events=events)
+
+    handle = sessions.begin(metadata("raw-session-secret"))
+    capture = sessions.performance_snapshots()
+    replay = events.subscribe(after=0)
+
+    assert capture.cursor == 1
+    assert capture.sessions[0].session.id == handle.public_id
+    assert capture.sessions[0].performance.session_id == handle.public_id
+    assert replay.replay[0].type == "request_started"
+    assert replay.replay[0].session_id == handle.public_id
+    assert replay.replay[0].request_id == handle.request_id
+    assert "raw-session-secret" not in repr(capture)
+    assert "raw-session-secret" not in repr(replay.replay)
+
+    terminal = sessions.finish(handle, "completed")
+    repeated = sessions.finish(handle, "failed")
+
+    assert terminal is not None
+    assert terminal.outcome == "completed"
+    assert repeated is None
+    assert events.current_sequence == 2
+    assert (await replay.receive(1)).type == "completed"
+    replay.close()
+
+
+def test_performance_overlap_keeps_base_and_reducer_concurrency_coherent() -> None:
+    clock = Clock()
+    sessions = registry(clock)
+    first = sessions.begin(metadata())
+    second = sessions.begin(metadata())
+
+    active = sessions.performance_snapshots().sessions[0]
+
+    assert active.session.active_requests == 2
+    assert active.session.state == "active"
+    assert active.performance.current_concurrency == 2
+    assert active.performance.peak_concurrency == 2
+    assert {item.id for item in active.performance.active_requests} == {
+        first.request_id,
+        second.request_id,
+    }
+
+    sessions.finish(first, "completed")
+    one_left = sessions.performance_snapshots().sessions[0]
+    assert one_left.session.active_requests == 1
+    assert one_left.performance.current_concurrency == 1
+
+
+@pytest.mark.parametrize(
+    ("outcome", "base_result", "base_state"),
+    [
+        ("completed", "completed", "idle"),
+        ("failed", "failed", "failed"),
+        ("cancelled", "failed", "failed"),
+        ("client_disconnected", "failed", "failed"),
+    ],
+)
+def test_detailed_outcomes_map_to_existing_base_contract(
+    outcome: str,
+    base_result: str,
+    base_state: str,
+) -> None:
+    clock = Clock()
+    sessions = registry(clock)
+    handle = sessions.begin(metadata())
+
+    terminal = sessions.finish(handle, outcome)  # type: ignore[arg-type]
+    view = sessions.performance_snapshots().sessions[0]
+
+    assert terminal is not None
+    assert terminal.outcome == outcome
+    assert view.performance.outcomes == {outcome: 1}
+    assert view.session.last_result == base_result
+    assert view.session.state == base_state
+
+
+def test_sequence_exhaustion_keeps_begin_and_finish_state_atomic() -> None:
+    clock = Clock()
+    begin_events = EventJournal()
+    begin_events._sequence = MAX_CONTROL_INTEGER  # type: ignore[attr-defined]
+    begin_sessions = registry(clock, events=begin_events)
+
+    with pytest.raises(ValueError, match="sequence"):
+        begin_sessions.begin(metadata())
+    assert begin_sessions.snapshots() == []
+
+    finish_events = EventJournal()
+    finish_sessions = registry(clock, events=finish_events)
+    handle = finish_sessions.begin(metadata())
+    before = finish_sessions.performance_snapshots().sessions
+    finish_events._sequence = MAX_CONTROL_INTEGER  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="sequence"):
+        finish_sessions.finish(handle, "completed")
+
+    assert finish_sessions.performance_snapshots().sessions == before
+    assert finish_sessions.snapshots()[0].state == "active"
+
+
+@pytest.mark.asyncio
+async def test_progress_is_rate_bounded_but_first_output_is_immediate() -> None:
+    clock = Clock()
+    events = EventJournal()
+    sessions = registry(clock, events=events)
+    observer = sessions.observer(sessions.begin(metadata()))
+    subscription = events.subscribe(after=1)
+
+    observer.stream_event(TextDelta("content-secret"))
+    for _ in range(100):
+        observer.stream_event(ToolInputDelta("slot-secret", "input-secret"))
+
+    assert (await subscription.receive(1)).type == "first_output"
+    assert await subscription.receive(0) is None
+
+    clock.advance(0.25)
+    observer.stream_event(ToolInputDelta("slot-secret", "input-secret"))
+    progress = await subscription.receive(1)
+
+    assert progress.type == "progress"
+    assert "content-secret" not in repr(progress)
+    assert "slot-secret" not in repr(progress)
+    assert "input-secret" not in repr(progress)
+    subscription.close()
+
+
+@pytest.mark.asyncio
+async def test_first_tool_start_publishes_first_output_then_tool_use_safely() -> None:
+    clock = Clock()
+    events = EventJournal()
+    sessions = registry(clock, events=events)
+    observer = sessions.observer(sessions.begin(metadata()))
+    subscription = events.subscribe(after=1)
+
+    observer.stream_event(
+        ToolUseStart("slot-secret", "tool-id-secret", "tool-name-secret")
+    )
+
+    published = [
+        await subscription.receive(1),
+        await subscription.receive(1),
+    ]
+    assert [item.type for item in published] == ["first_output", "tool_use"]
+    rendered = repr(published)
+    for secret in ("slot-secret", "tool-id-secret", "tool-name-secret"):
+        assert secret not in rendered
+    subscription.close()
+
+
+def test_observer_records_retry_usage_count_tokens_and_reasoning() -> None:
+    clock = Clock()
+    sessions = registry(clock)
+    messages_handle = sessions.begin(metadata())
+    messages = sessions.observer(messages_handle)
+
+    messages.upstream_started()
+    clock.advance(0.5)
+    messages.upstream_finished()
+    messages.mark_retries_supported()
+    messages.record_retry()
+    messages.set_reasoning_continuation("restored")
+    messages.response(
+        CompletionResponse(
+            "response-secret",
+            "model-secret",
+            (TextBlock("answer-secret"),),
+            "end_turn",
+            TokenUsage(7, 5),
+        )
+    )
+    sessions.finish(messages_handle, "completed")
+
+    count_handle = sessions.begin(metadata(), operation="count_tokens")
+    sessions.observer(count_handle).count_tokens(13)
+    sessions.finish(count_handle, "completed")
+    snapshot = sessions.performance_snapshots().sessions[0].performance
+    count_snapshot, message_snapshot = snapshot.recent_requests
+
+    assert message_snapshot.retries.value == 1
+    assert message_snapshot.reasoning_continuation == "restored"
+    assert message_snapshot.input_tokens.value == 7
+    assert message_snapshot.output_tokens.value == 5
+    assert message_snapshot.upstream_duration.value == 0.5
+    assert count_snapshot.input_tokens.value == 13
+    assert count_snapshot.output_tokens.status == "not_applicable"
+    assert "answer-secret" not in repr(snapshot)
+    assert "response-secret" not in repr(snapshot)
+
+
+@pytest.mark.parametrize("value", [True, -1, MAX_CONTROL_INTEGER + 1])
+def test_count_tokens_rejects_invalid_values_without_mutation(value: object) -> None:
+    clock = Clock()
+    sessions = registry(clock)
+    handle = sessions.begin(metadata(), operation="count_tokens")
+    before = sessions.performance_snapshots().sessions
+
+    with pytest.raises(ValueError, match="count_tokens"):
+        sessions.observer(handle).count_tokens(value)  # type: ignore[arg-type]
+
+    assert sessions.performance_snapshots().sessions == before
+
+
+def test_capture_reuses_snapshot_filters_retention_and_latest_twenty() -> None:
+    clock = Clock()
+    sessions = registry(clock, inactive_limit=1)
+    active = sessions.begin(metadata("active"))
+    evicted = sessions.begin(metadata("evicted"))
+    sessions.finish(evicted, "completed")
+    for index in range(25):
+        handle = sessions.begin(metadata("history"), operation="count_tokens")
+        sessions.observer(handle).count_tokens(index)
+        sessions.finish(handle, "completed")
+
+    history = sessions.performance_snapshots({"session_id": ["history"]})
+    active_capture = sessions.performance_snapshots({"state": ["ACTIVE"]})
+
+    assert len(history.sessions[0].performance.recent_requests) == 20
+    assert history.sessions[0].performance.input_tokens.value == sum(range(25))
+    assert active_capture.sessions[0].session.id == active.public_id
+    assert sessions.performance_snapshots(
+        {"session_id": ["evicted"]}
+    ).sessions == ()
+
+
+@pytest.mark.asyncio
+async def test_performance_subscription_capture_replay_reset_and_live_delivery() -> None:
+    clock = Clock()
+    events = EventJournal(capacity=2)
+    sessions = registry(clock, events=events)
+    first = sessions.begin(metadata("first"))
+
+    fresh = sessions.subscribe_performance(None, after=None)
+    assert fresh.initial is not None
+    assert fresh.initial.cursor == 1
+
+    retained = sessions.subscribe_performance(None, after=0)
+    assert retained.initial is None
+    assert [event.sequence for event in retained.subscription.replay] == [1]
+
+    sessions.finish(first, "completed")
+    second = sessions.begin(metadata("second"))
+    sessions.finish(second, "completed")
+    stale = sessions.subscribe_performance(None, after=1)
+    assert stale.subscription.reset_required is True
+    assert stale.initial is not None
+    assert stale.initial.cursor == 4
+
+    live = sessions.begin(metadata("live"))
+    delivered = await fresh.subscription.receive(1)
+    assert delivered.request_id == first.request_id
+    while delivered.request_id != live.request_id:
+        delivered = await fresh.subscription.receive(1)
+    assert delivered.type == "request_started"
+
+    for item in (fresh, retained, stale):
+        item.subscription.close()
+
+
+def test_begin_uses_supplied_clocks_and_rejects_invalid_values_atomically() -> None:
+    clock = Clock()
+    sessions = registry(clock)
+    supplied_wall = datetime(2026, 2, 3, tzinfo=UTC)
+
+    handle = sessions.begin(
+        metadata("supplied"),
+        started_at=supplied_wall,
+        started_monotonic=7.5,
+    )
+    started = sessions.performance_snapshots(
+        {"session_id": ["supplied"]}
+    ).sessions[0].performance.active_requests[0]
+
+    assert handle.operation == "messages"
+    assert handle.started_monotonic == 7.5
+    assert started.started_at == supplied_wall
+    before = sessions.performance_snapshots().sessions
+
+    with pytest.raises(ValueError, match="started_at"):
+        sessions.begin(
+            metadata("invalid-wall"),
+            started_at=datetime(2026, 2, 3),
+        )
+    with pytest.raises(ValueError, match="started_monotonic"):
+        sessions.begin(
+            metadata("invalid-monotonic"),
+            started_monotonic=float("nan"),
+        )
+
+    assert sessions.performance_snapshots().sessions == before
+
+
+@pytest.mark.asyncio
+async def test_retry_publication_is_immediate_and_safe() -> None:
+    clock = Clock()
+    events = EventJournal()
+    sessions = registry(clock, events=events)
+    observer = sessions.observer(sessions.begin(metadata()))
+    subscription = events.subscribe(after=1)
+
+    observer.mark_retries_supported()
+    assert await subscription.receive(0) is None
+    observer.record_retry()
+    retry = await subscription.receive(1)
+
+    assert retry.type == "retry"
+    assert retry.request.retries.value == 1
+    subscription.close()
+
+
+def test_performance_capture_rejects_ambiguous_public_id_prefix() -> None:
+    clock = Clock()
+    sessions = registry(clock, inactive_limit=20)
+    prefixes: dict[str, str] = {}
+    collision = None
+    for index in range(17):
+        handle = sessions.begin(metadata(f"capture-session-{index}"))
+        prefix = handle.public_id[0]
+        if prefix in prefixes:
+            collision = prefix
+            break
+        prefixes[prefix] = handle.public_id
+
+    assert collision is not None
+    with pytest.raises(AmbiguousSessionId, match=collision):
+        sessions.performance_snapshots({"id": [collision.upper()]})

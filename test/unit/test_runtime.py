@@ -107,3 +107,9 @@ def test_create_runtime_shares_auth_with_codex_service(tmp_path, monkeypatch):
     assert litellm_provider.settings is configured
     assert provider.auth is runtime.codex_auth
     assert provider.token_counter == litellm_provider.count_tokens
+
+
+def test_create_runtime_shares_one_event_journal_with_registry(tmp_path):
+    runtime = runtime_module.create_runtime(settings(tmp_path))
+
+    assert runtime.events is runtime.sessions.events
