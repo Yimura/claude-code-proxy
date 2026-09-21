@@ -5,7 +5,6 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
 
-import anyio
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -24,6 +23,7 @@ from ..logging import (
     REQUEST_LOG_CONTEXT,
     RequestLogContext,
     agent_identity,
+    cancelled_request_outcome,
     client_identity_from_headers,
     effective_effort,
     log_agent_started,
@@ -180,7 +180,8 @@ async def _complete_response(
         )
         raise _http_error(error) from error
     except asyncio.CancelledError:
-        _finalize_request(sessions, observation, context, "cancelled")
+        outcome = await cancelled_request_outcome(raw_request)
+        _finalize_request(sessions, observation, context, outcome)
         raise
     except Exception as error:
         _log_unexpected_error(raw_request, context, error)
@@ -203,7 +204,6 @@ async def _complete_response(
             stage=FailureStage.CLIENT_TRANSLATION,
         )
         raise
-    _finalize_request(sessions, observation, context, "completed")
     return response
 
 
@@ -231,13 +231,13 @@ async def _count_response(
         )
         raise _http_error(error) from error
     except asyncio.CancelledError:
-        _finalize_request(sessions, observation, context, "cancelled")
+        outcome = await cancelled_request_outcome(raw_request)
+        _finalize_request(sessions, observation, context, outcome)
         raise
     except Exception as error:
         _log_unexpected_error(raw_request, context, error)
         _finalize_unexpected(sessions, observation, context, error)
         raise
-    _finalize_request(sessions, observation, context, "completed")
     return response
 
 
@@ -286,7 +286,7 @@ class _LifecycleStreamingResponse(StreamingResponse):
             raise
         except asyncio.CancelledError as error:
             original = error
-            outcome = await _cancelled_outcome(self._raw_request)
+            outcome = await cancelled_request_outcome(self._raw_request)
             _set_stream_response_outcome(self._raw_request, outcome)
             raise
         except Exception as error:
@@ -406,7 +406,7 @@ async def _classify_stream_exception(
             return outcome
         if state.response_outcome is not None:
             return state.response_outcome
-        return await _cancelled_outcome(raw_request)
+        return await cancelled_request_outcome(raw_request)
     if isinstance(error, Exception) and not state.exception_logged:
         _record_unexpected_stream_exception(
             raw_request,
@@ -502,15 +502,6 @@ def _record_unexpected_stream_exception(
     state.exception_logged = True
     _log_unexpected_error(raw_request, context, error, stage=stage)
     return state.failure
-
-
-async def _cancelled_outcome(raw_request: Request) -> RequestOutcome:
-    try:
-        with anyio.CancelScope(shield=True):
-            disconnected = await raw_request.is_disconnected()
-    except BaseException:
-        return "cancelled"
-    return "client_disconnected" if disconnected else "cancelled"
 
 
 async def _close_stream_iterator(

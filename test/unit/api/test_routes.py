@@ -107,6 +107,7 @@ class RecordingSessionRegistry(SessionRegistry):
             monotonic_clock=monotonic_clock,
         )
         self.finish_calls: list[tuple[ObservationHandle, RequestOutcome]] = []
+        self.finish_attempts: list[tuple[ObservationHandle, RequestOutcome]] = []
         self.finish_failures: list[FailureDiagnostic | None] = []
 
     def finish_with_status(
@@ -115,9 +116,12 @@ class RecordingSessionRegistry(SessionRegistry):
         result: RequestOutcome,
         failure: FailureDiagnostic | None = None,
     ):
-        self.finish_calls.append((handle, result))
-        self.finish_failures.append(failure)
-        return super().finish_with_status(handle, result, failure)
+        self.finish_attempts.append((handle, result))
+        finalized = super().finish_with_status(handle, result, failure)
+        if finalized.finalized:
+            self.finish_calls.append((handle, result))
+            self.finish_failures.append(failure)
+        return finalized
 
 
 def registry() -> RecordingSessionRegistry:
@@ -134,7 +138,7 @@ def assert_finished_once(
 
 
 def application(
-    provider=None, *, sessions=None, with_middleware=False, config=None
+    provider=None, *, sessions=None, with_middleware=True, config=None
 ) -> FastAPI:
     provider = provider or Provider()
     config = config or ModelConfig({}, {}, {})
@@ -147,7 +151,7 @@ def application(
     return app
 
 
-def client(provider=None, *, sessions=None, with_middleware=False, config=None):
+def client(provider=None, *, sessions=None, with_middleware=True, config=None):
     app = application(
         provider,
         sessions=sessions,
@@ -1730,10 +1734,11 @@ def test_duplicate_finalization_emits_one_terminal_record(caplog):
             sessions, observation, context, "completed"
         )
 
-    assert sessions.finish_calls == [
+    assert sessions.finish_attempts == [
         (observation, "completed"),
         (observation, "completed"),
     ]
+    assert sessions.finish_calls == [(observation, "completed")]
     assert caplog.text.count("performance ") == 1
 
 

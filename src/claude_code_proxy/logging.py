@@ -7,6 +7,8 @@ import logging
 import math
 import os
 import uuid
+
+import anyio
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +27,11 @@ from .failures import (
     unexpected_failure_diagnostic,
 )
 from .observability import SessionRegistry
-from .performance import Measurement, RequestPerformanceSnapshot
+from .performance import (
+    Measurement,
+    RequestOutcome,
+    RequestPerformanceSnapshot,
+)
 from .providers.base import ProviderError
 from .reasoning import ReasoningPolicy
 from .text_safety import bounded_log_token, log_text
@@ -568,6 +574,16 @@ def _finalize_client_disconnect(request: Request) -> None:
     _invoke_state_finalizer(request, "client_disconnected")
 
 
+async def cancelled_request_outcome(request: Request) -> RequestOutcome:
+    """Distinguish request cancellation from a disconnected client."""
+    try:
+        with anyio.CancelScope(shield=True):
+            disconnected = await request.is_disconnected()
+    except BaseException:
+        return "cancelled"
+    return "client_disconnected" if disconnected else "cancelled"
+
+
 class RequestLoggingMiddleware:
     def __init__(self, app: ASGIApp, sessions: SessionRegistry) -> None:
         self._app = app
@@ -617,6 +633,7 @@ class RequestLoggingMiddleware:
             )
             _invoke_state_finalizer(request, "failed", diagnostic)
             raise
+        _invoke_state_finalizer(request, "completed")
         self._record_status(request, status_code)
 
     def _record_exception(
