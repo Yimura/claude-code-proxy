@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import typer
+from click import unstyle
 from wcwidth import wcswidth
 
 from claude_code_proxy import cli_common, performance_cli
@@ -538,6 +539,6 @@ def test_watch_help_and_dependencies() -> None:
     )
 
     assert result.exit_code == 0
-    assert "--watch" in result.stdout
+    assert "--watch" in unstyle(result.stdout)
     assert ".providers" not in sources
     assert "Settings" not in sources
