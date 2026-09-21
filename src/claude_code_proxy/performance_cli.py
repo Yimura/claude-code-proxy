@@ -11,11 +11,10 @@ import typer
 
 from .cli_common import (
     OutputFormat,
-    control_guidance,
+    bounded_error,
     exit_with_error,
     load_current_directory_environment,
     render_table,
-    report_unavailable,
     terminal_text,
     validated_filters,
 )
@@ -79,12 +78,11 @@ def perf(
             result = client.performance(normalized)
         typer.echo(render_performance(result, output_format, no_trunc))
     except ControlUnavailable as error:
-        report_unavailable(error, command_name="perf")
+        _performance_guidance(str(error))
         raise typer.Exit(code=1) from None
     except IncompatibleProtocol as error:
-        control_guidance(
-            f"Incompatible control API at {socket_path}: {error}",
-            command_name="perf",
+        _performance_guidance(
+            f"Incompatible control API at {socket_path}: {error}"
         )
         raise typer.Exit(code=1) from None
     except ControlError as error:
@@ -107,8 +105,23 @@ def render_performance(
                 allow_nan=False,
             )
         return _render_performance_table(result, no_trunc)
-    except (TypeError, ValueError, RecursionError) as error:
+    except (TypeError, ValueError, OverflowError, RecursionError) as error:
         raise ControlError(_INVALID_RESPONSE) from error
+
+
+def _performance_guidance(message: str) -> None:
+    typer.echo(f"Error: {bounded_error(message)}", err=True)
+    typer.echo(
+        "source: start `claude-code-proxy proxy --performance collector`",
+        err=True,
+    )
+    typer.echo(
+        "Docker: configure service command "
+        "`claude-code-proxy proxy --performance collector`, recreate the "
+        "service, then run "
+        "`docker compose exec proxy claude-code-proxy perf`",
+        err=True,
+    )
 
 
 def _render_performance_table(
@@ -193,11 +206,13 @@ def _format_aggregate(metric: MetricAggregateResponse) -> str:
 
 
 def _format_cache_ratio(performance: SessionPerformanceResponse) -> str:
-    metrics = (
-        performance.input_tokens,
+    cache_metrics = (
         performance.cache_read_tokens,
         performance.cache_creation_tokens,
     )
+    if any(item.not_applicable_samples for item in cache_metrics):
+        return "—"
+    metrics = (performance.input_tokens, *cache_metrics)
     observed = sum(item.observed_samples for item in metrics)
     if observed == 0 or performance.cache_read_tokens.observed_samples == 0:
         return "—"

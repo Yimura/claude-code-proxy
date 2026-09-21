@@ -148,6 +148,18 @@ def performance_response(
     )
 
 
+def mixed_numeric_overflow_response() -> PerformanceListResponse:
+    return performance_response(
+        view_payload(
+            aggregates={
+                "input_tokens": aggregate(10**1000),
+                "cache_read_tokens": aggregate(0.0),
+                "cache_creation_tokens": aggregate(0),
+            }
+        )
+    )
+
+
 def render_table(result: PerformanceListResponse, no_trunc: bool = False) -> str:
     return performance_cli.render_performance(result, OutputFormat.TABLE, no_trunc)
 
@@ -192,6 +204,25 @@ def test_table_formats_token_totals_and_cache_ratio() -> None:
 
     assert "200 / 25" in rendered
     assert "20%" in rendered
+
+
+def test_cache_ratio_unavailable_for_count_token_samples() -> None:
+    result = performance_response(
+        view_payload(
+            requests=2,
+            aggregates={
+                "input_tokens": aggregate(960, observed=2),
+                "cache_read_tokens": aggregate(
+                    40, observed=1, not_applicable=1
+                ),
+                "cache_creation_tokens": aggregate(
+                    0, observed=1, not_applicable=1
+                ),
+            },
+        )
+    )
+
+    assert row_cells(render_table(result))[10] == "—"
 
 
 @pytest.mark.parametrize(
@@ -530,11 +561,31 @@ def test_perf_errors_exit_one_safely_and_close_client(
     assert "Traceback" not in result.stderr
     assert client.entered and client.exited
     if isinstance(error, (ControlUnavailable, IncompatibleProtocol)):
-        assert "source: start `claude-code-proxy proxy`" in result.stderr
-        assert (
-            "docker compose exec proxy claude-code-proxy perf" in result.stderr
+        guidance = (
+            "source: start `claude-code-proxy proxy --performance collector`\n"
+            "Docker: configure service command "
+            "`claude-code-proxy proxy --performance collector`, recreate the "
+            "service, then run "
+            "`docker compose exec proxy claude-code-proxy perf`\n"
         )
+        assert result.stderr.endswith(guidance)
+        assert "source: start `claude-code-proxy proxy`\n" not in result.stderr
         assert "claude-code-proxy ps" not in result.stderr
+
+
+def test_perf_mixed_numeric_overflow_closes_client_and_hides_raw_error() -> None:
+    FakePerformanceClient.result = mixed_numeric_overflow_response()
+
+    invoked = runner.invoke(app, ["perf"])
+
+    assert invoked.exit_code == 1
+    assert invoked.stderr == (
+        "Error: Control API returned an invalid performance response\n"
+    )
+    assert "int too large to convert to float" not in invoked.stderr
+    assert "OverflowError" not in invoked.stderr
+    assert "Traceback" not in invoked.stderr
+    assert FakePerformanceClient.instances[0].exited
 
 
 def test_perf_serialization_failure_closes_client_and_hides_raw_value() -> None:
@@ -589,6 +640,15 @@ def test_cache_ratio_is_unavailable_without_observed_cache_read_samples() -> Non
         )
 
         assert row_cells(render_table(result))[10] == "—"
+
+
+def test_table_mixed_numeric_overflow_raises_generic_safe_error() -> None:
+    with pytest.raises(ControlError) as raised:
+        render_table(mixed_numeric_overflow_response())
+
+    assert str(raised.value) == (
+        "Control API returned an invalid performance response"
+    )
 
 
 def test_table_nonfinite_contract_bypass_raises_generic_safe_error() -> None:
