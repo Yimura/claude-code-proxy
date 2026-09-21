@@ -181,6 +181,25 @@ def test_anthropic_preserves_thinking_and_output_config(settings):
     assert "reasoning_effort" not in payload
 
 
+class RecordingTelemetry:
+    def __init__(self):
+        self.calls = []
+
+    def mark_retries_supported(self):
+        self.calls.append(("mark_retries_supported",))
+
+    def record_retry(self):
+        self.calls.append(("record_retry",))
+
+    def set_reasoning_continuation(self, value):
+        self.calls.append(("set_reasoning_continuation", value))
+
+
+class FailingTelemetry(RecordingTelemetry):
+    def set_reasoning_continuation(self, value):
+        raise RuntimeError("sensitive callback failure")
+
+
 class FakeClient:
     def __init__(self, response=None, chunks=(), token_count=9):
         self.response = response
@@ -200,6 +219,110 @@ class FakeClient:
     def token_counter(self, **kwargs):
         self.counter_args = kwargs
         return self.token_count
+
+
+async def invoke_provider_operation(
+    provider, operation, completion_request, telemetry
+):
+    if operation == "complete":
+        await provider.complete(completion_request, telemetry=telemetry)
+        return
+    if operation == "stream":
+        async for _ in provider.stream(
+            completion_request, telemetry=telemetry
+        ):
+            pass
+        return
+    await provider.count_tokens(completion_request, telemetry=telemetry)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["complete", "stream", "count_tokens"])
+@pytest.mark.parametrize(
+    ("enabled", "expected"),
+    [(True, "unavailable"), (False, "not_applicable"), (None, "not_applicable")],
+)
+async def test_operations_report_reasoning_state_once(
+    settings, operation, enabled, expected
+):
+    telemetry = RecordingTelemetry()
+    client = FakeClient(
+        response={
+            "id": "response-1",
+            "choices": [{
+                "message": {"content": "ok", "tool_calls": None},
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        },
+        chunks=[{"choices": [{"delta": {}, "finish_reason": "stop"}]}],
+    )
+
+    await invoke_provider_operation(
+        LiteLLMProvider(settings, client),
+        operation,
+        request(reasoning=ReasoningPolicy(enabled, None)),
+        telemetry,
+    )
+
+    assert telemetry.calls == [("set_reasoning_continuation", expected)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["complete", "stream", "count_tokens"])
+async def test_operations_report_reasoning_before_translation_failure(
+    settings, monkeypatch, operation
+):
+    telemetry = RecordingTelemetry()
+    provider = LiteLLMProvider(settings, FakeClient())
+
+    def fail_build(*args, **kwargs):
+        raise RuntimeError("sensitive build failure")
+
+    monkeypatch.setattr(provider, "build_request", fail_build)
+
+    if operation == "stream":
+        await invoke_provider_operation(
+            provider, operation, request(), telemetry
+        )
+    else:
+        with pytest.raises(ProviderError):
+            await invoke_provider_operation(
+                provider, operation, request(), telemetry
+            )
+
+    assert telemetry.calls == [("set_reasoning_continuation", "unavailable")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["complete", "stream", "count_tokens"])
+async def test_telemetry_callback_failure_does_not_change_provider_behavior(
+    settings, operation, caplog
+):
+    client = FakeClient(
+        response={
+            "id": "response-1",
+            "choices": [{
+                "message": {"content": "ok", "tool_calls": None},
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        },
+        chunks=[{"choices": [{"delta": {}, "finish_reason": "stop"}]}],
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="claude_code_proxy.performance"
+    ):
+        await invoke_provider_operation(
+            LiteLLMProvider(settings, client),
+            operation,
+            request(),
+            FailingTelemetry(),
+        )
+
+    assert caplog.records[-1].getMessage() == "telemetry callback failed"
+    assert "sensitive callback failure" not in caplog.text
 
 
 @pytest.mark.asyncio

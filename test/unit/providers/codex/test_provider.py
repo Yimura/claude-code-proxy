@@ -11,12 +11,14 @@ from claude_code_proxy.domain.models import (
     ClientIdentity,
     CompletionRequest,
     Message,
+    RedactedThinkingBlock,
     StreamComplete,
     StreamError,
     StreamStart,
     TextBlock,
     TextDelta,
     TokenUsage,
+    ToolResultBlock,
     ToolDefinition,
 )
 from claude_code_proxy.failures import (
@@ -39,6 +41,7 @@ from claude_code_proxy.providers.codex.provider import (
     CODEX_RESPONSES_URL,
     CodexProvider,
 )
+from claude_code_proxy.providers.codex.reasoning import encode_reasoning
 from claude_code_proxy.providers.codex.translation import CodexEventTranslator
 from claude_code_proxy.reasoning import ReasoningPolicy
 from claude_code_proxy.service import _validated_stream
@@ -72,6 +75,20 @@ class Auth:
         if self.recovery_failure is not None:
             raise self.recovery_failure
         return self.recovered
+
+
+class RecordingTelemetry:
+    def __init__(self):
+        self.calls = []
+
+    def mark_retries_supported(self):
+        self.calls.append(("mark_retries_supported",))
+
+    def record_retry(self):
+        self.calls.append(("record_retry",))
+
+    def set_reasoning_continuation(self, value):
+        self.calls.append(("set_reasoning_continuation", value))
 
 
 class Response:
@@ -286,9 +303,13 @@ def completed_response(input_tokens=0, output_tokens=0):
     )
 
 
-async def collect(provider, completion_request=None):
+async def collect(provider, completion_request=None, telemetry=None):
     completion_request = completion_request or request()
-    return [event async for event in provider.stream(completion_request)]
+    if telemetry is None:
+        stream = provider.stream(completion_request)
+    else:
+        stream = provider.stream(completion_request, telemetry=telemetry)
+    return [event async for event in stream]
 
 
 async def test_stream_posts_headers_and_returns_semantic_events():
@@ -319,6 +340,55 @@ async def test_stream_posts_headers_and_returns_semantic_events():
         Client.requests[0][2]["headers"]["Authorization"]
         == "Bearer secret-access"
     )
+
+
+async def test_codex_telemetry_callback_failure_is_isolated(caplog):
+    marker = "sensitive telemetry failure"
+
+    class FailingTelemetry:
+        def mark_retries_supported(self):
+            raise RuntimeError(marker)
+
+        def set_reasoning_continuation(self, value):
+            raise RuntimeError(marker)
+
+    Client.responses = [completed_response()]
+
+    with caplog.at_level(
+        logging.WARNING, logger="claude_code_proxy.performance"
+    ):
+        events = await collect(
+            CodexProvider(Auth(), Client), telemetry=FailingTelemetry()
+        )
+
+    assert events == [
+        StreamStart(),
+        StreamComplete("end_turn", TokenUsage(0, 0)),
+    ]
+    assert marker not in caplog.text
+
+
+async def test_non_401_response_observes_zero_retries():
+    telemetry = RecordingTelemetry()
+    Client.responses = [completed_response()]
+
+    await collect(CodexProvider(Auth(), Client), telemetry=telemetry)
+
+    assert ("record_retry",) not in telemetry.calls
+
+
+async def test_early_close_does_not_record_retry():
+    telemetry = RecordingTelemetry()
+    response = Response(block_lines=True)
+    ExitClient.responses = [response]
+    stream = CodexProvider(Auth(), ExitClient).stream(
+        request(), telemetry=telemetry
+    )
+
+    assert await anext(stream) == StreamStart()
+    await stream.aclose()
+
+    assert ("record_retry",) not in telemetry.calls
 
 
 async def test_early_close_immediately_closes_response_and_client_once():
@@ -665,6 +735,64 @@ async def test_headerless_requests_receive_distinct_fallback_sessions():
     assert first["json"]["prompt_cache_key"] != second["json"]["prompt_cache_key"]
 
 
+async def test_stream_reports_capability_then_reasoning_once():
+    telemetry = RecordingTelemetry()
+    Client.responses = [completed_response()]
+
+    await collect(
+        CodexProvider(Auth(), Client),
+        request(reasoning=ReasoningPolicy(True, "high")),
+        telemetry=telemetry,
+    )
+
+    assert telemetry.calls == [
+        ("mark_retries_supported",),
+        ("set_reasoning_continuation", "expected"),
+    ]
+
+
+async def test_complete_reports_adapter_facts_only_once():
+    telemetry = RecordingTelemetry()
+    Client.responses = [completed_response()]
+
+    await CodexProvider(Auth(), Client).complete(
+        request(reasoning=ReasoningPolicy(True, "high")),
+        telemetry=telemetry,
+    )
+
+    assert telemetry.calls == [
+        ("mark_retries_supported",),
+        ("set_reasoning_continuation", "expected"),
+    ]
+
+
+async def test_stream_reports_restored_reasoning_without_carrier_content():
+    marker = "sensitive-encrypted-state"
+    carrier = encode_reasoning(marker, [])
+    completion_request = request(
+        reasoning=ReasoningPolicy(True, "high"),
+        messages=(
+            Message("assistant", (RedactedThinkingBlock(carrier),)),
+            Message("user", (ToolResultBlock("call-1", "done"),)),
+        ),
+    )
+    telemetry = RecordingTelemetry()
+    Client.responses = [completed_response()]
+
+    await collect(
+        CodexProvider(Auth(), Client),
+        completion_request,
+        telemetry=telemetry,
+    )
+
+    assert telemetry.calls[-1] == (
+        "set_reasoning_continuation",
+        "restored",
+    )
+    assert marker not in repr(telemetry.calls)
+    assert carrier not in repr(telemetry.calls)
+
+
 async def test_401_retry_reuses_client_session_id():
     Client.responses = [Response(status=401), completed_response()]
 
@@ -692,28 +820,57 @@ async def test_401_retry_reuses_generated_fallback_session_id():
 
 
 async def test_401_recovers_credentials_after_closing_response_and_retries_once():
+    order = []
     rejected = Response(status=401)
+
+    def recovered_after_close():
+        assert rejected.exited is True
+        order.append("credentials_recovered")
+
+    class OrderedClient(Client):
+        def stream(self, method, url, **kwargs):
+            order.append("request_started")
+            return super().stream(method, url, **kwargs)
+
+    class OrderedTelemetry(RecordingTelemetry):
+        def record_retry(self):
+            order.append("retry_recorded")
+            super().record_retry()
+
     auth = Auth(
         recovered=("new-access", "account"),
-        on_recover=lambda: rejected.exited
-        or pytest.fail("response must close before credential recovery"),
+        on_recover=recovered_after_close,
     )
-    Client.responses = [rejected, completed_response()]
+    OrderedClient.responses = [rejected, completed_response()]
 
-    events = await collect(CodexProvider(auth, Client))
+    telemetry = OrderedTelemetry()
+    events = await collect(
+        CodexProvider(auth, OrderedClient), telemetry=telemetry
+    )
 
+    assert telemetry.calls == [
+        ("mark_retries_supported",),
+        ("set_reasoning_continuation", "not_applicable"),
+        ("record_retry",),
+    ]
+    assert order == [
+        "request_started",
+        "credentials_recovered",
+        "retry_recorded",
+        "request_started",
+    ]
     assert events == [
         StreamStart(),
         StreamComplete("end_turn", TokenUsage(0, 0)),
     ]
     assert auth.rejected == ["secret-access"]
-    assert len(Client.requests) == 2
+    assert len(OrderedClient.requests) == 2
     assert (
-        Client.requests[0][2]["headers"]["Authorization"]
+        OrderedClient.requests[0][2]["headers"]["Authorization"]
         == "Bearer secret-access"
     )
     assert (
-        Client.requests[1][2]["headers"]["Authorization"]
+        OrderedClient.requests[1][2]["headers"]["Authorization"]
         == "Bearer new-access"
     )
 
@@ -722,8 +879,12 @@ async def test_second_401_returns_authentication_error_without_stream_start():
     auth = Auth(recovered=("new-access", "account"))
     Client.responses = [Response(status=401), Response(status=401)]
 
-    events = await collect(CodexProvider(auth, Client))
+    telemetry = RecordingTelemetry()
+    events = await collect(
+        CodexProvider(auth, Client), telemetry=telemetry
+    )
 
+    assert telemetry.calls.count(("record_retry",)) == 1
     assert len(Client.requests) == 2
     assert auth.rejected == ["secret-access"]
     assert events == [
@@ -1079,8 +1240,12 @@ async def test_recovery_failure_returns_safe_error_without_second_request():
     )
     Client.responses = [rejected]
 
-    events = await collect(CodexProvider(auth, Client))
+    telemetry = RecordingTelemetry()
+    events = await collect(
+        CodexProvider(auth, Client), telemetry=telemetry
+    )
 
+    assert ("record_retry",) not in telemetry.calls
     assert len(Client.requests) == 1
     assert events == [
         StreamError(
@@ -1144,6 +1309,28 @@ async def test_transport_failures_are_safe_and_structured(
         )
     ]
     assert "secret" not in repr(events)
+
+
+async def test_payload_build_failure_still_reports_adapter_facts(monkeypatch):
+    telemetry = RecordingTelemetry()
+
+    def fail_build(*args, **kwargs):
+        raise RuntimeError("sensitive carrier must not leak")
+
+    monkeypatch.setattr(
+        "claude_code_proxy.providers.codex.provider.build_request",
+        fail_build,
+    )
+
+    events = await collect(
+        CodexProvider(Auth(), Client), telemetry=telemetry
+    )
+
+    assert telemetry.calls == [
+        ("mark_retries_supported",),
+        ("set_reasoning_continuation", "not_applicable"),
+    ]
+    assert "sensitive carrier" not in repr(events)
 
 
 @pytest.mark.parametrize(

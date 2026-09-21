@@ -20,7 +20,11 @@ from ..domain.models import (
     StreamStart, TextBlock, TextDelta, TokenUsage, ToolInputDelta, ToolResultBlock,
     ToolUseBlock, ToolUseEnd, ToolUseStart,
 )
-from ..performance import ProviderTelemetry
+from ..performance import (
+    ProviderTelemetry,
+    ReasoningContinuation,
+    notify_telemetry,
+)
 from ..failures import (
     FailureCategory,
     FailureDiagnostic,
@@ -117,6 +121,15 @@ class _LiteLLMStreamState:
         events = [ToolUseEnd(slot) for slot in sorted(self.slots)]
         events.append(StreamComplete(self.stop_reason, self.usage))
         return tuple(events)
+
+
+def _report_reasoning_continuation(
+    request: CompletionRequest, telemetry: ProviderTelemetry | None
+) -> None:
+    state: ReasoningContinuation = (
+        "unavailable" if request.reasoning.enabled else "not_applicable"
+    )
+    notify_telemetry(telemetry, "set_reasoning_continuation", state)
 
 
 class LiteLLMProvider:
@@ -248,6 +261,7 @@ class LiteLLMProvider:
         request: CompletionRequest,
         telemetry: ProviderTelemetry | None = None,
     ) -> CompletionResponse:
+        _report_reasoning_continuation(request, telemetry)
         try:
             payload = self.build_request(request, stream=False)
         except Exception as error:
@@ -302,6 +316,7 @@ class LiteLLMProvider:
         )
 
     async def stream(self, request: CompletionRequest, telemetry: ProviderTelemetry | None = None):
+        _report_reasoning_continuation(request, telemetry)
         try:
             payload = self.build_request(request, stream=True)
         except Exception as error:
@@ -407,6 +422,7 @@ class LiteLLMProvider:
         request: CompletionRequest,
         telemetry: ProviderTelemetry | None = None,
     ) -> int:
+        _report_reasoning_continuation(request, telemetry)
         try:
             payload = self.build_request(request, stream=False)
         except Exception as error:

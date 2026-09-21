@@ -23,6 +23,7 @@ from ...domain.models import (
     ToolUseStart,
 )
 from ...failures import FailureCategory, FailureDiagnostic, FailureStage
+from ...performance import ReasoningContinuation
 from ..base import scalar_provider_code
 from ..usage import normalize_usage
 from .identity import CodexIdentity
@@ -45,6 +46,29 @@ def content_to_text(content: Any) -> str:
     if isinstance(content, dict):
         return content.get("text", json.dumps(content))
     return str(content)
+
+
+def reasoning_continuation_state(
+    request: CompletionRequest,
+) -> ReasoningContinuation:
+    if not request.reasoning.enabled:
+        return "not_applicable"
+
+    blocks = (
+        block
+        for message in request.messages
+        for block in message.content
+    )
+    blocks = tuple(blocks)
+    if not any(isinstance(block, ToolResultBlock) for block in blocks):
+        return "expected"
+    if any(
+        isinstance(block, RedactedThinkingBlock)
+        and decode_reasoning(block.data) is not None
+        for block in blocks
+    ):
+        return "restored"
+    return "missing"
 
 
 def build_request(

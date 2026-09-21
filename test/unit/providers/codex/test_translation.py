@@ -12,7 +12,12 @@ from claude_code_proxy.domain.models import (
 from claude_code_proxy.failures import FailureCategory, FailureDiagnostic, FailureStage
 from claude_code_proxy.providers.codex.identity import CodexIdentity
 from claude_code_proxy.providers.codex.reasoning import decode_reasoning, encode_reasoning
-from claude_code_proxy.providers.codex.translation import CodexEventTranslator, build_request, response_from_events
+from claude_code_proxy.providers.codex.translation import (
+    CodexEventTranslator,
+    build_request,
+    reasoning_continuation_state,
+    response_from_events,
+)
 from claude_code_proxy.reasoning import ReasoningPolicy
 
 
@@ -27,6 +32,88 @@ def request(**changes):
     )
     return replace(base, **changes)
 
+
+def test_reasoning_continuation_is_not_applicable_when_not_enabled():
+    assert reasoning_continuation_state(
+        request(reasoning=ReasoningPolicy(False, None))
+    ) == "not_applicable"
+    assert reasoning_continuation_state(
+        request(reasoning=ReasoningPolicy(None, None))
+    ) == "not_applicable"
+
+
+def test_reasoning_continuation_is_expected_without_tool_results():
+    carrier = encode_reasoning("sensitive-fresh-state", [])
+    prepared = request(messages=(
+        Message("assistant", (RedactedThinkingBlock(carrier),)),
+        Message("user", (TextBlock("next"),)),
+    ))
+
+    result = reasoning_continuation_state(prepared)
+
+    assert result == "expected"
+    assert "sensitive-fresh-state" not in repr(result)
+    assert carrier not in repr(result)
+
+
+def test_reasoning_continuation_is_restored_across_messages_and_blocks():
+    carrier = encode_reasoning(
+        "sensitive-restored-state",
+        [{"type": "summary_text", "text": "private"}],
+    )
+    prepared = request(
+        messages=(
+            Message(
+                "assistant",
+                (
+                    TextBlock("before"),
+                    RedactedThinkingBlock("foreign-carrier"),
+                ),
+            ),
+            Message(
+                "assistant",
+                (
+                    ToolUseBlock("call-1", "lookup", {}),
+                    RedactedThinkingBlock(carrier),
+                ),
+            ),
+            Message(
+                "user",
+                (
+                    TextBlock("result follows"),
+                    ToolResultBlock("call-1", "done"),
+                ),
+            ),
+        )
+    )
+
+    result = reasoning_continuation_state(prepared)
+
+    assert result == "restored"
+    assert "sensitive-restored-state" not in repr(result)
+    assert carrier not in repr(result)
+
+
+def test_reasoning_continuation_is_missing_without_valid_carrier():
+    for blocks in (
+        (),
+        (RedactedThinkingBlock("anthropic-ciphertext"),),
+        (RedactedThinkingBlock("codex-reasoning-v1:not-base64!"),),
+    ):
+        prepared = request(
+            messages=(
+                Message(
+                    "assistant",
+                    blocks + (ToolUseBlock("call-1", "lookup", {}),),
+                ),
+                Message(
+                    "user",
+                    (ToolResultBlock("call-1", "done"),),
+                ),
+            )
+        )
+
+        assert reasoning_continuation_state(prepared) == "missing"
 
 
 def test_build_request_adds_shared_cache_and_turn_metadata():

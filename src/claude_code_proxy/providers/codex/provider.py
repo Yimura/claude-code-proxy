@@ -12,7 +12,7 @@ from ...domain.models import (
     StreamError,
     StreamStart,
 )
-from ...performance import ProviderTelemetry
+from ...performance import ProviderTelemetry, notify_telemetry
 from ...failures import (
     FailureCategory,
     FailureDiagnostic,
@@ -29,7 +29,12 @@ from ..base import (
 from .auth import CodexAuth
 from .identity import CodexIdentity
 from .orchestration import reconcile_codex_request
-from .translation import CodexEventTranslator, build_request, response_from_events
+from .translation import (
+    CodexEventTranslator,
+    build_request,
+    reasoning_continuation_state,
+    response_from_events,
+)
 
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 CODEX_USER_AGENT = "opencode/latest/2.0.3/cli"
@@ -87,7 +92,9 @@ class CodexProvider:
 
     async def stream(self, request: CompletionRequest, telemetry: ProviderTelemetry | None = None):
         try:
-            request, identity, payload = self._prepare_request(request)
+            request, identity, payload = self._prepare_request(
+                request, telemetry
+            )
         except ProviderError as error:
             yield stream_error_from_exception(error, provider=self.name)
             return
@@ -111,6 +118,7 @@ class CodexProvider:
                     access_token,
                     account_id,
                     state,
+                    telemetry,
                 )
                 try:
                     async for event in inner:
@@ -156,9 +164,19 @@ class CodexProvider:
             )
         yield state.terminal
 
-    def _prepare_request(self, request: CompletionRequest):
+    def _prepare_request(
+        self,
+        request: CompletionRequest,
+        telemetry: ProviderTelemetry | None = None,
+    ):
         try:
             request = reconcile_codex_request(request)
+            notify_telemetry(telemetry, "mark_retries_supported")
+            notify_telemetry(
+                telemetry,
+                "set_reasoning_continuation",
+                reasoning_continuation_state(request),
+            )
             identity = CodexIdentity.from_client(request.client_identity)
             return request, identity, build_request(request, identity)
         except Exception as error:
@@ -174,6 +192,7 @@ class CodexProvider:
         access_token: str,
         account_id: str,
         state: _CodexStreamState,
+        telemetry: ProviderTelemetry | None = None,
     ):
         for attempt in range(2):
             retry_rejected = False
@@ -247,6 +266,7 @@ class CodexProvider:
                         error, provider=self.name
                     )
                     return
+                notify_telemetry(telemetry, "record_retry")
 
     async def _consume_response(self, response):
         translator = CodexEventTranslator()
