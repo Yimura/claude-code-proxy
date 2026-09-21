@@ -120,7 +120,13 @@ def test_compose_uses_image_cli_and_daemon_lifecycle():
     proxy = compose["services"]["proxy"]
 
     assert proxy["restart"] == "unless-stopped"
-    assert {"tty", "entrypoint", "command"}.isdisjoint(proxy)
+    assert {"tty", "entrypoint"}.isdisjoint(proxy)
+    assert proxy["command"] == [
+        "claude-code-proxy",
+        "proxy",
+        "--performance",
+        "collector",
+    ]
 
 
 def test_control_socket_remains_internal_to_container():

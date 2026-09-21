@@ -55,7 +55,7 @@ The image starts through the installed `claude-code-proxy` executable; `uv run` 
 docker compose exec proxy claude-code-proxy ps
 ```
 
-The default image is quiet: its `CMD` starts performance mode `off`, so session inspection remains available but performance collection, performance endpoints, `perf`, and terminal performance records are disabled. To enable collector mode, create a Compose override such as `compose.override.yaml` with exactly:
+The image itself stays quiet: its `CMD` starts performance mode `off`. The repository's default Compose service overrides that complete `CMD` with collector mode:
 
 ```yaml
 services:
@@ -63,7 +63,7 @@ services:
     command: ["claude-code-proxy", "proxy", "--performance", "collector"]
 ```
 
-Compose `command` replaces the image's complete `CMD`; it does not append arguments. Recreate the service after adding or changing the override, then run snapshot or watch commands inside the container:
+This collects performance snapshots and events for `perf` and the future TUI without emitting terminal `performance outcome=...` records. Compose `command` replaces the image's complete `CMD`; it does not append arguments. Recreate the service after changing modes, then run snapshot or watch commands inside the container:
 
 ```bash
 docker compose up --build -d --force-recreate

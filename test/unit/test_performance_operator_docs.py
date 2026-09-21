@@ -12,6 +12,7 @@ def test_readme_documents_complete_performance_operator_contract() -> None:
         "uv run claude-code-proxy proxy --performance collector",
         "uv run claude-code-proxy proxy --performance logging",
         "uv run claude-code-proxy perf --watch --format json",
+        "default Compose service overrides that complete `CMD` with collector mode",
         'command: ["claude-code-proxy", "proxy", "--performance", "collector"]',
         'command: ["claude-code-proxy", "proxy", "--performance", "logging"]',
         "replaces the image's complete `CMD`",

@@ -1,6 +1,7 @@
 services:
   proxy:
     build: .
+    command: ["claude-code-proxy", "proxy", "--performance", "collector"]
     restart: unless-stopped
     env_file: .env
     ports:
