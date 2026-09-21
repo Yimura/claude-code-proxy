@@ -165,3 +165,68 @@ def test_safe_exception_location_chooses_innermost_app_across_external_frame():
     assert re.fullmatch(
         r"claude_code_proxy\.inner:inner_app:\d+", location
     )
+
+
+@pytest.mark.parametrize(
+    "provider_code",
+    [
+        "rate_limit_exceeded",
+        "rate_limit_error",
+        "overloaded",
+        "overloaded_error",
+        "authentication_error",
+        "permission_error",
+        "invalid_request_error",
+        "not_found_error",
+        "billing_error",
+        "conflict_error",
+        "request_too_large",
+        "timeout_error",
+        "api_error",
+        "server_error",
+        "service_unavailable",
+        "model_not_found",
+        "context_length_exceeded",
+        "ECONNRESET",
+    ],
+)
+def test_failure_diagnostic_preserves_recognized_provider_code(
+    provider_code: str,
+) -> None:
+    diagnostic = FailureDiagnostic(
+        FailureCategory.UPSTREAM_HTTP,
+        FailureStage.RESPONSE,
+        "provider_error",
+        provider_code=provider_code,
+    )
+
+    assert diagnostic.provider_code == provider_code
+
+
+@pytest.mark.parametrize(
+    "provider_code",
+    [
+        "PRIVACY_PROVIDER_CODE_MUST_NOT_LEAK",
+        "bounded_code",
+        "looks_like_a_valid_enum",
+        "",
+        True,
+        False,
+        42,
+        -3,
+        1.25,
+        None,
+    ],
+)
+def test_failure_diagnostic_omits_unrecognized_provider_code(
+    provider_code: object,
+) -> None:
+    diagnostic = FailureDiagnostic(
+        FailureCategory.UPSTREAM_HTTP,
+        FailureStage.RESPONSE,
+        "provider_error",
+        provider_code=provider_code,
+    )
+
+    assert diagnostic.provider_code is None
+    assert "PRIVACY_PROVIDER_CODE_MUST_NOT_LEAK" not in repr(diagnostic)

@@ -288,7 +288,7 @@ def test_stream_error_retains_only_safe_diagnostic() -> None:
         FailureCategory.UPSTREAM_HTTP,
         FailureStage.STREAM,
         "provider_error",
-        provider_code="rate_limit",
+        provider_code="rate_limit_exceeded",
     )
     performance = request()
 

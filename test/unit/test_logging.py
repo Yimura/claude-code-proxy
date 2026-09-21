@@ -553,18 +553,18 @@ def test_provider_failure_tokens_resist_field_injection(caplog):
     assert rendered.count(" category=") == 1
     assert "status=503" in rendered
     assert "retryable=True" in rendered
-    for field in ("provider_code", "provider"):
-        matches = re.findall(rf"(?:^| ){field}=(\S+)", rendered)
-        assert len(matches) == 1
-        value = matches[0]
-        assert len(value) == 128
-        assert value.endswith("...")
-        for escaped in ("\\x20", "\\x3d", "\\x5c", "\\x27", "\\x22", "\\u00a0"):
-            assert escaped in value
-        assert "=" not in value
-        assert "'" not in value
-        assert '"' not in value
-        assert "\u00a0" not in value
+    assert "provider_code=" not in rendered and hostile not in rendered
+    assert len(matches := re.findall(r"(?:^| )provider=(\S+)", rendered)) == 1
+    value = matches[0]
+    assert len(value) == 128
+    assert value.endswith("...")
+    for escaped in ("\\x20", "\\x3d", "\\x5c", "\\x27", "\\x22", "\\u00a0"):
+        assert escaped in value
+    assert "=" not in value
+    assert "'" not in value
+    assert '"' not in value
+    assert " " not in value
+
 
 
 def test_stream_failure_tokens_bound_all_untrusted_structured_values(caplog):
@@ -642,14 +642,14 @@ def test_diagnostic_text_is_encoded_and_bounded_to_128_rendered_chars(caplog):
 
     assert len(caplog.records) == 1
     rendered = caplog.records[0].getMessage()
-    for field in ("category", "stage", "code", "provider_code"):
+    for field in ("category", "stage", "code"):
         match = re.search(rf"(?:^| ){field}=(\S+)", rendered)
         assert match is not None
         value = match.group(1)
         assert len(value) == 128
         assert value.endswith("...")
         assert "\\x0d\\x0a\\x09\\x1b\\x85\\u2028\\u2029\\u202e" in value
-    assert "\r" not in rendered
+    assert "provider_code=" not in rendered and "\r" not in rendered
     assert "\n" not in rendered
     assert "\t" not in rendered
     assert "\x1b" not in rendered

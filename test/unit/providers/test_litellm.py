@@ -1057,7 +1057,6 @@ def _typed_litellm_errors():
                 FailureCategory.UPSTREAM_HTTP,
                 FailureStage.REQUEST,
                 "upstream_http_error",
-                "provider-overloaded",
             ),
         ),
     ]

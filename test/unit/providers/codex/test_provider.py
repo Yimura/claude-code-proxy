@@ -1027,8 +1027,8 @@ async def test_403_does_not_reload_or_expose_response_body():
     ("body", "provider_code"),
     [
         ('{"error":{"code":"rate_limit_exceeded","message":"secret"}}', "rate_limit_exceeded"),
-        ('{"error":{"type":"quota_error","message":"secret"}}', "quota_error"),
-        ('{"error":{"code":"","type":"must_not_replace"}}', ""),
+        ('{"error":{"type":"quota_error","message":"secret"}}', None),
+        ('{"error":{"code":"","type":"must_not_replace"}}', None),
         ('{"error":{"code":{"nested":"not allowed"}}}', None),
         ('{"message":"not a recognized envelope"}', None),
         ("plain secret body", None),
@@ -1112,7 +1112,7 @@ async def test_non_200_without_content_length_does_not_read_body():
     assert stream.closed is True
 
 
-async def test_non_200_valid_bounded_content_length_extracts_code_and_closes():
+async def test_non_200_valid_bounded_content_length_omits_unknown_code():
     body = b'{"error":{"code":"bounded_code"}}'
     stream = RawBodyStream([body])
     context = RealResponseContext(
@@ -1126,7 +1126,7 @@ async def test_non_200_valid_bounded_content_length_extracts_code_and_closes():
 
     events = await collect(CodexProvider(Auth(), Client))
 
-    assert events[-1].diagnostic.provider_code == "bounded_code"
+    assert events[-1].diagnostic.provider_code is None
     assert stream.iterations == 1
     assert context.exited is True
     assert stream.closed is True
@@ -1816,8 +1816,8 @@ async def test_complete_preserves_stream_error_status_and_diagnostic():
         FailureCategory.UPSTREAM_HTTP,
         FailureStage.RESPONSE,
         "http_error",
-        "quota_exhausted",
     )
+    assert caught.value.diagnostic.provider_code is None
     assert "secret" not in repr(caught.value)
 
 

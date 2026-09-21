@@ -1,7 +1,6 @@
 """Shared provider contract and errors."""
 
 from collections.abc import AsyncIterator
-import math
 from typing import Protocol
 
 from ..domain.models import CompletionRequest, CompletionResponse, StreamError, StreamEvent
@@ -10,6 +9,7 @@ from ..failures import (
     FailureCategory,
     FailureDiagnostic,
     FailureStage,
+    recognized_provider_code,
     retryable_status,
     unexpected_failure_diagnostic,
 )
@@ -100,15 +100,8 @@ def public_error(status_code: int | None) -> tuple[str, str]:
 
 
 def scalar_provider_code(value: object) -> str | None:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float) and math.isfinite(value):
-        return str(value)
-    return None
+    """Retain only recognized provider categories at adapter boundaries."""
+    return recognized_provider_code(value)
 
 
 def _provider_error_fallback(status_code: int | None) -> FailureDiagnostic:

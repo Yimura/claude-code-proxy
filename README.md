@@ -175,7 +175,7 @@ Provider failure records use safe structured fields:
 - `category`: `authentication`, `transport`, `upstream_http`, `provider_protocol`, `translation`, or `internal`.
 - `stage`: `credentials`, `request`, `response`, `stream`, `provider_translation`, `client_translation`, or `route`.
 - `code`: a stable, application-local diagnostic code.
-- `provider_code`: optional provider error identity from an allowlisted scalar field.
+- `provider_code`: optional provider error identity retained only when it exactly matches a conservative recognized-category allowlist.
 - `status` and `retryable`: normalized HTTP/retry context when applicable.
 - Unhandled exceptions captured at route or stream boundaries may additionally include only the exception class and an application-relative `module:function:line` location.
 
@@ -185,7 +185,7 @@ For example, a plain-text server record can look like:
 2026-09-19 12:00:00,000 - WARNING - [session 4f2c9a8d1e03] POST /v1/messages provider request failed category=upstream_http stage=response code=http_error provider_code=rate_limit_exceeded status=429 retryable=True model=client-model upstream=provider-model provider=codex effort=high
 ```
 
-Diagnostic tokens are control-character encoded and bounded; `provider_code` is never a license to log an arbitrary provider body. For Codex non-200 responses, enrichment requires Content-Encoding to be absent or `identity`, an ASCII-decimal Content-Length no greater than 4096 that exactly matches the raw bytes, UTF-8 JSON, a top-level object containing a nested `error` object, and a string, boolean, integer, or finite numeric `error.code`; `error.type` is the fallback and accepts the same scalar types. Otherwise `provider_code` is omitted and the body is never emitted.
+Diagnostic tokens are control-character encoded and bounded; `provider_code` is never a license to log an arbitrary provider body. The frozen diagnostic boundary retains only exact recognized categorical strings, such as `rate_limit_exceeded`, `authentication_error`, `server_error`, or `ECONNRESET`; unknown or empty strings and boolean or numeric values become unavailable. For Codex non-200 responses, optional enrichment also requires Content-Encoding to be absent or `identity`, an ASCII-decimal Content-Length no greater than 4096 that exactly matches the raw bytes, UTF-8 JSON, and a top-level object containing a nested `error` object. A recognized string `error.code`, or recognized string `error.type` fallback, may then be retained. Otherwise `provider_code` is omitted and the body is never emitted.
 
 Application-managed request and provider diagnostic records exclude prompts/messages/system instructions; tool definitions, inputs, and results; request/response bodies; headers; access and refresh tokens; API keys; credentials; connection strings; encrypted reasoning; raw provider payloads; and exception messages, exception locals, and full exception traceback paths. Provider failures returned through the proxy's HTTP and SSE adapters use generic client messages; the structured diagnostic fields above are emitted only in server logs. Framework and dependency logs are outside this contract.
 

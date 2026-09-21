@@ -554,7 +554,7 @@ def test_stream_error_logs_once_and_returns_safe_sse(caplog):
     assert "category=upstream_http" in caplog.text
     assert "stage=stream" in caplog.text
     assert "code=stream_http_error" in caplog.text
-    assert "provider_code=SECRET_PROVIDER_CODE" in caplog.text
+    assert "provider_code=" not in caplog.text and "SECRET_PROVIDER_CODE" not in caplog.text
     assert "error=api_error" in caplog.text
     assert "retryable=True" in caplog.text
     assert 'event: error' in response.text
@@ -1569,7 +1569,7 @@ def test_provider_failure_preserves_status_and_records_safe_diagnostic_once(capl
         FailureCategory.UPSTREAM_HTTP,
         FailureStage.RESPONSE,
         "overloaded",
-        provider_code="SAFE_CODE",
+        provider_code="overloaded",
     )
     provider = Provider(
         ProviderError(
@@ -1591,7 +1591,7 @@ def test_provider_failure_preserves_status_and_records_safe_diagnostic_once(capl
     assert sessions.finish_failures == [diagnostic]
     assert caplog.text.count("provider request failed") == 1
     assert caplog.text.count("performance ") == 1
-    assert "SECRET_PROVIDER_BODY" not in caplog.text
+    assert "provider_code=overloaded" in caplog.text and "SECRET_PROVIDER_BODY" not in caplog.text
 
 
 class FailingFinalizationRegistry(RecordingSessionRegistry):

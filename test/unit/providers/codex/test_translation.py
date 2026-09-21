@@ -409,7 +409,7 @@ def test_response_failed_excludes_message_and_preserves_scalar_code():
     assert "secret upstream detail" not in repr(events)
 
 
-def test_response_failed_falls_back_to_scalar_type_only():
+def test_response_failed_omits_unrecognized_numeric_type():
     event = CodexEventTranslator().feed(
         "response.failed",
         {"error": {"code": {"unsafe": "value"}, "type": 503}},
@@ -419,17 +419,16 @@ def test_response_failed_falls_back_to_scalar_type_only():
         FailureCategory.PROVIDER_PROTOCOL,
         FailureStage.STREAM,
         "response_failed",
-        "503",
     )
 
 
-def test_response_failed_preserves_empty_scalar_code():
+def test_response_failed_omits_empty_scalar_code():
     event = CodexEventTranslator().feed(
         "response.failed",
         {"error": {"code": "", "type": "must_not_replace"}},
     )[0]
 
-    assert event.diagnostic.provider_code == ""
+    assert event.diagnostic.provider_code is None
 
 
 def test_completion_maps_nested_cache_and_reasoning_usage():

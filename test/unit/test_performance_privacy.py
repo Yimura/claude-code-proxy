@@ -30,6 +30,11 @@ from claude_code_proxy.domain.models import (
     TokenUsage,
     ToolUseStart,
 )
+from claude_code_proxy.failures import (
+    FailureCategory,
+    FailureDiagnostic,
+    FailureStage,
+)
 from claude_code_proxy.model_mapping import ModelResolver
 from claude_code_proxy.observability import SessionRegistry
 from claude_code_proxy.performance_cli import render_performance
@@ -54,6 +59,9 @@ _MARKERS = {
     "tool_result": "PRIVACY_TOOL_RESULT_12f98c",
     "reasoning": "PRIVACY_REASONING_53a2d8",
     "provider_body": "PRIVACY_PROVIDER_BODY_479041",
+    "provider_code": "PRIVACY_PROVIDER_CODE_43b80a",
+    "provider_type": "PRIVACY_PROVIDER_TYPE_ec9271",
+    "direct_diagnostic": "PRIVACY_DIRECT_DIAGNOSTIC_f7063a",
     "exception": "PRIVACY_EXCEPTION_29bcf8",
 }
 
@@ -64,17 +72,25 @@ class _PrivacyProvider:
     def __init__(self) -> None:
         self.requests: list[object] = []
         self.telemetry: list[object | None] = []
-        self.fail_next = False
+        self.failure_provider_code: str | None = None
 
     async def complete(self, request, telemetry=None):
         self.requests.append(request)
         self.telemetry.append(telemetry)
-        if self.fail_next:
-            self.fail_next = False
+        if self.failure_provider_code is not None:
+            provider_code = self.failure_provider_code
+            self.failure_provider_code = None
             raise ProviderError(
-                f"{_MARKERS['provider_body']} {_MARKERS['exception']}",
+                f"{_MARKERS['provider_body']} {_MARKERS['exception']} "
+                f"{provider_code}",
                 provider=self.name,
                 status_code=503,
+                diagnostic=FailureDiagnostic(
+                    FailureCategory.UPSTREAM_HTTP,
+                    FailureStage.RESPONSE,
+                    "provider_error",
+                    provider_code=provider_code,
+                ),
             )
         return CompletionResponse(
             "provider-response-id",
@@ -249,10 +265,17 @@ async def _exercise_public_routes(
                 headers=_headers(),
                 json=_request_payload(stream=True),
             )
-            provider.fail_next = True
-            failed = await client.post(
-                "/v1/messages", headers=_headers(), json=_request_payload()
-            )
+            failures = []
+            for provider_code in (
+                _MARKERS["provider_code"],
+                _MARKERS["provider_type"],
+                _MARKERS["direct_diagnostic"],
+                "rate_limit_exceeded",
+            ):
+                provider.failure_provider_code = provider_code
+                failures.append(await client.post(
+                    "/v1/messages", headers=_headers(), json=_request_payload()
+                ))
             counted = await client.post(
                 "/v1/messages/count_tokens",
                 headers=_headers(),
@@ -260,10 +283,20 @@ async def _exercise_public_routes(
             )
 
     assert complete.status_code == streamed.status_code == counted.status_code == 200
-    assert failed.status_code == 503
+    assert all(response.status_code == 503 for response in failures)
     assert _MARKERS["provider_body"] in streamed.text
-    assert _MARKERS["provider_body"] in failed.text
-    assert _MARKERS["exception"] in failed.text
+    for response, provider_code in zip(
+        failures,
+        (
+            _MARKERS["provider_code"],
+            _MARKERS["provider_type"],
+            _MARKERS["direct_diagnostic"],
+            "rate_limit_exceeded",
+        ), strict=True,
+    ):
+        assert _MARKERS["provider_body"] in response.text
+        assert _MARKERS["exception"] in response.text
+        assert provider_code in response.text
 
 
 async def _collect_control_evidence(
@@ -298,7 +331,7 @@ async def _collect_control_evidence(
 
 
 def _assert_provider_boundary(provider: _PrivacyProvider) -> None:
-    assert len(provider.requests) == len(provider.telemetry) == 4
+    assert len(provider.requests) == len(provider.telemetry) == 7
     assert all(item is not None for item in provider.telemetry)
     first_request = provider.requests[0]
     identity = first_request.client_identity
@@ -317,6 +350,14 @@ def _assert_provider_boundary(provider: _PrivacyProvider) -> None:
         "reasoning",
     ):
         assert _MARKERS[name] in request_text
+
+    direct = FailureDiagnostic(
+        FailureCategory.UPSTREAM_HTTP,
+        FailureStage.RESPONSE,
+        "provider_error",
+        provider_code=_MARKERS["direct_diagnostic"],
+    )
+    assert direct.provider_code is None
 
     outbound = LiteLLMProvider(
         _litellm_settings(), object()
@@ -383,6 +424,7 @@ def _assert_nonempty_safe_evidence(
     assert '"input_tokens"' in exposed_surfaces
     assert "performance outcome=completed" in log_text
     assert "provider request failed" in log_text
+    assert "provider_code=rate_limit_exceeded" in exposed_surfaces
     assert json.loads(evidence.reset_line)["type"] == "reset"
     assert any(
         isinstance(event, PerformanceEventResponse)

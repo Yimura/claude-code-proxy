@@ -924,7 +924,7 @@ def test_failure_diagnostic_maps_only_safe_structured_fields() -> None:
         FailureCategory.UPSTREAM_HTTP,
         FailureStage.RESPONSE,
         "provider_error",
-        provider_code="rate_limit",
+        provider_code="rate_limit_exceeded",
         exception_type="ProviderError",
         location="module:function:10",
     )
