@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import math
+import sys
 from types import MappingProxyType
 from typing import Literal, Protocol, TypeAlias
 
@@ -123,6 +124,7 @@ _REASONING_CONTINUATIONS = frozenset({
     "not_applicable",
     "unavailable",
 })
+_MAX_TIME_MAGNITUDE = sys.float_info.max / 2
 _AGGREGATE_METRICS = (
     "input_tokens",
     "output_tokens",
@@ -409,6 +411,25 @@ class RequestPerformance:
         self._tool_calls = Measurement.observed(0)
         self._reasoning_continuation = "unavailable"
 
+    def would_mark_upstream_started(self) -> bool:
+        return not self._is_terminal and self._upstream_started is None
+
+    def would_mark_upstream_finished(self) -> bool:
+        return (
+            not self._is_terminal
+            and self._upstream_started is not None
+            and self._upstream_finished is None
+        )
+
+    def would_mark_stream_output(self, event: StreamEvent) -> bool:
+        return self._would_mark_first_output(_is_semantic_event(event))
+
+    def would_mark_response_output(self, response: CompletionResponse) -> bool:
+        meaningful = any(
+            _is_meaningful_block(block) for block in response.content
+        )
+        return self._would_mark_first_output(meaningful)
+
     def mark_upstream_started(self, now: float) -> bool:
         sampled = _require_finite_time("upstream start", now)
         if self._is_terminal or self._upstream_started is not None:
@@ -559,6 +580,14 @@ class RequestPerformance:
         assert isinstance(count, int)
         self._tool_calls = Measurement.observed(
             _increment_control_integer("tool calls", count)
+        )
+
+    def _would_mark_first_output(self, meaningful: bool) -> bool:
+        return (
+            meaningful
+            and self._operation == "messages"
+            and self._first_output is None
+            and not self._is_terminal
         )
 
     def _mark_first_output(self, now: float, meaningful: bool) -> bool:
@@ -752,8 +781,8 @@ def _require_finite_time(name: str, value: object) -> float:
         sampled = float(value)
     except (OverflowError, ValueError):
         raise ValueError(f"{name} must be finite") from None
-    if not math.isfinite(sampled):
-        raise ValueError(f"{name} must be finite")
+    if not math.isfinite(sampled) or abs(sampled) > _MAX_TIME_MAGNITUDE:
+        raise ValueError(f"{name} must be safely subtractable")
     return sampled
 
 

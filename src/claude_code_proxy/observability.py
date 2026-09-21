@@ -13,23 +13,16 @@ from typing import Literal
 import uuid
 
 from .domain.models import (
-    ClientIdentity,
-    CompletionResponse,
-    StreamEvent,
-    TokenUsage,
-    ToolUseStart,
+    ClientIdentity, CompletionResponse, StreamEvent, TokenUsage, ToolUseStart,
 )
-from .event_journal import EventJournal, EventType, JournalEvent, Subscription
+from .event_journal import (
+    EventJournal, EventReservation, EventType, JournalEvent, Subscription,
+)
 from .failures import FailureDiagnostic
 from .limits import MAX_CONTROL_INTEGER
 from .performance import (
-    OperationKind,
-    ReasoningContinuation,
-    RequestOutcome,
-    RequestPerformance,
-    RequestPerformanceSnapshot,
-    RequestTelemetryObserver,
-    SessionPerformance,
+    OperationKind, ReasoningContinuation, RequestOutcome, RequestPerformance,
+    RequestPerformanceSnapshot, RequestTelemetryObserver, SessionPerformance,
     SessionPerformanceSnapshot,
 )
 from .text_safety import scalar_text
@@ -38,17 +31,9 @@ SessionState = Literal["active", "idle", "failed"]
 SessionResult = Literal["completed", "failed"]
 SessionFilters = Mapping[str, Sequence[str]]
 
-_FILTER_FIELDS = frozenset(
-    {
-        "id",
-        "session_id",
-        "state",
-        "provider",
-        "transport",
-        "model",
-        "effort",
-    }
-)
+_FILTER_FIELDS = frozenset({
+    "id", "session_id", "state", "provider", "transport", "model", "effort",
+})
 
 
 @dataclass(frozen=True)
@@ -63,11 +48,7 @@ class SessionMetadata:
 
     def __post_init__(self) -> None:
         for name in (
-            "client_model",
-            "upstream_model",
-            "provider",
-            "transport",
-            "effort",
+            "client_model", "upstream_model", "provider", "transport", "effort",
         ):
             object.__setattr__(self, name, scalar_text(getattr(self, name)))
 
@@ -80,11 +61,11 @@ class ObservationHandle:
     started_monotonic: float
     is_new: bool
     request_scoped: bool
-    operation: OperationKind = "messages"
     agent_key: str | None = None
     agent_public_id: str | None = None
     parent_agent_public_id: str | None = None
     agent_is_new: bool = False
+    operation: OperationKind = "messages"
 
 
 @dataclass(frozen=True)
@@ -319,15 +300,15 @@ class SessionRegistry:
                 monotonic,
                 1,
             )
-            self._ensure_event_capacity_locked()
-            handle, record = self._start_locked(
-                context, metadata, request, wall, monotonic
-            )
-            self._publish_event_locked(
-                record, request, "request_started", wall, monotonic
-            )
-            record.progress_at[request.request_id] = monotonic
-            return handle
+            with self._events.reserve(1) as reservation:
+                handle, record = self._start_locked(
+                    context, metadata, request, wall, monotonic
+                )
+                self._commit_events_locked(
+                    reservation, record, request,
+                    ("request_started",), wall, monotonic,
+                )
+                return handle
 
     def _begin_context(self, metadata: SessionMetadata) -> "_BeginContext":
         identity = metadata.client_identity
@@ -337,9 +318,7 @@ class SessionRegistry:
         root = f"request:{request_id}" if request_scoped else normalized_id
         public_id = self.public_id(root)
         key = f"request:{request_id}" if request_scoped else f"session:{public_id}"
-        return _BeginContext(
-            request_id, key, root, public_id, request_scoped
-        )
+        return _BeginContext(request_id, key, root, public_id, request_scoped)
 
     def _start_locked(
         self,
@@ -386,10 +365,13 @@ class SessionRegistry:
                 return
             record, request = target
             now = self._monotonic_clock()
-            if request.mark_upstream_started(now):
-                self._publish_progress_locked(
-                    record, request, self._wall_clock(), now
-                )
+            publish = (
+                request.would_mark_upstream_started()
+                and self._progress_due(record, request, now)
+            )
+            self._update_upstream_locked(
+                record, request, request.mark_upstream_started, now, publish
+            )
 
     def upstream_finished(self, handle: ObservationHandle) -> None:
         with self._lock:
@@ -398,9 +380,26 @@ class SessionRegistry:
                 return
             record, request = target
             now = self._monotonic_clock()
-            if request.mark_upstream_finished(now):
-                self._publish_progress_locked(
-                    record, request, self._wall_clock(), now
+            publish = (
+                request.would_mark_upstream_finished()
+                and self._progress_due(record, request, now)
+            )
+            self._update_upstream_locked(
+                record, request, request.mark_upstream_finished, now, publish
+            )
+
+    def _update_upstream_locked(
+        self, record: _SessionRecord, request: RequestPerformance,
+        mutation: Callable[[float], bool], now: float, publish: bool,
+    ) -> None:
+        if not publish:
+            mutation(now)
+            return
+        with self._events.reserve(1) as reservation:
+            if mutation(now):
+                self._commit_events_locked(
+                    reservation, record, request, ("progress",),
+                    self._wall_clock(), now,
                 )
 
     def stream_event(
@@ -412,37 +411,31 @@ class SessionRegistry:
                 return
             record, request = target
             now = self._monotonic_clock()
-            first_output = request.observe_stream_event(event, now)
-            occurred_at = self._wall_clock()
-            immediate = self._publish_stream_immediate_locked(
-                record, request, event, first_output, occurred_at, now
-            )
-            if not immediate:
-                self._publish_progress_locked(
-                    record, request, occurred_at, now
+            event_types = self._stream_event_plan(record, request, event, now)
+            if not event_types:
+                request.observe_stream_event(event, now)
+                return
+            with self._events.reserve(len(event_types)) as reservation:
+                request.observe_stream_event(event, now)
+                self._commit_events_locked(
+                    reservation, record, request, event_types,
+                    self._wall_clock(), now,
                 )
 
-    def _publish_stream_immediate_locked(
-        self,
-        record: _SessionRecord,
-        request: RequestPerformance,
-        event: StreamEvent,
-        first_output: bool,
-        occurred_at: datetime,
-        now: float,
-    ) -> bool:
-        published = False
-        if first_output:
-            self._publish_immediate_locked(
-                record, request, "first_output", occurred_at, now
-            )
-            published = True
+    def _stream_event_plan(
+        self, record: _SessionRecord, request: RequestPerformance,
+        event: StreamEvent, now: float,
+    ) -> tuple[EventType, ...]:
+        immediate: list[EventType] = []
+        if request.would_mark_stream_output(event):
+            immediate.append("first_output")
         if isinstance(event, ToolUseStart):
-            self._publish_immediate_locked(
-                record, request, "tool_use", occurred_at, now
-            )
-            published = True
-        return published
+            immediate.append("tool_use")
+        if immediate:
+            return tuple(immediate)
+        if self._progress_due(record, request, now):
+            return ("progress",)
+        return ()
 
     def response(
         self, handle: ObservationHandle, response: CompletionResponse
@@ -453,16 +446,30 @@ class SessionRegistry:
                 return
             record, request = target
             now = self._monotonic_clock()
-            had_output = request.snapshot(now).ttft.status == "observed"
+            if request.would_mark_response_output(response):
+                event_types: tuple[EventType, ...] = ("first_output",)
+            elif self._progress_due(record, request, now):
+                event_types = ("progress",)
+            else:
+                event_types = ()
+            self._observe_response_locked(
+                record, request, response, now, event_types
+            )
+
+    def _observe_response_locked(
+        self, record: _SessionRecord, request: RequestPerformance,
+        response: CompletionResponse, now: float,
+        event_types: tuple[EventType, ...],
+    ) -> None:
+        if not event_types:
             request.observe_response(response, now)
-            has_output = request.snapshot(now).ttft.status == "observed"
-            occurred_at = self._wall_clock()
-            if has_output and not had_output:
-                self._publish_immediate_locked(
-                    record, request, "first_output", occurred_at, now
-                )
-                return
-            self._publish_progress_locked(record, request, occurred_at, now)
+            return
+        with self._events.reserve(len(event_types)) as reservation:
+            request.observe_response(response, now)
+            self._commit_events_locked(
+                reservation, record, request, event_types,
+                self._wall_clock(), now,
+            )
 
     def count_tokens(self, handle: ObservationHandle, value: int) -> None:
         _validate_count_tokens(value)
@@ -474,11 +481,16 @@ class SessionRegistry:
             if target is None:
                 return
             record, request = target
-            request.record_usage(usage)
             now = self._monotonic_clock()
-            self._publish_progress_locked(
-                record, request, self._wall_clock(), now
-            )
+            if not self._progress_due(record, request, now):
+                request.record_usage(usage)
+                return
+            with self._events.reserve(1) as reservation:
+                request.record_usage(usage)
+                self._commit_events_locked(
+                    reservation, record, request, ("progress",),
+                    self._wall_clock(), now,
+                )
 
     def mark_retries_supported(self, handle: ObservationHandle) -> None:
         with self._lock:
@@ -492,27 +504,32 @@ class SessionRegistry:
             if target is None:
                 return
             record, request = target
-            request.record_retry()
             now = self._monotonic_clock()
-            self._publish_immediate_locked(
-                record, request, "retry", self._wall_clock(), now
-            )
+            with self._events.reserve(1) as reservation:
+                request.record_retry()
+                self._commit_events_locked(
+                    reservation, record, request, ("retry",),
+                    self._wall_clock(), now,
+                )
 
     def set_reasoning_continuation(
-        self,
-        handle: ObservationHandle,
-        value: ReasoningContinuation,
+        self, handle: ObservationHandle, value: ReasoningContinuation,
     ) -> None:
         with self._lock:
             target = self._request_locked(handle)
             if target is None:
                 return
             record, request = target
-            request.set_reasoning_continuation(value)
             now = self._monotonic_clock()
-            self._publish_progress_locked(
-                record, request, self._wall_clock(), now
-            )
+            if not self._progress_due(record, request, now):
+                request.set_reasoning_continuation(value)
+                return
+            with self._events.reserve(1) as reservation:
+                request.set_reasoning_continuation(value)
+                self._commit_events_locked(
+                    reservation, record, request, ("progress",),
+                    self._wall_clock(), now,
+                )
 
     def finish(
         self,
@@ -528,22 +545,25 @@ class SessionRegistry:
             record, request = target
             finished_at = self._wall_clock()
             finished_monotonic = self._monotonic_clock()
-            self._ensure_event_capacity_locked()
-            request.finish(
-                result, finished_at, finished_monotonic, failure
-            )
-            terminal = record.performance.add_finalized(request)
-            if terminal is None:
-                raise RuntimeError("request finalization invariant violated")
-            self._finish_base_locked(
-                record, handle, finished_at, finished_monotonic, result
-            )
-            self._publish_event_locked(
-                record, request, result, finished_at, finished_monotonic
-            )
-            record.progress_at.pop(handle.request_id, None)
-            self._retain_finished_locked(handle, record)
-            return terminal
+            with self._events.reserve(1) as reservation:
+                request.finish(
+                    result, finished_at, finished_monotonic, failure
+                )
+                terminal = record.performance.add_finalized(request)
+                if terminal is None:
+                    raise RuntimeError(
+                        "request finalization invariant violated"
+                    )
+                self._finish_base_locked(
+                    record, handle, finished_at, finished_monotonic, result
+                )
+                self._commit_events_locked(
+                    reservation, record, request, (result,),
+                    finished_at, finished_monotonic,
+                )
+                record.progress_at.pop(handle.request_id, None)
+                self._retain_finished_locked(handle, record)
+                return terminal
 
     def _finish_base_locked(
         self,
@@ -609,10 +629,14 @@ class SessionRegistry:
         normalized = _validate_filters(filters)
         with self._lock:
             subscription = self._events.subscribe(after)
-            initial = None
-            if after is None or subscription.reset_required:
-                initial = self._performance_capture_locked(normalized)
-            return PerformanceSubscription(initial, subscription)
+            try:
+                initial = None
+                if after is None or subscription.reset_required:
+                    initial = self._performance_capture_locked(normalized)
+                return PerformanceSubscription(initial, subscription)
+            except BaseException:
+                subscription.close()
+                raise
 
     def _performance_capture_locked(
         self, filters: dict[str, tuple[str, ...]] | None
@@ -628,9 +652,7 @@ class SessionRegistry:
             )
             for session in sessions
         )
-        return PerformanceCapture(
-            captured_at, self._events.current_sequence, views
-        )
+        return PerformanceCapture(captured_at, self._events.current_sequence, views)
 
     def _session_snapshots_locked(
         self, filters: dict[str, tuple[str, ...]] | None
@@ -655,9 +677,7 @@ class SessionRegistry:
                 else None
             )
             snapshots = _filter_snapshots(snapshots, filters, exact_ids)
-        return sorted(
-            snapshots, key=lambda item: item.last_seen, reverse=True
-        )
+        return sorted(snapshots, key=lambda item: item.last_seen, reverse=True)
 
     def counts(self) -> tuple[int, int]:
         """Return ``(active logical rows, total retained rows)``."""
@@ -678,56 +698,37 @@ class SessionRegistry:
             return None
         return record, request
 
-    def _publish_progress_locked(
-        self,
-        record: _SessionRecord,
-        request: RequestPerformance,
-        occurred_at: datetime,
-        now: float,
-    ) -> None:
+    @staticmethod
+    def _progress_due(
+        record: _SessionRecord, request: RequestPerformance, now: float
+    ) -> bool:
         last = record.progress_at.get(request.request_id)
-        if last is not None and now - last < 0.25:
-            return
-        self._publish_event_locked(
-            record, request, "progress", occurred_at, now
-        )
-        record.progress_at[request.request_id] = now
+        return last is None or now - last >= 0.25
 
-    def _publish_immediate_locked(
-        self,
-        record: _SessionRecord,
-        request: RequestPerformance,
-        event_type: EventType,
-        occurred_at: datetime,
-        now: float,
-    ) -> None:
-        self._publish_event_locked(
-            record, request, event_type, occurred_at, now
+    def _commit_events_locked(
+        self, reservation: EventReservation, record: _SessionRecord,
+        request: RequestPerformance, event_types: tuple[EventType, ...],
+        occurred_at: datetime, now: float,
+    ) -> tuple[JournalEvent, ...]:
+        events = tuple(
+            self._event_locked(record, request, kind, occurred_at, now)
+            for kind in event_types
         )
+        published = reservation.publish(events)
         record.progress_at[request.request_id] = now
+        return published
 
-    def _publish_event_locked(
-        self,
-        record: _SessionRecord,
-        request: RequestPerformance,
-        event_type: EventType,
-        occurred_at: datetime,
-        now: float,
-    ) -> None:
-        event = JournalEvent(
-            sequence=0,
-            occurred_at=occurred_at,
-            type=event_type,
-            session_id=record.public_id,
-            request_id=request.request_id,
+    @staticmethod
+    def _event_locked(
+        record: _SessionRecord, request: RequestPerformance,
+        event_type: EventType, occurred_at: datetime, now: float,
+    ) -> JournalEvent:
+        return JournalEvent(
+            sequence=0, occurred_at=occurred_at, type=event_type,
+            session_id=record.public_id, request_id=request.request_id,
             request=request.snapshot(now),
             session=record.performance.snapshot(now),
         )
-        self._events.publish(event)
-
-    def _ensure_event_capacity_locked(self) -> None:
-        if self._events.current_sequence >= MAX_CONTROL_INTEGER:
-            raise ValueError("event sequence exceeds the control limit")
 
     def _evict_inactive(self) -> None:
         while len(self._inactive) > self._inactive_limit:

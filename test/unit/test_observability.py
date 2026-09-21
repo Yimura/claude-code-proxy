@@ -91,9 +91,34 @@ def test_constructor_rejects_negative_inactive_limit() -> None:
         SessionRegistry(-1)
 
 
-def test_observation_handle_preserves_default_operation_and_positionals() -> None:
-    default = ObservationHandle("key", "request", "public", 1.0, False, False)
-    explicit = ObservationHandle(
+def test_observation_handle_preserves_all_legacy_positional_fields() -> None:
+    required = ("key", "request", "public", 1.0, False, False)
+    handles = [
+        ObservationHandle(*required),
+        ObservationHandle(*required, "agent-key"),
+        ObservationHandle(*required, "agent-key", "agent-public"),
+        ObservationHandle(
+            *required, "agent-key", "agent-public", "parent-public"
+        ),
+        ObservationHandle(
+            *required,
+            "agent-key",
+            "agent-public",
+            "parent-public",
+            True,
+        ),
+    ]
+
+    assert handles[0].operation == "messages"
+    assert handles[1].agent_key == "agent-key"
+    assert handles[2].agent_public_id == "agent-public"
+    assert handles[3].parent_agent_public_id == "parent-public"
+    assert handles[4].agent_is_new is True
+    assert all(handle.operation == "messages" for handle in handles)
+
+
+def test_observation_handle_accepts_explicit_operation_keyword() -> None:
+    handle = ObservationHandle(
         "key",
         "request",
         "public",
@@ -103,9 +128,7 @@ def test_observation_handle_preserves_default_operation_and_positionals() -> Non
         operation="count_tokens",
     )
 
-    assert default.operation == "messages"
-    assert explicit.operation == "count_tokens"
-
+    assert handle.operation == "count_tokens"
 
 
 def test_agents_share_root_aggregate_but_keep_independent_counts() -> None:
@@ -1073,3 +1096,105 @@ def test_performance_capture_rejects_ambiguous_public_id_prefix() -> None:
     assert collision is not None
     with pytest.raises(AmbiguousSessionId, match=collision):
         sessions.performance_snapshots({"id": [collision.upper()]})
+
+
+def test_finish_rejects_unsafe_finite_clock_without_registry_mutation() -> None:
+    clock = Clock()
+    sessions = registry(clock)
+    handle = sessions.begin(metadata())
+    before = sessions.performance_snapshots().sessions
+    clock.monotonic = 1e308
+
+    with pytest.raises(ValueError, match="finished_monotonic"):
+        sessions.finish(handle, "completed")
+
+    clock.monotonic = 100.0
+    assert sessions.performance_snapshots().sessions == before
+    assert sessions.snapshots()[0].state == "active"
+
+
+@pytest.mark.asyncio
+async def test_first_tool_start_commits_two_final_sequences_as_one_batch() -> None:
+    clock = Clock()
+    events = EventJournal()
+    sessions = registry(clock, events=events)
+    observer = sessions.observer(sessions.begin(metadata()))
+    events._sequence = MAX_CONTROL_INTEGER - 2  # type: ignore[attr-defined]
+    subscription = events.subscribe(after=MAX_CONTROL_INTEGER - 2)
+
+    observer.stream_event(ToolUseStart("slot", "tool-id", "tool-name"))
+
+    published = subscription.replay + (
+        await subscription.receive(1),
+        await subscription.receive(1),
+    )
+    assert [item.type for item in published] == ["first_output", "tool_use"]
+    assert [item.sequence for item in published] == [
+        MAX_CONTROL_INTEGER - 1,
+        MAX_CONTROL_INTEGER,
+    ]
+    subscription.close()
+
+
+def test_first_tool_start_capacity_failure_changes_no_reducer_state() -> None:
+    clock = Clock()
+    events = EventJournal()
+    sessions = registry(clock, events=events)
+    handle = sessions.begin(metadata())
+    observer = sessions.observer(handle)
+    before = sessions.performance_snapshots().sessions
+    retained_before = tuple(events._events)  # type: ignore[attr-defined]
+    events._sequence = MAX_CONTROL_INTEGER - 1  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="sequence"):
+        observer.stream_event(ToolUseStart("slot", "tool-id", "tool-name"))
+
+    events._sequence = 1  # type: ignore[attr-defined]
+    assert sessions.performance_snapshots().sessions == before
+    assert tuple(events._events) == retained_before  # type: ignore[attr-defined]
+
+
+def test_retry_capacity_failure_changes_no_reducer_or_progress_state() -> None:
+    clock = Clock()
+    events = EventJournal()
+    sessions = registry(clock, events=events)
+    handle = sessions.begin(metadata())
+    observer = sessions.observer(handle)
+    observer.mark_retries_supported()
+    before = sessions.performance_snapshots().sessions
+    progress_before = dict(
+        sessions._records[handle.key].progress_at  # type: ignore[attr-defined]
+    )
+    events._sequence = MAX_CONTROL_INTEGER  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="sequence"):
+        observer.record_retry()
+
+    events._sequence = 1  # type: ignore[attr-defined]
+    assert sessions.performance_snapshots().sessions == before
+    assert (  # type: ignore[attr-defined]
+        sessions._records[handle.key].progress_at == progress_before
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_initial_capture_unregisters_performance_subscription() -> None:
+    clock = Clock()
+    events = EventJournal()
+    sessions = registry(clock, inactive_limit=20, events=events)
+    prefixes: dict[str, str] = {}
+    collision = None
+    for index in range(17):
+        handle = sessions.begin(metadata(f"subscribe-session-{index}"))
+        prefix = handle.public_id[0]
+        if prefix in prefixes:
+            collision = prefix
+            break
+        prefixes[prefix] = handle.public_id
+
+    assert collision is not None
+    before = events.subscriber_count
+    with pytest.raises(AmbiguousSessionId, match=collision):
+        sessions.subscribe_performance({"id": [collision]}, after=None)
+
+    assert events.subscriber_count == before

@@ -192,6 +192,49 @@ class Subscription:
             return len(self._pending)
 
 
+@dataclass(eq=False, slots=True)
+class EventReservation:
+    """Hold ordered journal capacity until one batch commits or is abandoned."""
+
+    _journal: EventJournal = field(repr=False)
+    count: int
+    _active: bool = field(default=True, init=False, repr=False)
+    _state_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+
+    def __enter__(self) -> "EventReservation":
+        with self._state_lock:
+            if not self._active:
+                raise ValueError("event reservation is no longer active")
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    def publish(
+        self, events: tuple[JournalEvent, ...]
+    ) -> tuple[JournalEvent, ...]:
+        self._claim()
+        try:
+            return self._journal._publish_reserved(self.count, events)
+        finally:
+            self._journal._dispatch_lock.release()
+
+    def close(self) -> None:
+        with self._state_lock:
+            if not self._active:
+                return
+            self._active = False
+        self._journal._dispatch_lock.release()
+
+    def _claim(self) -> None:
+        with self._state_lock:
+            if not self._active:
+                raise ValueError("event reservation is no longer active")
+            self._active = False
+
+
 class EventJournal:
     """Retain bounded history and fan out live events without blocking."""
 
@@ -228,22 +271,39 @@ class EventJournal:
         with self._lock:
             return len(self._subscribers)
 
-    def publish(self, event: JournalEvent) -> JournalEvent:
-        """Sequence, retain, and offer an unpublished event to subscribers."""
-        if type(event) is not JournalEvent:
-            raise ValueError("publish requires an exact JournalEvent")
-        if event.sequence != 0:
-            raise ValueError("publish requires an event with sequence 0")
-        with self._dispatch_lock:
+    def reserve(self, count: int) -> EventReservation:
+        """Reserve consecutive event sequences while serializing dispatch."""
+        _require_control_integer("reservation count", count, minimum=1)
+        self._dispatch_lock.acquire()
+        try:
             with self._lock:
-                if self._sequence >= MAX_CONTROL_INTEGER:
+                if self._sequence + count > MAX_CONTROL_INTEGER:
                     raise ValueError("event sequence exceeds the control limit")
-                published = replace(event, sequence=self._sequence + 1)
-                self._sequence = published.sequence
-                self._events.append(published)
-                subscribers = tuple(self._subscribers)
+            return EventReservation(self, count)
+        except BaseException:
+            self._dispatch_lock.release()
+            raise
+
+    def publish(self, event: JournalEvent) -> JournalEvent:
+        """Sequence, retain, and offer one unpublished event."""
+        return self.reserve(1).publish((event,))[0]
+
+    def _publish_reserved(
+        self, count: int, events: tuple[JournalEvent, ...]
+    ) -> tuple[JournalEvent, ...]:
+        batch = tuple(events)
+        _validate_event_batch(batch, count)
+        with self._lock:
+            published = tuple(
+                replace(event, sequence=self._sequence + index)
+                for index, event in enumerate(batch, start=1)
+            )
+            self._sequence += count
+            self._events.extend(published)
+            subscribers = tuple(self._subscribers)
+        for item in published:
             for subscription in subscribers:
-                subscription.offer(published)
+                subscription.offer(item)
         return published
 
     def subscribe(self, after: int | None) -> Subscription:
@@ -279,6 +339,18 @@ class EventJournal:
         """Remove a subscription if it is currently registered."""
         with self._lock:
             self._subscribers.discard(subscription)
+
+
+def _validate_event_batch(
+    events: tuple[JournalEvent, ...], count: int
+) -> None:
+    if len(events) != count:
+        raise ValueError("reserved event batch must match reservation count")
+    for event in events:
+        if type(event) is not JournalEvent:
+            raise ValueError("publish requires exact JournalEvent values")
+        if event.sequence != 0:
+            raise ValueError("publish requires events with sequence 0")
 
 
 def _require_control_integer(name: str, value: object, *, minimum: int) -> None:

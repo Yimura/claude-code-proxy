@@ -1,6 +1,7 @@
 from dataclasses import FrozenInstanceError, fields
 from datetime import UTC, datetime, timedelta, timezone
 import math
+import sys
 
 import pytest
 
@@ -493,6 +494,61 @@ def test_constructor_rejects_non_finite_monotonic_time(invalid: float) -> None:
 def test_constructor_rejects_huge_monotonic_integer_as_value_error() -> None:
     with pytest.raises(ValueError, match="started_monotonic"):
         RequestPerformance("id", "session", "messages", STARTED, 10**1000, 1)
+
+
+@pytest.mark.parametrize("value", [-1e308, 1e308])
+def test_constructor_rejects_finite_times_with_unsafe_duration_magnitude(
+    value: float,
+) -> None:
+    assert math.isfinite(value)
+    assert abs(value) > sys.float_info.max / 2
+
+    with pytest.raises(ValueError, match="started_monotonic"):
+        RequestPerformance("id", "session", "messages", STARTED, value, 1)
+
+
+def test_finish_rejects_unsafe_finite_time_without_mutation() -> None:
+    performance = request()
+    before = performance.snapshot(10.0)
+
+    with pytest.raises(ValueError, match="finished_monotonic"):
+        performance.finish("completed", STARTED, 1e308)
+
+    assert performance.snapshot(10.0) == before
+
+
+@pytest.mark.parametrize(
+    ("operation", "error"),
+    [
+        (lambda item: item.mark_upstream_started(1e308), "upstream start"),
+        (
+            lambda item: item.observe_stream_event(TextDelta("first"), 1e308),
+            "stream event time",
+        ),
+        (lambda item: item.snapshot(1e308), "snapshot time"),
+    ],
+)
+def test_timing_paths_reject_unsafe_finite_values_before_mutation(
+    operation, error: str
+) -> None:
+    performance = request()
+    before = performance.snapshot(10.0)
+
+    with pytest.raises(ValueError, match=error):
+        operation(performance)
+
+    assert performance.snapshot(10.0) == before
+
+
+def test_upstream_finish_rejects_unsafe_finite_time_without_mutation() -> None:
+    performance = request()
+    performance.mark_upstream_started(10.0)
+    before = performance.snapshot(10.0)
+
+    with pytest.raises(ValueError, match="upstream finish"):
+        performance.mark_upstream_finished(1e308)
+
+    assert performance.snapshot(10.0) == before
 
 
 def test_snapshot_rejects_huge_time_as_value_error_without_mutation() -> None:

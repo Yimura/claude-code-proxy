@@ -464,3 +464,77 @@ async def test_subscribe_without_cursor_has_no_replay_or_reset() -> None:
     assert subscription.replay == ()
     assert subscription.reset_required is False
     subscription.close()
+
+
+def test_reserved_two_event_batch_uses_final_two_sequences_atomically() -> None:
+    journal = EventJournal()
+    journal._sequence = MAX_CONTROL_INTEGER - 2  # type: ignore[attr-defined]
+
+    reservation = journal.reserve(2)
+    published = reservation.publish(
+        (event("first_output"), event("tool_use"))
+    )
+
+    assert [item.sequence for item in published] == [
+        MAX_CONTROL_INTEGER - 1,
+        MAX_CONTROL_INTEGER,
+    ]
+    assert journal.current_sequence == MAX_CONTROL_INTEGER
+
+
+def test_reservation_rejects_insufficient_capacity_without_publication() -> None:
+    journal = EventJournal()
+    journal._sequence = MAX_CONTROL_INTEGER - 1  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="sequence"):
+        journal.reserve(2)
+
+    assert journal.current_sequence == MAX_CONTROL_INTEGER - 1
+    assert tuple(journal._events) == ()  # type: ignore[attr-defined]
+
+
+def test_invalid_reserved_batch_leaves_sequence_and_history_unchanged() -> None:
+    journal = EventJournal()
+    invalid = replace(event("tool_use"), sequence=1)
+    reservation = journal.reserve(2)
+
+    with pytest.raises(ValueError, match="sequence"):
+        reservation.publish((event("first_output"), invalid))
+
+    assert journal.current_sequence == 0
+    assert tuple(journal._events) == ()  # type: ignore[attr-defined]
+
+
+def test_reservation_blocks_ordinary_publisher_until_batch_commits() -> None:
+    journal = EventJournal()
+    reservation = journal.reserve(1)
+    attempted = Event()
+    result: list[JournalEvent] = []
+
+    def publish_ordinary() -> None:
+        attempted.set()
+        result.append(journal.publish(event("progress")))
+
+    worker = Thread(target=publish_ordinary)
+    worker.start()
+    assert attempted.wait(1)
+    assert worker.is_alive()
+    assert journal.current_sequence == 0
+
+    reserved = reservation.publish((event("retry"),))
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert reserved[0].sequence == 1
+    assert result[0].sequence == 2
+
+
+def test_abandoned_reservation_consumes_nothing_and_is_single_use() -> None:
+    journal = EventJournal()
+
+    with journal.reserve(1) as reservation:
+        pass
+
+    assert journal.current_sequence == 0
+    with pytest.raises(ValueError, match="reservation"):
+        reservation.publish((event(),))
