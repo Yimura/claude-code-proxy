@@ -342,3 +342,5 @@ def test_command_help_lists_documented_options(command: str) -> None:
     else:
         for option in ("--filter", "--format", "--no-trunc", "--socket"):
             assert option in help_text
+        if command == "perf":
+            assert "--watch" in help_text

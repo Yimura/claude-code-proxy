@@ -66,7 +66,7 @@ app = typer.Typer(
     help="Run and inspect the Anthropic-compatible model proxy.",
 )
 
-app.command(name="perf")(_performance_report)
+app.command(name="perf", help="Show or watch performance telemetry.")(_performance_report)
 
 
 def _configure_proxy_logging() -> None:

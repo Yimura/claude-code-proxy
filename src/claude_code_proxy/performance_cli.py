@@ -1,7 +1,8 @@
-"""One-shot performance reporting for the local control API."""
+"""Performance reporting for the local control API."""
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 import json
 import math
 from pathlib import Path
@@ -28,10 +29,16 @@ from .control.schemas import (
     MetricAggregateResponse,
     MetricResponse,
     PerformanceListResponse,
+    PerformanceStreamEvent,
     SessionPerformanceResponse,
     SessionPerformanceViewResponse,
 )
 from .control.socket import resolve_socket_path
+from .performance_watch_cli import (
+    INVALID_PERFORMANCE_STREAM,
+    render_watch_event,
+    watch_table_header,
+)
 
 _MODEL_DISPLAY_LENGTH = 24
 _HEADERS = (
@@ -68,9 +75,16 @@ def perf(
         Path | None,
         typer.Option("--socket", help="Control Unix socket path."),
     ] = None,
+    watch: Annotated[
+        bool,
+        typer.Option("--watch", help="Stream append-only performance events."),
+    ] = False,
 ) -> None:
-    """Show a one-shot performance report from a running proxy."""
+    """Show or watch performance data from a running proxy."""
     normalized = validated_filters(filters or ())
+    if watch:
+        _watch_performance(normalized, output_format, no_trunc, socket)
+        return
     try:
         load_current_directory_environment()
         socket_path = resolve_socket_path(socket)
@@ -89,6 +103,48 @@ def perf(
         exit_with_error(str(error))
     except Exception as error:
         exit_with_error(str(error))
+
+
+def _watch_performance(
+    filters: tuple[str, ...],
+    output_format: OutputFormat,
+    no_trunc: bool,
+    socket: Path | None,
+) -> None:
+    try:
+        load_current_directory_environment()
+        socket_path = resolve_socket_path(socket)
+        with ControlClient(socket_path) as client:
+            with client.performance_events(filters) as stream:
+                _emit_watch_events(stream, output_format, no_trunc)
+        typer.echo("Performance stream closed", err=True)
+    except KeyboardInterrupt:
+        return
+    except ControlUnavailable as error:
+        _performance_guidance(str(error))
+        raise typer.Exit(code=1) from None
+    except IncompatibleProtocol as error:
+        _performance_guidance(
+            f"Incompatible control API at {socket_path}: {error}"
+        )
+        raise typer.Exit(code=1) from None
+    except Exception:
+        exit_with_error(INVALID_PERFORMANCE_STREAM)
+
+
+def _emit_watch_events(
+    stream: Iterator[PerformanceStreamEvent],
+    output_format: OutputFormat,
+    no_trunc: bool,
+) -> None:
+    header_emitted = False
+    for event in stream:
+        lines = render_watch_event(event, output_format, no_trunc)
+        if output_format is OutputFormat.TABLE and lines and not header_emitted:
+            typer.echo(watch_table_header())
+            header_emitted = True
+        for line in lines:
+            typer.echo(line)
 
 
 def render_performance(
