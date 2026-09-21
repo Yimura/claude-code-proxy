@@ -470,17 +470,13 @@ def test_watch_initial_unavailable_or_incompatible_has_collector_guidance(
     assert_closed_once()
 
 
-def test_watch_control_error_is_generic_and_closes() -> None:
-    FakeWatchClient.stream_error = ControlError(
-        "Control API returned an invalid performance event stream"
-    )
+def test_watch_preserves_safe_control_error_and_closes() -> None:
+    FakeWatchClient.stream_error = ControlError("Control API returned HTTP 422")
 
     result = invoke_watch()
 
     assert result.exit_code == 1
-    assert result.stderr == (
-        "Error: Control API returned an invalid performance event stream\n"
-    )
+    assert result.stderr == "Error: Control API returned HTTP 422\n"
     assert_closed_once()
 
 

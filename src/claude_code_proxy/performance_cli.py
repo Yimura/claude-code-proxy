@@ -128,6 +128,8 @@ def _watch_performance(
             f"Incompatible control API at {socket_path}: {error}"
         )
         raise typer.Exit(code=1) from None
+    except ControlError as error:
+        exit_with_error(str(error))
     except Exception:
         exit_with_error(INVALID_PERFORMANCE_STREAM)
 
