@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
+import gzip
 import json
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from claude_code_proxy.control.client import (
     ControlClient,
     ControlError,
     IncompatibleProtocol,
+    PerformanceEventStream,
 )
 from claude_code_proxy.control.schemas import (
     PerformanceCursorResponse,
@@ -315,8 +317,10 @@ class TrackingStream(httpx.SyncByteStream):
     def __init__(self, chunks: Iterable[bytes]) -> None:
         self.chunks = tuple(chunks)
         self.close_count = 0
+        self.iteration_count = 0
 
     def __iter__(self):
+        self.iteration_count += 1
         yield from self.chunks
 
     def close(self) -> None:
@@ -330,11 +334,13 @@ class StreamingTransport(httpx.BaseTransport):
         *,
         status: int = 200,
         content_type: str = "application/x-ndjson",
+        content_encoding: str | None = None,
         capabilities: list[str] | None = None,
     ) -> None:
         self.chunks = tuple(chunks)
         self.status = status
         self.content_type = content_type
+        self.content_encoding = content_encoding
         self.capabilities = capabilities
         self.requests: list[httpx.Request] = []
         self.streams: list[TrackingStream] = []
@@ -350,9 +356,12 @@ class StreamingTransport(httpx.BaseTransport):
             )
         stream = TrackingStream(self.chunks)
         self.streams.append(stream)
+        headers = {"content-type": self.content_type}
+        if self.content_encoding is not None:
+            headers["content-encoding"] = self.content_encoding
         return httpx.Response(
             self.status,
-            headers={"content-type": self.content_type},
+            headers=headers,
             stream=stream,
             request=request,
         )
@@ -652,8 +661,8 @@ def test_stream_reset_atomically_replaces_process_and_cursor() -> None:
     new_process = process_payload(pid=99, started_at="2026-01-03T03:00:00Z")
     transport = StreamingTransport(
         [
-            frame(reset_payload(sequence=20, process=new_process)),
-            frame(cursor_payload(21, process=new_process)),
+            frame(reset_payload(sequence=2, process=new_process)),
+            frame(cursor_payload(3, process=new_process)),
         ]
     )
 
@@ -661,19 +670,29 @@ def test_stream_reset_atomically_replaces_process_and_cursor() -> None:
         events = consume(client, after=10, process=old_process)
 
     assert [event.process.pid for event in events] == [99, 99]
-    assert [event.sequence for event in events] == [20, 21]
+    assert [event.sequence for event in events] == [2, 3]
 
 
-def test_stream_ignores_exact_duplicate_sequence() -> None:
-    duplicate = cursor_payload(1)
+def test_stream_rejects_equal_sequence_non_reset_frame() -> None:
     transport = StreamingTransport(
-        [frame(reset_payload()), frame(duplicate), frame(duplicate), frame(cursor_payload(2))]
+        [frame(reset_payload()), frame(cursor_payload(1)), frame(ordinary_payload(1))]
     )
 
     with ControlClient(SOCKET_PATH, transport=transport) as client:
-        events = consume(client)
+        with pytest.raises(ControlError, match="invalid performance event stream"):
+            consume(client)
 
-    assert [event.sequence for event in events] == [0, 1, 2]
+
+@pytest.mark.parametrize("sequence", [9, 10])
+def test_stream_rejects_same_process_reset_not_above_resume_cursor(
+    sequence: int,
+) -> None:
+    process = ProcessIdentityResponse.model_validate(process_payload())
+    transport = StreamingTransport([frame(reset_payload(sequence=sequence))])
+
+    with ControlClient(SOCKET_PATH, transport=transport) as client:
+        with pytest.raises(ControlError, match="invalid performance event stream"):
+            consume(client, after=10, process=process)
 
 
 @pytest.mark.parametrize(
@@ -778,9 +797,14 @@ def test_stream_closes_when_consumer_raises(
     transport = StreamingTransport([frame(reset_payload()), frame(cursor_payload(1))])
 
     with ControlClient(SOCKET_PATH, transport=transport) as client:
+        events = client.performance_events()
+        assert isinstance(events, PerformanceEventStream)
         with pytest.raises(exception_type):
-            for _event in client.performance_events():
-                raise exception_type("consumer stopped")
+            with events:
+                for _event in events:
+                    raise exception_type("consumer stopped")
+        assert transport.streams[0].close_count == 1
+        events.close()
         assert transport.streams[0].close_count == 1
 
 
@@ -797,48 +821,12 @@ def test_client_close_closes_active_stream_exactly_once() -> None:
     assert transport.streams[0].close_count == 1
 
 
-def test_stream_http_error_reads_safe_bounded_json_detail() -> None:
-    detail = "bad\nrequest " + "x" * 1000
+def test_stream_http_error_is_status_only_without_body_iteration() -> None:
     transport = StreamingTransport(
-        [json.dumps({"detail": detail}).encode()],
+        [b'{"detail":"raw stream secret"}'],
         status=422,
         content_type="application/json",
-    )
-
-    with ControlClient(SOCKET_PATH, transport=transport) as client:
-        with pytest.raises(ControlError) as raised:
-            consume(client)
-
-    message = str(raised.value)
-    assert message.startswith("Control API returned HTTP 422: bad\\x0arequest")
-    assert "\n" not in message
-    assert len(message) < 400
-    assert transport.streams[0].close_count == 1
-
-
-def test_stream_http_error_does_not_echo_non_json_body() -> None:
-    transport = StreamingTransport(
-        [b"raw stream secret stack"],
-        status=500,
-        content_type="text/plain",
-    )
-
-    with ControlClient(SOCKET_PATH, transport=transport) as client:
-        with pytest.raises(ControlError) as raised:
-            consume(client)
-
-    assert str(raised.value) == "Control API returned HTTP 500"
-    assert "secret" not in str(raised.value)
-
-
-def test_stream_http_error_body_read_is_bounded(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(client_module, "_MAX_ERROR_BODY_BYTES", 64, raising=False)
-    transport = StreamingTransport(
-        [b'{"detail":"' + b"secret" * 100 + b'"}'],
-        status=422,
-        content_type="application/json",
+        content_encoding="gzip",
     )
 
     with ControlClient(SOCKET_PATH, transport=transport) as client:
@@ -846,7 +834,33 @@ def test_stream_http_error_body_read_is_bounded(
             consume(client)
 
     assert str(raised.value) == "Control API returned HTTP 422"
+    assert "secret" not in str(raised.value)
+    assert transport.streams[0].iteration_count == 0
     assert transport.streams[0].close_count == 1
+
+
+def test_stream_rejects_gzip_before_body_iteration() -> None:
+    compressed = gzip.compress(frame(reset_payload()))
+    transport = StreamingTransport([compressed], content_encoding="gzip")
+
+    with ControlClient(SOCKET_PATH, transport=transport) as client:
+        with pytest.raises(ControlError, match="invalid performance event stream"):
+            consume(client)
+
+    assert transport.streams[0].iteration_count == 0
+    assert transport.streams[0].close_count == 1
+
+
+def test_stream_accepts_identity_content_encoding() -> None:
+    transport = StreamingTransport(
+        [frame(reset_payload())], content_encoding="identity"
+    )
+
+    with ControlClient(SOCKET_PATH, transport=transport) as client:
+        events = consume(client)
+
+    assert [event.type for event in events] == ["reset"]
+    assert transport.streams[0].iteration_count == 1
 
 
 class ErrorStream(httpx.SyncByteStream):
@@ -886,75 +900,4 @@ def test_stream_request_failure_maps_to_socket_aware_safe_error() -> None:
 
     assert raised.value.socket_path == SOCKET_PATH.resolve()
     assert raised.value.reason == "unsafe\\x0astream detail"
-    assert transport.streams[0].close_count == 1
-
-
-class TimeoutCheckingErrorStream(httpx.SyncByteStream):
-    def __init__(self, request: httpx.Request) -> None:
-        self.request = request
-        self.observed_timeouts: list[float | None] = []
-        self.close_count = 0
-
-    def __iter__(self):
-        timeout = self.request.extensions["timeout"]["read"]
-        self.observed_timeouts.append(timeout)
-        if timeout is None:
-            raise AssertionError("error body read remained unbounded")
-        raise httpx.ReadTimeout("simulated stalled body", request=self.request)
-
-    def close(self) -> None:
-        self.close_count += 1
-
-
-class TimeoutCheckingTransport(StreamingTransport):
-    def __init__(self) -> None:
-        super().__init__([], status=422, content_type="application/json")
-        self.error_streams: list[TimeoutCheckingErrorStream] = []
-
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append(request)
-        if request.url.path == "/v1/health":
-            return httpx.Response(200, json=health_payload(), request=request)
-        stream = TimeoutCheckingErrorStream(request)
-        self.error_streams.append(stream)
-        return httpx.Response(
-            422,
-            headers={"content-type": "application/json"},
-            stream=stream,
-            request=request,
-        )
-
-
-def test_stream_http_error_stall_uses_finite_read_timeout() -> None:
-    transport = TimeoutCheckingTransport()
-
-    with ControlClient(SOCKET_PATH, transport=transport) as client:
-        with pytest.raises(ControlError) as raised:
-            consume(client)
-
-    assert str(raised.value) == "Control API returned HTTP 422"
-    observed = transport.error_streams[0].observed_timeouts[0]
-    assert observed is not None
-    assert 0 < observed <= 2.0
-    assert transport.requests[1].extensions["timeout"]["read"] is None
-    assert transport.error_streams[0].close_count == 1
-
-
-def test_stream_http_error_drip_feed_has_total_deadline(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    times = iter((0.0, 0.5, 2.1))
-    monkeypatch.setattr(client_module, "monotonic", lambda: next(times), raising=False)
-    transport = StreamingTransport(
-        [b'{"detail":"', b'raw secret"}'],
-        status=422,
-        content_type="application/json",
-    )
-
-    with ControlClient(SOCKET_PATH, transport=transport) as client:
-        with pytest.raises(ControlError) as raised:
-            consume(client)
-
-    assert str(raised.value) == "Control API returned HTTP 422"
-    assert transport.requests[1].extensions["timeout"]["read"] is None
     assert transport.streams[0].close_count == 1

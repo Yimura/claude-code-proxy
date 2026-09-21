@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Iterator, Sequence
 from datetime import UTC, datetime
 import json
 import math
 from pathlib import Path
-from time import monotonic
 from types import TracebackType
 from typing import Any, Self
 
@@ -30,8 +29,6 @@ _PROTOCOL_VERSION = 1
 _DEFAULT_TIMEOUT_SECONDS = 2.0
 _STREAM_TIMEOUT = httpx.Timeout(_DEFAULT_TIMEOUT_SECONDS, read=None)
 _MAX_ERROR_DETAIL = 200
-_MAX_ERROR_BODY_BYTES = 64 * 1024
-_MAX_ERROR_READ_SECONDS = _DEFAULT_TIMEOUT_SECONDS
 # Reset snapshots can be large; cap any single NDJSON record at 64 MiB.
 _MAX_NDJSON_LINE_BYTES = 64 * 1024 * 1024
 _PERFORMANCE_EVENT_ADAPTER = TypeAdapter(PerformanceStreamEvent)
@@ -57,6 +54,47 @@ class IncompatibleProtocol(ControlError):
     """The endpoint does not implement the protocol required by this client."""
 
 
+class PerformanceEventStream(Iterator[PerformanceStreamEvent]):
+    """Iterate events; use as a context manager when stopping early."""
+
+    def __init__(self, events: Generator[PerformanceStreamEvent, None, None]) -> None:
+        self._events = events
+        self._closed = False
+
+    def __iter__(self) -> Self:
+        return self
+
+    def __next__(self) -> PerformanceStreamEvent:
+        if self._closed:
+            raise StopIteration
+        try:
+            return next(self._events)
+        except StopIteration:
+            self.close()
+            raise
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Close the response-owning generator once."""
+        if self._closed:
+            return
+        self._closed = True
+        self._events.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
+
+
 class ControlClient:
     """Own an HTTPX client connected to one control Unix socket."""
 
@@ -78,9 +116,7 @@ class ControlClient:
         self._closed = False
         self._active_streams: set[httpx.Response] = set()
 
-    def health(
-        self, *, _required_capability: str = "sessions"
-    ) -> HealthResponse:
+    def health(self, *, _required_capability: str = "sessions") -> HealthResponse:
         """Return validated health and protocol information."""
         payload = self._request_json("/v1/health")
         version = payload.get("protocol_version")
@@ -111,9 +147,7 @@ class ControlClient:
         except (ValidationError, ValueError) as error:
             raise ControlError("Control API returned an invalid sessions response") from error
 
-    def performance(
-        self, filters: Sequence[str] = ()
-    ) -> PerformanceListResponse:
+    def performance(self, filters: Sequence[str] = ()) -> PerformanceListResponse:
         """Negotiate capabilities and return validated performance snapshots."""
         health = self.health(_required_capability="performance")
         _require_capability(health, "performance")
@@ -137,18 +171,19 @@ class ControlClient:
         *,
         after: int | None = None,
         process: ProcessIdentityResponse | None = None,
-    ) -> Iterator[PerformanceStreamEvent]:
-        """Yield validated performance events from the control stream."""
+    ) -> PerformanceEventStream:
+        """Return a closeable iterator over validated performance events."""
         if after is not None:
             _require_control_integer(after)
-        return self._performance_event_stream(filters, after, process)
+        events = self._performance_event_stream(filters, after, process)
+        return PerformanceEventStream(events)
 
     def _performance_event_stream(
         self,
         filters: Sequence[str],
         after: int | None,
         process: ProcessIdentityResponse | None,
-    ) -> Iterator[PerformanceStreamEvent]:
+    ) -> Generator[PerformanceStreamEvent, None, None]:
         health = self.health(_required_capability="performance")
         _require_capability(health, "performance")
         _require_capability(health, "performance_events")
@@ -246,6 +281,8 @@ def _validated_performance_events(
         except (ValidationError, ValueError) as error:
             raise _invalid_performance_stream() from None
         if isinstance(event, PerformanceResetResponse):
+            if _reset_rewinds_stream(event, expected_process, last_sequence):
+                raise _invalid_performance_stream()
             expected_process = event.process
             last_sequence = event.sequence
             yield event
@@ -254,17 +291,28 @@ def _validated_performance_events(
             raise _invalid_performance_stream()
         if event.process != expected_process:
             raise _invalid_performance_stream()
-        if event.sequence == last_sequence:
-            continue
         if event.sequence != last_sequence + 1:
             raise _invalid_performance_stream()
         last_sequence = event.sequence
         yield event
 
 
+def _reset_rewinds_stream(
+    event: PerformanceResetResponse,
+    expected_process: ProcessIdentityResponse | None,
+    last_sequence: int | None,
+) -> bool:
+    return (
+        expected_process is not None
+        and last_sequence is not None
+        and event.process == expected_process
+        and event.sequence <= last_sequence
+    )
+
+
 def _iter_ndjson_objects(response: httpx.Response) -> Iterator[dict[str, Any]]:
     line = bytearray()
-    for chunk in response.iter_bytes():
+    for chunk in response.iter_raw():
         offset = 0
         while offset < len(chunk):
             newline = chunk.find(b"\n", offset)
@@ -338,44 +386,13 @@ def _validate_stream_response(response: httpx.Response) -> None:
             "Control API performance events endpoint is missing (HTTP 404)"
         )
     if not response.is_success:
-        raise ControlError(_stream_http_error_message(response))
+        raise ControlError(f"Control API returned HTTP {response.status_code}")
     media_type = response.headers.get("content-type", "").split(";", 1)[0]
     if media_type.strip().lower() != "application/x-ndjson":
         raise _invalid_performance_stream()
-
-
-def _stream_http_error_message(response: httpx.Response) -> str:
-    content = _read_bounded_response(response)
-    if content is None:
-        return f"Control API returned HTTP {response.status_code}"
-    return _http_error_message(response, content=content)
-
-
-def _read_bounded_response(response: httpx.Response) -> bytes | None:
-    timeout = response.request.extensions.get("timeout")
-    if not isinstance(timeout, dict):
-        return None
-    original_read_timeout = timeout.get("read")
-    deadline = monotonic() + _MAX_ERROR_READ_SECONDS
-    chunks = iter(response.iter_bytes())
-    content = bytearray()
-    try:
-        while True:
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                return None
-            timeout["read"] = remaining
-            try:
-                chunk = next(chunks)
-            except StopIteration:
-                return bytes(content)
-            except httpx.RequestError:
-                return None
-            if len(chunk) > _MAX_ERROR_BODY_BYTES - len(content):
-                return None
-            content.extend(chunk)
-    finally:
-        timeout["read"] = original_read_timeout
+    content_encoding = response.headers.get("content-encoding")
+    if content_encoding and content_encoding.strip().lower() != "identity":
+        raise _invalid_performance_stream()
 
 
 def _invalid_performance_stream() -> ControlError:
