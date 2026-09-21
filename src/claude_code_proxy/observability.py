@@ -37,7 +37,11 @@ from .session_inventory import (
     strip_model_prefix as _strip_model_prefix,
 )
 from .session_snapshot_filters import filter_snapshots as _filter_snapshots
-from .text_safety import scalar_text
+from .text_safety import (
+    TELEMETRY_ATTRIBUTE_MAX_LENGTH,
+    TELEMETRY_MODEL_MAX_LENGTH,
+    retained_telemetry_text,
+)
 
 
 class PerformanceUnavailable(RuntimeError):
@@ -54,8 +58,18 @@ class SessionMetadata:
     context_window: int | None
 
     def __post_init__(self) -> None:
-        for name in ("client_model", "upstream_model", "provider", "transport", "effort"):
-            object.__setattr__(self, name, scalar_text(getattr(self, name)))
+        limits = {
+            "client_model": TELEMETRY_MODEL_MAX_LENGTH,
+            "upstream_model": TELEMETRY_MODEL_MAX_LENGTH,
+            "provider": TELEMETRY_ATTRIBUTE_MAX_LENGTH,
+            "transport": TELEMETRY_ATTRIBUTE_MAX_LENGTH,
+            "effort": TELEMETRY_ATTRIBUTE_MAX_LENGTH,
+        }
+        for name, limit in limits.items():
+            retained = retained_telemetry_text(
+                getattr(self, name), max_length=limit
+            )
+            object.__setattr__(self, name, retained)
 
 
 @dataclass(frozen=True)

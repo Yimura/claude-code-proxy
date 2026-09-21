@@ -21,6 +21,10 @@ from pydantic import (
 
 from ..failures import FailureCategory, FailureStage
 from ..limits import MAX_CONTROL_INTEGER
+from ..text_safety import (
+    TELEMETRY_ATTRIBUTE_MAX_LENGTH,
+    TELEMETRY_MODEL_MAX_LENGTH,
+)
 
 
 NonNegativeControlInteger = Annotated[
@@ -135,6 +139,16 @@ SafeString = Annotated[
     Field(strict=True),
     AfterValidator(_require_safe_string),
 ]
+TelemetryModelString = Annotated[
+    str,
+    Field(strict=True, max_length=TELEMETRY_MODEL_MAX_LENGTH),
+    AfterValidator(_require_safe_string),
+]
+TelemetryAttributeString = Annotated[
+    str,
+    Field(strict=True, max_length=TELEMETRY_ATTRIBUTE_MAX_LENGTH),
+    AfterValidator(_require_safe_string),
+]
 StrictNumber: TypeAlias = StrictInt | StrictFloat
 RequestOutcome = Literal[
     "active",
@@ -178,11 +192,11 @@ class _PerformanceActivityResponse(_TelemetryModel):
     state: Literal["active", "idle", "failed"]
     active_requests: NonNegativeControlInteger
     requests: NonNegativeControlInteger
-    client_model: SafeString
-    model: SafeString
-    provider: SafeString
-    transport: SafeString
-    effort: SafeString
+    client_model: TelemetryModelString
+    model: TelemetryModelString
+    provider: TelemetryAttributeString
+    transport: TelemetryAttributeString
+    effort: TelemetryAttributeString
     context_window: PositiveControlInteger | None
     first_seen: UTCDateTime
     last_seen: UTCDateTime
