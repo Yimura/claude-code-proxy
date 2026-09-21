@@ -171,6 +171,9 @@ def test_safe_exception_location_chooses_innermost_app_across_external_frame():
     "provider_code",
     [
         "rate_limit_exceeded",
+        "insufficient_quota",
+        "invalid_prompt",
+        "content_policy_violation",
         "rate_limit_error",
         "overloaded",
         "overloaded_error",

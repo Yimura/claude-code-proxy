@@ -103,6 +103,9 @@ def test_provider_error_without_diagnostic_gets_structured_fallback():
     ("value", "expected"),
     [
         ("rate_limit_exceeded", "rate_limit_exceeded"),
+        ("insufficient_quota", "insufficient_quota"),
+        ("invalid_prompt", "invalid_prompt"),
+        ("content_policy_violation", "content_policy_violation"),
         ("server_error", "server_error"),
         ("ECONNRESET", "ECONNRESET"),
         ("provider-code", None),

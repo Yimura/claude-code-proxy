@@ -64,6 +64,18 @@ _MARKERS = {
     "direct_diagnostic": "PRIVACY_DIRECT_DIAGNOSTIC_f7063a",
     "exception": "PRIVACY_EXCEPTION_29bcf8",
 }
+_RETAINED_PROVIDER_CODES = (
+    "rate_limit_exceeded",
+    "insufficient_quota",
+    "invalid_prompt",
+    "content_policy_violation",
+)
+_FAILURE_PROVIDER_CODES = (
+    _MARKERS["provider_code"],
+    _MARKERS["provider_type"],
+    _MARKERS["direct_diagnostic"],
+    *_RETAINED_PROVIDER_CODES,
+)
 
 
 class _PrivacyProvider:
@@ -266,12 +278,7 @@ async def _exercise_public_routes(
                 json=_request_payload(stream=True),
             )
             failures = []
-            for provider_code in (
-                _MARKERS["provider_code"],
-                _MARKERS["provider_type"],
-                _MARKERS["direct_diagnostic"],
-                "rate_limit_exceeded",
-            ):
+            for provider_code in _FAILURE_PROVIDER_CODES:
                 provider.failure_provider_code = provider_code
                 failures.append(await client.post(
                     "/v1/messages", headers=_headers(), json=_request_payload()
@@ -286,13 +293,7 @@ async def _exercise_public_routes(
     assert all(response.status_code == 503 for response in failures)
     assert _MARKERS["provider_body"] in streamed.text
     for response, provider_code in zip(
-        failures,
-        (
-            _MARKERS["provider_code"],
-            _MARKERS["provider_type"],
-            _MARKERS["direct_diagnostic"],
-            "rate_limit_exceeded",
-        ), strict=True,
+        failures, _FAILURE_PROVIDER_CODES, strict=True
     ):
         assert _MARKERS["provider_body"] in response.text
         assert _MARKERS["exception"] in response.text
@@ -331,7 +332,7 @@ async def _collect_control_evidence(
 
 
 def _assert_provider_boundary(provider: _PrivacyProvider) -> None:
-    assert len(provider.requests) == len(provider.telemetry) == 7
+    assert len(provider.requests) == len(provider.telemetry) == 10
     assert all(item is not None for item in provider.telemetry)
     first_request = provider.requests[0]
     identity = first_request.client_identity
@@ -401,6 +402,28 @@ def _render_exposed_surfaces(
     )
 
 
+def _assert_retained_codes_cross_surfaces(
+    sessions: SessionRegistry,
+    evidence: _ControlEvidence,
+    log_text: str,
+) -> None:
+    domain = repr(sessions.performance_snapshots())
+    journal = "".join(evidence.journal_lines)
+    cli = render_performance(
+        evidence.snapshot, OutputFormat.JSON, no_trunc=True
+    )
+    watch = "".join(
+        output
+        for event in evidence.journal_events
+        for output in render_watch_event(
+            event, OutputFormat.JSON, no_trunc=True
+        )
+    )
+    surfaces = (domain, evidence.response_text, journal, cli, watch, log_text)
+    for provider_code in _RETAINED_PROVIDER_CODES:
+        assert all(provider_code in surface for surface in surfaces)
+
+
 def _assert_nonempty_safe_evidence(
     evidence: _ControlEvidence,
     exposed_surfaces: str,
@@ -455,3 +478,4 @@ async def test_performance_surfaces_exclude_all_sensitive_request_content(
     for marker in _MARKERS.values():
         assert marker not in exposed_surfaces
     _assert_nonempty_safe_evidence(evidence, exposed_surfaces, caplog.text)
+    _assert_retained_codes_cross_surfaces(sessions, evidence, caplog.text)
