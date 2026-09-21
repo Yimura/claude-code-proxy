@@ -98,13 +98,21 @@ class Subscription:
         """Wait up to timeout seconds for one live event or overflow marker."""
         validated = _require_timeout(timeout)
         item = self._pop_pending()
-        if item is not None or validated == 0:
+        if item is not None or validated == 0 or self._is_closed():
             return item
-        try:
-            await asyncio.wait_for(self._event.wait(), validated)
-        except TimeoutError:
-            return None
-        return self._pop_pending()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + validated
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return None
+            try:
+                await asyncio.wait_for(self._event.wait(), remaining)
+            except TimeoutError:
+                return None
+            item = self._pop_pending()
+            if item is not None or self._is_closed():
+                return item
 
     def offer(self, event: JournalEvent) -> None:
         """Add one event to bounded ingress and schedule at most one wake."""
@@ -139,8 +147,8 @@ class Subscription:
     def _wake(self) -> None:
         with self._state_lock:
             self._wake_scheduled = False
-            should_wake = (
-                not self._closed and self._notified and bool(self._pending)
+            should_wake = self._closed or (
+                self._notified and bool(self._pending)
             )
         if should_wake:
             self._event.set()
@@ -148,6 +156,8 @@ class Subscription:
     def _pop_pending(self) -> QueueItem | None:
         with self._state_lock:
             if not self._pending:
+                if not self._closed:
+                    self._event.clear()
                 return None
             item = self._pending.popleft()
             if not self._pending:
@@ -155,8 +165,13 @@ class Subscription:
                 self._event.clear()
             return item
 
+    def _is_closed(self) -> bool:
+        with self._state_lock:
+            return self._closed
+
     def close(self) -> None:
-        """Close and unregister this subscription idempotently."""
+        """Close, wake blocked receivers, and unregister idempotently."""
+        schedule_wake = False
         with self._state_lock:
             if self._closed:
                 return
@@ -164,7 +179,12 @@ class Subscription:
             self._accepting = False
             self._pending.clear()
             self._notified = False
+            if not self._wake_scheduled:
+                self._wake_scheduled = True
+                schedule_wake = True
         self._journal.unsubscribe(self)
+        if schedule_wake:
+            self._schedule_wake()
 
     @property
     def queue_size(self) -> int:

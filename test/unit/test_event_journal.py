@@ -277,6 +277,41 @@ async def test_receive_zero_returns_populated_pending_item_synchronously() -> No
 
 
 @pytest.mark.asyncio
+async def test_concurrent_receivers_wait_for_distinct_events() -> None:
+    journal = EventJournal()
+    subscription = journal.subscribe(after=None)
+    receivers = {
+        asyncio.create_task(subscription.receive(10)),
+        asyncio.create_task(subscription.receive(10)),
+    }
+    await asyncio.sleep(0)
+
+    first_event = journal.publish(event("request_started"))
+    completed, pending = await asyncio.wait(
+        receivers, timeout=1, return_when=asyncio.FIRST_COMPLETED
+    )
+
+    assert len(completed) == 1
+    assert len(pending) == 1
+    assert completed.pop().result() == first_event
+    second_event = journal.publish(event("progress"))
+    remaining = pending.pop()
+    assert await asyncio.wait_for(remaining, timeout=1) == second_event
+    subscription.close()
+
+
+@pytest.mark.asyncio
+async def test_close_wakes_blocked_receiver() -> None:
+    subscription = EventJournal().subscribe(after=None)
+    receiver = asyncio.create_task(subscription.receive(10))
+    await asyncio.sleep(0)
+
+    subscription.close()
+
+    assert await asyncio.wait_for(receiver, timeout=1) is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("timeout", [True, False, -1, math.nan, math.inf, -math.inf])
 async def test_receive_rejects_invalid_timeout(timeout: object) -> None:
     subscription = EventJournal().subscribe(after=None)
