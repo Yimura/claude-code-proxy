@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from pydantic import TypeAdapter, ValidationError
 
@@ -1587,7 +1588,7 @@ async def test_performance_stream_filters_live_events_server_side() -> None:
     await response.body_iterator.aclose()
 
 
-async def test_performance_stream_without_after_ignores_resume_identity_parameters() -> None:
+async def test_performance_stream_without_after_valid_identity_still_resets() -> None:
     clock = RegistryClock()
     sessions = stream_registry(clock)
     sessions.begin(metadata("existing"))
@@ -1595,14 +1596,70 @@ async def test_performance_stream_without_after_ignores_resume_identity_paramete
 
     response = await performance_stream_response(
         app,
-        pid="not-an-integer",
-        started_at="not-a-date",
+        pid="42",
+        started_at="2026-01-02T03:00:00Z",
     )
     reset = await next_stream_json(response)
 
     assert reset["type"] == "reset"
     assert reset["sequence"] == 1
     await response.body_iterator.aclose()
+
+
+@pytest.mark.parametrize(
+    ("pid", "started_at"),
+    [
+        ("not-an-integer", "2026-01-02T03:00:00Z"),
+        ("42", "not-a-date"),
+    ],
+)
+async def test_performance_stream_without_after_rejects_malformed_identity(
+    pid: str,
+    started_at: str,
+    monkeypatch,
+) -> None:
+    clock = RegistryClock()
+    sessions = stream_registry(clock)
+
+    def unexpected_subscription(*args, **kwargs):
+        pytest.fail("malformed identity reached subscription")
+
+    monkeypatch.setattr(sessions, "subscribe_performance", unexpected_subscription)
+    app = control_app_for_stream(sessions)
+
+    with pytest.raises(HTTPException) as captured:
+        await performance_stream_response(
+            app,
+            pid=pid,
+            started_at=started_at,
+        )
+
+    assert captured.value.status_code == 422
+    assert captured.value.detail == "Invalid performance event request"
+
+
+@pytest.mark.parametrize(
+    "started_at",
+    [
+        "0001-01-01T00:00:00+14:00",
+        "9999-12-31T23:59:59-14:00",
+    ],
+)
+async def test_performance_stream_rejects_utc_overflow_boundaries(
+    started_at: str,
+) -> None:
+    clock = RegistryClock()
+    app = control_app_for_stream(stream_registry(clock))
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with AsyncClient(transport=transport, base_url="http://control") as client:
+        response = await client.get(
+            "/v1/performance/events",
+            params={"after": "0", "pid": "42", "started_at": started_at},
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Invalid performance event request"}
 
 
 @pytest.mark.parametrize("pid", ["true", "-1", "0", "+42", "9223372036854775808"])

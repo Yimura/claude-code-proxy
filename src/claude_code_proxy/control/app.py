@@ -374,10 +374,10 @@ def _effective_after(
     started_at: str | None,
 ) -> int | None:
     cursor = _parse_query_integer(after, minimum=0)
-    if cursor is None:
-        return None
     process_pid = _parse_query_integer(pid, minimum=1)
     process_started_at = _parse_resume_datetime(started_at)
+    if cursor is None:
+        return None
     if process_pid != context.pid or process_started_at != context.started_at:
         return None
     return cursor
@@ -399,9 +399,11 @@ def _parse_resume_datetime(value: str | None) -> datetime | None:
         return None
     try:
         parsed = datetime.fromisoformat(value)
-    except ValueError as error:
-        raise ValueError("resume datetime must use ISO format") from error
-    return _aware_utc(parsed, "resume datetime")
+        return _aware_utc(parsed, "resume datetime")
+    except (ValueError, OverflowError) as error:
+        raise ValueError(
+            "resume datetime must be an aware ISO value in the UTC range"
+        ) from error
 
 
 def _process_identity(context: _ControlContext) -> ProcessIdentityResponse:
