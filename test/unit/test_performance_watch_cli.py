@@ -225,18 +225,37 @@ def test_table_rejects_nonfinite_derived_token_total() -> None:
         )
 
 
-def test_table_count_tokens_output_and_request_only_metrics_are_not_applicable() -> None:
+@pytest.mark.parametrize(
+    ("input_tokens", "expected_tokens"),
+    [
+        (metric(value=123), ["123", "/", "—", "—", "—"]),
+        (metric("unavailable"), ["—", "/", "—", "—", "—"]),
+    ],
+)
+def test_table_count_tokens_uses_input_result_for_live_and_snapshot_rows(
+    input_tokens: dict[str, object],
+    expected_tokens: list[str],
+) -> None:
     request = request_payload()
     request["operation"] = "count_tokens"
-    for name in ("ttft", "output_tokens", "tool_calls", "retries"):
+    request["input_tokens"] = input_tokens
+    for name in (
+        "ttft", "cache_read_tokens", "cache_creation_tokens",
+        "output_tokens", "tool_calls", "retries",
+    ):
         request[name] = metric("not_applicable")
 
-    row = cells(render_watch_event(
+    live = cells(render_watch_event(
         ordinary_event(request=request), OutputFormat.TABLE, False
     )[0])
+    snapshot = cells(render_watch_event(
+        reset_event(view_payload(latest=request)), OutputFormat.TABLE, False
+    )[0])
 
-    assert "count_tokens" in row
-    assert row[-4:] == ["/", "—", "—", "—"]
+    assert live[4] == "count_tokens"
+    assert live[8:] == expected_tokens
+    assert snapshot[5] == "SNAPSHOT"
+    assert snapshot[8:] == expected_tokens
 
 
 def test_json_events_are_compact_exact_ndjson_objects() -> None:

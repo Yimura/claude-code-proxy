@@ -216,6 +216,8 @@ def _format_count(metric: MetricResponse) -> str:
 
 
 def _format_request_tokens(request: RequestPerformanceResponse) -> str:
+    if request.operation == "count_tokens":
+        return f"{_format_count(request.input_tokens)} / —"
     input_metrics = (
         request.input_tokens,
         request.cache_read_tokens,
