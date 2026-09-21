@@ -64,7 +64,7 @@ class Provider:
         self.stream_error = stream_error
         self.requests = []
 
-    async def complete(self, request):
+    async def complete(self, request, telemetry=None):
         self.requests.append(request)
         if self.error:
             raise self.error
@@ -76,7 +76,7 @@ class Provider:
             TokenUsage(2, 1),
         )
 
-    async def stream(self, request):
+    async def stream(self, request, telemetry=None):
         if self.stream_error:
             raise self.stream_error
         if self.stream_events is not None:
@@ -86,7 +86,7 @@ class Provider:
         yield TextDelta("hello")
         yield StreamComplete("end_turn", TokenUsage(2, 1))
 
-    async def count_tokens(self, request):
+    async def count_tokens(self, request, telemetry=None):
         if self.count_error:
             raise self.count_error
         return 7
@@ -213,7 +213,7 @@ def test_mapped_streaming_response_uses_client_capability_identity():
 def test_surrogate_model_reaches_provider_unchanged_and_control_snapshot_is_safe():
     provider = Provider()
 
-    async def complete_with_safe_response(request):
+    async def complete_with_safe_response(request, telemetry=None):
         provider.requests.append(request)
         return CompletionResponse(
             "msg-1",
@@ -394,7 +394,7 @@ def test_route_log_encodes_hostile_model_without_changing_provider_request(
     monkeypatch.setenv("NO_COLOR", "1")
     provider = Provider()
 
-    async def complete_with_safe_response(request):
+    async def complete_with_safe_response(request, telemetry=None):
         provider.requests.append(request)
         return CompletionResponse(
             "msg-1",
@@ -1131,7 +1131,7 @@ class ConcurrentProvider(Provider):
         self.all_started = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def complete(self, request):
+    async def complete(self, request, telemetry=None):
         self.started += 1
         self.loops.append(asyncio.get_running_loop())
         if self.started == 2:

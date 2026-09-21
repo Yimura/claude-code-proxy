@@ -1576,7 +1576,7 @@ async def test_complete_buffers_stream():
 async def test_count_tokens_uses_local_counter_only():
     calls = []
 
-    async def local_counter(completion_request):
+    async def local_counter(completion_request, telemetry=None):
         calls.append(completion_request)
         return 8
 
@@ -1603,7 +1603,7 @@ async def test_stream_applies_codex_agent_completion_guidance():
 async def test_count_tokens_applies_codex_agent_completion_guidance():
     captured = []
 
-    async def count_tokens(completion_request):
+    async def count_tokens(completion_request, telemetry=None):
         captured.append(completion_request)
         return 17
 
@@ -1613,3 +1613,34 @@ async def test_count_tokens_applies_codex_agent_completion_guidance():
     assert captured[0].system[-1] == TextBlock(AGENT_COMPLETION_POLICY)
     assert captured[0].tools[0].description.endswith(AGENT_GUIDANCE)
     assert captured[0].tools[1].description.endswith(TASK_OUTPUT_GUIDANCE)
+
+
+async def test_complete_forwards_telemetry_to_internal_stream(monkeypatch):
+    telemetry = object()
+    captured = []
+    async def stream(self, completion_request, telemetry=None):
+        captured.append(telemetry)
+        yield TextDelta("ok")
+        yield StreamComplete("end_turn", TokenUsage(1, 1))
+
+    monkeypatch.setattr(CodexProvider, "stream", stream)
+    result = await CodexProvider(Auth(), Client).complete(
+        request(), telemetry=telemetry
+    )
+
+    assert result.content == (TextBlock("ok"),)
+    assert captured == [telemetry]
+
+
+async def test_count_tokens_forwards_telemetry_to_local_counter():
+    telemetry = object()
+    captured = []
+
+    async def local_counter(completion_request, telemetry=None):
+        captured.append((completion_request, telemetry))
+        return 8
+
+    provider = CodexProvider(Auth(), Client, local_counter)
+
+    assert await provider.count_tokens(request(), telemetry=telemetry) == 8
+    assert captured[0][1] is telemetry

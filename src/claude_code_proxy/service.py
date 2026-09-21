@@ -11,6 +11,7 @@ from .domain.models import (
     StreamEvent,
 )
 from .model_mapping import ModelResolver
+from .performance import RequestTelemetry, notify_telemetry
 from .prompt_identity import reconcile_message_identities, reconcile_system_identity
 from .providers.base import Provider, ProviderError, protocol_error, stream_error_from_exception
 from .reasoning import resolve_reasoning_policy
@@ -56,24 +57,80 @@ class ProxyService:
             return self._codex_provider
         return self._litellm_provider
 
-    async def complete(self, request: CompletionRequest) -> CompletionResponse:
-        return await self.complete_prepared(self.prepare(request))
+    async def complete(
+        self,
+        request: CompletionRequest,
+        telemetry: RequestTelemetry | None = None,
+    ) -> CompletionResponse:
+        return await self.complete_prepared(self.prepare(request), telemetry)
 
-    async def complete_prepared(self, request: CompletionRequest) -> CompletionResponse:
-        return await self.provider_for(request).complete(request)
-
-    def stream(self, request: CompletionRequest):
-        return self.stream_prepared(self.prepare(request))
-
-    def stream_prepared(self, request: CompletionRequest):
+    async def complete_prepared(
+        self,
+        request: CompletionRequest,
+        telemetry: RequestTelemetry | None = None,
+    ) -> CompletionResponse:
         provider = self.provider_for(request)
-        return _validated_stream(provider.stream(request), provider.name)
+        notify_telemetry(telemetry, "upstream_started")
+        try:
+            response = await provider.complete(request, telemetry=telemetry)
+            notify_telemetry(telemetry, "response", response)
+            return response
+        finally:
+            notify_telemetry(telemetry, "upstream_finished")
 
-    async def count_tokens(self, request: CompletionRequest) -> int:
-        return await self.count_tokens_prepared(self.prepare(request))
+    def stream(
+        self,
+        request: CompletionRequest,
+        telemetry: RequestTelemetry | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        return self.stream_prepared(self.prepare(request), telemetry)
 
-    async def count_tokens_prepared(self, request: CompletionRequest) -> int:
-        return await self.provider_for(request).count_tokens(request)
+    def stream_prepared(
+        self,
+        request: CompletionRequest,
+        telemetry: RequestTelemetry | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        provider = self.provider_for(request)
+        provider_events = _provider_stream(provider, request, telemetry)
+        return _observed_stream(provider_events, telemetry)
+
+    async def count_tokens(
+        self,
+        request: CompletionRequest,
+        telemetry: RequestTelemetry | None = None,
+    ) -> int:
+        return await self.count_tokens_prepared(self.prepare(request), telemetry)
+
+    async def count_tokens_prepared(
+        self,
+        request: CompletionRequest,
+        telemetry: RequestTelemetry | None = None,
+    ) -> int:
+        provider = self.provider_for(request)
+        notify_telemetry(telemetry, "upstream_started")
+        try:
+            return await provider.count_tokens(request, telemetry=telemetry)
+        finally:
+            notify_telemetry(telemetry, "upstream_finished")
+
+
+async def _provider_stream(
+    provider: Provider,
+    request: CompletionRequest,
+    telemetry: RequestTelemetry | None,
+) -> AsyncIterator[StreamEvent]:
+    try:
+        events = provider.stream(request, telemetry=telemetry)
+    except Exception as error:
+        yield stream_error_from_exception(error, provider=provider.name)
+        return
+
+    iterator = aiter(_validated_stream(events, provider.name))
+    try:
+        async for event in iterator:
+            yield event
+    finally:
+        await _close_iterator(iterator)
 
 
 async def _validated_stream(
@@ -97,3 +154,28 @@ async def _validated_stream(
             await close()
 
     yield protocol_error("missing_terminal_event", provider=provider)
+
+
+async def _observed_stream(
+    events: AsyncIterator[StreamEvent],
+    telemetry: RequestTelemetry | None,
+) -> AsyncIterator[StreamEvent]:
+    notify_telemetry(telemetry, "upstream_started")
+    iterator = None
+    try:
+        iterator = aiter(events)
+        async for event in iterator:
+            notify_telemetry(telemetry, "stream_event", event)
+            yield event
+    finally:
+        try:
+            if iterator is not None:
+                await _close_iterator(iterator)
+        finally:
+            notify_telemetry(telemetry, "upstream_finished")
+
+
+async def _close_iterator(iterator: object) -> None:
+    close = getattr(iterator, "aclose", None)
+    if close is not None:
+        await close()

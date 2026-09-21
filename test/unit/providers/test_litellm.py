@@ -205,7 +205,10 @@ class FakeClient:
 @pytest.mark.asyncio
 async def test_complete_returns_normalized_text_and_usage(settings):
     client = FakeClient({"id": "response-1", "choices": [{"message": {"content": "hello", "tool_calls": None}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 4, "completion_tokens": 2}})
-    response = await LiteLLMProvider(settings, client).complete(request())
+    telemetry = object()
+    response = await LiteLLMProvider(settings, client).complete(
+        request(), telemetry=telemetry
+    )
     assert response.content == (TextBlock("hello"),)
     assert response.stop_reason == "end_turn"
     assert response.usage == TokenUsage(4, 2)
@@ -293,7 +296,13 @@ async def test_stream_returns_semantic_text_events(settings):
         {"choices": [{"delta": {"content": "hel"}, "finish_reason": None}]},
         {"choices": [{"delta": {"content": "lo"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 3, "completion_tokens": 2}},
     ])
-    events = [event async for event in LiteLLMProvider(settings, client).stream(request())]
+    telemetry = object()
+    events = [
+        event
+        async for event in LiteLLMProvider(settings, client).stream(
+            request(), telemetry=telemetry
+        )
+    ]
     assert events == [StreamStart(), TextDelta("hel"), TextDelta("lo"), StreamComplete("end_turn", TokenUsage(3, 2))]
 
 
@@ -1207,7 +1216,13 @@ async def test_count_tokens_failure_has_distinct_stage_and_safe_message(settings
 @pytest.mark.asyncio
 async def test_count_tokens_uses_local_counter(settings):
     client = FakeClient(token_count=17)
-    assert await LiteLLMProvider(settings, client).count_tokens(request()) == 17
+    telemetry = object()
+    assert (
+        await LiteLLMProvider(settings, client).count_tokens(
+            request(), telemetry=telemetry
+        )
+        == 17
+    )
     assert client.counter_args["model"] == "openai/gpt-5.6-sol"
 
 

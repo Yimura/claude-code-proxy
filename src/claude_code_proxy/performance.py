@@ -4,6 +4,7 @@ from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import logging
 import math
 import sys
 from types import MappingProxyType
@@ -43,6 +44,8 @@ ReasoningContinuation: TypeAlias = Literal[
     "unavailable",
 ]
 
+logger = logging.getLogger(__name__)
+
 
 class ProviderTelemetry(Protocol):
     """Provider-facing telemetry controls without request content fields."""
@@ -54,6 +57,36 @@ class ProviderTelemetry(Protocol):
     def set_reasoning_continuation(
         self, value: ReasoningContinuation
     ) -> None: ...
+
+
+class RequestTelemetry(ProviderTelemetry, Protocol):
+    """Observe a provider request lifecycle without retaining its content."""
+
+    def upstream_started(self) -> None: ...
+
+    def upstream_finished(self) -> None: ...
+
+    def stream_event(self, event: StreamEvent) -> None: ...
+
+    def response(self, response: CompletionResponse) -> None: ...
+
+    def count_tokens(self, value: int) -> None: ...
+
+
+def notify_telemetry(
+    telemetry: object | None, method_name: str, *args: object
+) -> None:
+    """Invoke one telemetry callback without affecting provider behavior."""
+    if telemetry is None:
+        return
+    try:
+        callback = getattr(telemetry, method_name)
+        callback(*args)
+    except Exception as error:
+        logger.warning(
+            "telemetry callback failed exception=%s",
+            type(error).__name__,
+        )
 
 
 class _TelemetryRegistry(Protocol):
@@ -108,6 +141,7 @@ class RequestTelemetryObserver:
         self, value: ReasoningContinuation
     ) -> None:
         self._registry.set_reasoning_continuation(self._handle, value)
+
 
 _METRIC_STATUSES = frozenset({"observed", "unavailable", "not_applicable"})
 _OPERATIONS = frozenset({"messages", "count_tokens"})

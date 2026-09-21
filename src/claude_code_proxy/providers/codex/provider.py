@@ -12,6 +12,7 @@ from ...domain.models import (
     StreamError,
     StreamStart,
 )
+from ...performance import ProviderTelemetry
 from ...failures import (
     FailureCategory,
     FailureDiagnostic,
@@ -59,8 +60,14 @@ class CodexProvider:
         self._client_factory = client_factory
         self._token_counter = token_counter
 
-    async def complete(self, request: CompletionRequest):
-        events = [event async for event in self.stream(request)]
+    async def complete(
+        self,
+        request: CompletionRequest,
+        telemetry: ProviderTelemetry | None = None,
+    ):
+        events = [
+            event async for event in self.stream(request, telemetry=telemetry)
+        ]
         error = next((event for event in events if isinstance(event, StreamError)), None)
         if error:
             raise ProviderError(
@@ -76,7 +83,7 @@ class CodexProvider:
                 error, "response_translation_failed"
             ) from error
 
-    async def stream(self, request: CompletionRequest):
+    async def stream(self, request: CompletionRequest, telemetry: ProviderTelemetry | None = None):
         try:
             request, identity, payload = self._prepare_request(request)
         except ProviderError as error:
@@ -373,10 +380,16 @@ class CodexProvider:
                 ),
             ) from error
 
-    async def count_tokens(self, request: CompletionRequest) -> int:
+    async def count_tokens(
+        self,
+        request: CompletionRequest,
+        telemetry: ProviderTelemetry | None = None,
+    ) -> int:
         if self._token_counter is None:
             return 1000
-        return await self._token_counter(reconcile_codex_request(request))
+        return await self._token_counter(
+            reconcile_codex_request(request), telemetry=telemetry
+        )
 
     async def _http_error(self, response) -> ProviderError:
         status_code = response.status_code

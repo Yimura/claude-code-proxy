@@ -20,6 +20,7 @@ from ..domain.models import (
     StreamStart, TextBlock, TextDelta, TokenUsage, ToolInputDelta, ToolResultBlock,
     ToolUseBlock, ToolUseEnd, ToolUseStart,
 )
+from ..performance import ProviderTelemetry
 from ..failures import (
     FailureCategory,
     FailureDiagnostic,
@@ -242,7 +243,11 @@ class LiteLLMProvider:
                 if key not in {"role", "content", "name", "tool_call_id", "tool_calls"}:
                     del message[key]
 
-    async def complete(self, request: CompletionRequest) -> CompletionResponse:
+    async def complete(
+        self,
+        request: CompletionRequest,
+        telemetry: ProviderTelemetry | None = None,
+    ) -> CompletionResponse:
         try:
             payload = self.build_request(request, stream=False)
         except Exception as error:
@@ -296,7 +301,7 @@ class LiteLLMProvider:
             normalize_usage(usage),
         )
 
-    async def stream(self, request: CompletionRequest):
+    async def stream(self, request: CompletionRequest, telemetry: ProviderTelemetry | None = None):
         try:
             payload = self.build_request(request, stream=True)
         except Exception as error:
@@ -397,7 +402,11 @@ class LiteLLMProvider:
                 error, provider=self.name
             )
 
-    async def count_tokens(self, request: CompletionRequest) -> int:
+    async def count_tokens(
+        self,
+        request: CompletionRequest,
+        telemetry: ProviderTelemetry | None = None,
+    ) -> int:
         try:
             payload = self.build_request(request, stream=False)
         except Exception as error:

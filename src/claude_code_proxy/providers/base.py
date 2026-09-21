@@ -5,6 +5,7 @@ import math
 from typing import Protocol
 
 from ..domain.models import CompletionRequest, CompletionResponse, StreamError, StreamEvent
+from ..performance import ProviderTelemetry
 from ..failures import (
     FailureCategory,
     FailureDiagnostic,
@@ -129,6 +130,20 @@ def _status_code(error: Exception) -> int | None:
 class Provider(Protocol):
     name: str
 
-    async def complete(self, request: CompletionRequest) -> CompletionResponse: ...
-    def stream(self, request: CompletionRequest) -> AsyncIterator[StreamEvent]: ...
-    async def count_tokens(self, request: CompletionRequest) -> int: ...
+    async def complete(
+        self,
+        request: CompletionRequest,
+        telemetry: ProviderTelemetry | None = None,
+    ) -> CompletionResponse: ...
+
+    def stream(
+        self,
+        request: CompletionRequest,
+        telemetry: ProviderTelemetry | None = None,
+    ) -> AsyncIterator[StreamEvent]: ...
+
+    async def count_tokens(
+        self,
+        request: CompletionRequest,
+        telemetry: ProviderTelemetry | None = None,
+    ) -> int: ...

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from dataclasses import replace
 
 import pytest
@@ -6,6 +7,7 @@ from claude_code_proxy.config import ModelConfig, ModelDefinition
 from claude_code_proxy.domain.models import ClientIdentity, CompletionRequest, CompletionResponse, Message, StreamComplete, StreamError, TextBlock, TextDelta, TokenUsage
 from claude_code_proxy.failures import FailureCategory, FailureDiagnostic, FailureStage
 from claude_code_proxy.model_mapping import ModelResolver
+from claude_code_proxy.performance import notify_telemetry
 from claude_code_proxy.providers.base import ProviderError
 from claude_code_proxy.reasoning import MappingEntry, ReasoningPolicy
 from claude_code_proxy.service import ProxyService
@@ -14,15 +16,21 @@ from claude_code_proxy.service import ProxyService
 class FakeProvider:
     name = "fake"
 
-    def __init__(self): self.last_request = None
-    async def complete(self, request):
+    def __init__(self):
+        self.last_request = None
+        self.last_telemetry = None
+
+    async def complete(self, request, telemetry=None):
         self.last_request = request
+        self.last_telemetry = telemetry
         return CompletionResponse("id", request.response_model, (TextBlock("ok"),), "end_turn", TokenUsage(1, 1))
-    async def stream(self, request):
+    async def stream(self, request, telemetry=None):
         self.last_request = request
+        self.last_telemetry = telemetry
         yield StreamComplete("end_turn", TokenUsage(1, 1))
-    async def count_tokens(self, request):
+    async def count_tokens(self, request, telemetry=None):
         self.last_request = request
+        self.last_telemetry = telemetry
         return 7
 
 
@@ -96,8 +104,9 @@ class EventProvider(FakeProvider):
         self.events = events
         self.error = error
 
-    async def stream(self, request):
+    async def stream(self, request, telemetry=None):
         self.last_request = request
+        self.last_telemetry = telemetry
         if self.error is not None:
             raise self.error
         for event in self.events:
@@ -182,7 +191,8 @@ class TerminalThenBlocksProvider(FakeProvider):
         self.closed = False
         self.waiting = asyncio.Event()
 
-    async def stream(self, request):
+    async def stream(self, request, telemetry=None):
+        self.last_telemetry = telemetry
         try:
             yield StreamComplete("end_turn", TokenUsage(1, 1))
             self.waiting.set()
@@ -330,3 +340,448 @@ async def test_dispatches_reconciled_system_role_identity(operation):
     assert codex.last_request.messages == (
         Message("system", (EXPECTED_MAPPED_IDENTITY[1],)),
     )
+
+
+class RecordingTelemetry:
+    def __init__(self, raising=()):
+        self.calls = []
+        self._raising = set(raising)
+
+    def _record(self, name, value=None):
+        self.calls.append((name, value))
+        if name in self._raising:
+            raise RuntimeError("telemetry-secret-marker")
+
+    def upstream_started(self):
+        self._record("upstream_started")
+
+    def upstream_finished(self):
+        self._record("upstream_finished")
+
+    def stream_event(self, event):
+        self._record("stream_event", event)
+
+    def response(self, response):
+        self._record("response", response)
+
+    def count_tokens(self, value):
+        self._record("count_tokens", value)
+
+    def mark_retries_supported(self):
+        self._record("mark_retries_supported")
+
+    def record_retry(self):
+        self._record("record_retry")
+
+    def set_reasoning_continuation(self, value):
+        self._record("set_reasoning_continuation", value)
+
+
+class LifecycleProvider(FakeProvider):
+    def __init__(
+        self,
+        *,
+        response=None,
+        complete_error=None,
+        count=7,
+        count_error=None,
+        events=(),
+        stream_error=None,
+    ):
+        super().__init__()
+        self.response_value = response or CompletionResponse(
+            "response-id",
+            "claude-sonnet",
+            (TextBlock("ok"),),
+            "end_turn",
+            TokenUsage(1, 1),
+        )
+        self.complete_error = complete_error
+        self.count = count
+        self.count_error = count_error
+        self.events = events
+        self.stream_error = stream_error
+        self.close_count = 0
+
+    async def complete(self, request, telemetry=None):
+        self.last_request = request
+        self.last_telemetry = telemetry
+        if self.complete_error is not None:
+            raise self.complete_error
+        return self.response_value
+
+    async def count_tokens(self, request, telemetry=None):
+        self.last_request = request
+        self.last_telemetry = telemetry
+        if self.count_error is not None:
+            raise self.count_error
+        return self.count
+
+    async def stream(self, request, telemetry=None):
+        self.last_request = request
+        self.last_telemetry = telemetry
+        try:
+            if self.stream_error is not None:
+                raise self.stream_error
+            for event in self.events:
+                yield event
+        finally:
+            self.close_count += 1
+
+
+def lifecycle_service(provider):
+    return ProxyService(
+        ModelResolver(ModelConfig({}, {}, {})), "litellm", provider, provider
+    )
+
+
+@pytest.mark.asyncio
+async def test_complete_observes_lifecycle_in_order_and_forwards_telemetry():
+    provider = LifecycleProvider()
+    telemetry = RecordingTelemetry()
+
+    response = await lifecycle_service(provider).complete_prepared(
+        make_request(), telemetry=telemetry
+    )
+
+    assert response is provider.response_value
+    assert provider.last_telemetry is telemetry
+    assert telemetry.calls == [
+        ("upstream_started", None),
+        ("response", response),
+        ("upstream_finished", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_complete_provider_failure_preserves_error_and_finishes():
+    error = ProviderError("safe", provider="fake", status_code=503)
+    provider = LifecycleProvider(complete_error=error)
+    telemetry = RecordingTelemetry()
+
+    with pytest.raises(ProviderError) as caught:
+        await lifecycle_service(provider).complete_prepared(
+            make_request(), telemetry=telemetry
+        )
+
+    assert caught.value is error
+    assert caught.value.status_code == 503
+    assert telemetry.calls == [
+        ("upstream_started", None),
+        ("upstream_finished", None),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", [False, True])
+async def test_count_tokens_observes_lifecycle_and_preserves_outcome(fails):
+    error = ProviderError("safe", provider="fake", status_code=429)
+    provider = LifecycleProvider(count=23, count_error=error if fails else None)
+    telemetry = RecordingTelemetry()
+    operation = lifecycle_service(provider).count_tokens_prepared(
+        make_request(), telemetry=telemetry
+    )
+
+    if fails:
+        with pytest.raises(ProviderError) as caught:
+            await operation
+        assert caught.value is error
+    else:
+        assert await operation == 23
+
+    assert provider.last_telemetry is telemetry
+    assert telemetry.calls == [
+        ("upstream_started", None),
+        ("upstream_finished", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_observes_events_before_yield_without_replacing_them():
+    first = TextDelta("first")
+    second = StreamComplete("end_turn", TokenUsage(1, 2))
+    provider = LifecycleProvider(events=(first, second))
+    telemetry = RecordingTelemetry()
+
+    events = [
+        event
+        async for event in lifecycle_service(provider).stream_prepared(
+            make_request(), telemetry=telemetry
+        )
+    ]
+
+    assert events[0] is first
+    assert events[1] is second
+    assert provider.last_telemetry is telemetry
+    assert provider.close_count == 1
+    assert telemetry.calls == [
+        ("upstream_started", None),
+        ("stream_event", first),
+        ("stream_event", second),
+        ("upstream_finished", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_observes_safe_error_created_from_provider_exception():
+    provider = LifecycleProvider(stream_error=RuntimeError("provider secret"))
+    telemetry = RecordingTelemetry()
+
+    events = [
+        event
+        async for event in lifecycle_service(provider).stream_prepared(
+            make_request(), telemetry=telemetry
+        )
+    ]
+
+    assert len(events) == 1
+    assert isinstance(events[0], StreamError)
+    assert events[0].message == "Internal server error"
+    assert telemetry.calls == [
+        ("upstream_started", None),
+        ("stream_event", events[0]),
+        ("upstream_finished", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_early_close_closes_provider_and_finishes_once():
+    provider = LifecycleProvider(
+        events=(TextDelta("first"), TextDelta("unconsumed"))
+    )
+    telemetry = RecordingTelemetry()
+    stream = lifecycle_service(provider).stream_prepared(
+        make_request(), telemetry=telemetry
+    )
+
+    first = await anext(stream)
+    await stream.aclose()
+    await stream.aclose()
+
+    assert first is provider.events[0]
+    assert provider.close_count == 1
+    assert telemetry.calls == [
+        ("upstream_started", None),
+        ("stream_event", first),
+        ("upstream_finished", None),
+    ]
+
+
+class CancellingProvider(LifecycleProvider):
+    async def stream(self, request, telemetry=None):
+        self.last_telemetry = telemetry
+        try:
+            yield TextDelta("first")
+            raise asyncio.CancelledError
+        finally:
+            self.close_count += 1
+
+
+@pytest.mark.asyncio
+async def test_stream_cancellation_propagates_and_finishes_once():
+    provider = CancellingProvider()
+    telemetry = RecordingTelemetry()
+    stream = lifecycle_service(provider).stream_prepared(
+        make_request(), telemetry=telemetry
+    )
+
+    first = await anext(stream)
+    with pytest.raises(asyncio.CancelledError):
+        await anext(stream)
+
+    assert provider.close_count == 1
+    assert telemetry.calls == [
+        ("upstream_started", None),
+        ("stream_event", first),
+        ("upstream_finished", None),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failing_callback",
+    ["upstream_started", "response", "upstream_finished"],
+)
+async def test_complete_callback_failures_are_isolated_and_safely_logged(
+    failing_callback, caplog
+):
+    provider = LifecycleProvider()
+    telemetry = RecordingTelemetry((failing_callback,))
+
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.performance"):
+        response = await lifecycle_service(provider).complete_prepared(
+            make_request(), telemetry=telemetry
+        )
+
+    assert response is provider.response_value
+    assert [name for name, _ in telemetry.calls] == [
+        "upstream_started",
+        "response",
+        "upstream_finished",
+    ]
+    assert "RuntimeError" in caplog.text
+    assert "telemetry-secret-marker" not in caplog.text
+    assert "response-id" not in caplog.text
+    assert "hi" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failing_callback",
+    ["upstream_started", "stream_event", "upstream_finished"],
+)
+async def test_stream_callback_failure_keeps_event_and_cleanup(
+    failing_callback, caplog
+):
+    event = StreamComplete("end_turn", TokenUsage(1, 1))
+    provider = LifecycleProvider(events=(event,))
+    telemetry = RecordingTelemetry((failing_callback,))
+
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.performance"):
+        events = [
+            item
+            async for item in lifecycle_service(provider).stream_prepared(
+                make_request(), telemetry=telemetry
+            )
+        ]
+
+    assert events == [event]
+    assert events[0] is event
+    assert provider.close_count == 1
+    assert [name for name, _ in telemetry.calls] == [
+        "upstream_started",
+        "stream_event",
+        "upstream_finished",
+    ]
+    assert "telemetry-secret-marker" not in caplog.text
+
+
+class FactoryFailureProvider(FakeProvider):
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+        self.stream_calls = 0
+
+    def stream(self, request, telemetry=None):
+        self.stream_calls += 1
+        raise self.error
+
+
+@pytest.mark.asyncio
+async def test_stream_factory_failure_is_lazy_observed_and_finished():
+    provider = FactoryFailureProvider(RuntimeError("provider secret"))
+    telemetry = RecordingTelemetry()
+
+    stream = lifecycle_service(provider).stream_prepared(
+        make_request(), telemetry=telemetry
+    )
+
+    assert provider.stream_calls == 0
+    events = [event async for event in stream]
+    assert provider.stream_calls == 1
+    assert len(events) == 1
+    assert isinstance(events[0], StreamError)
+    assert events[0].message == "Internal server error"
+    assert telemetry.calls == [
+        ("upstream_started", None),
+        ("stream_event", events[0]),
+        ("upstream_finished", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_start_cancellation_does_not_construct_provider_stream():
+    provider = FactoryFailureProvider(AssertionError("must not construct"))
+
+    class CancellingTelemetry(RecordingTelemetry):
+        def upstream_started(self):
+            raise asyncio.CancelledError
+
+    stream = lifecycle_service(provider).stream_prepared(
+        make_request(), telemetry=CancellingTelemetry()
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await anext(stream)
+
+    assert provider.stream_calls == 0
+
+
+class CloseFailureEvents:
+    def __init__(self):
+        self.emitted = False
+        self.close_count = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.emitted:
+            raise StopAsyncIteration
+        self.emitted = True
+        return StreamComplete("end_turn", TokenUsage(1, 1))
+
+    async def aclose(self):
+        self.close_count += 1
+        raise RuntimeError("cleanup failed")
+
+
+class CloseFailureProvider(FakeProvider):
+    def __init__(self, events):
+        super().__init__()
+        self.events = events
+
+    def stream(self, request, telemetry=None):
+        self.last_telemetry = telemetry
+        return self.events
+
+
+@pytest.mark.asyncio
+async def test_stream_notifies_finish_when_owned_iterator_close_raises():
+    events = CloseFailureEvents()
+    telemetry = RecordingTelemetry()
+    stream = lifecycle_service(CloseFailureProvider(events)).stream_prepared(
+        make_request(), telemetry=telemetry
+    )
+
+    event = await anext(stream)
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        await anext(stream)
+
+    assert events.close_count == 1
+    assert telemetry.calls == [
+        ("upstream_started", None),
+        ("stream_event", event),
+        ("upstream_finished", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_none_telemetry_preserves_provider_results_and_event_identity():
+    response_provider = LifecycleProvider()
+    stream_event = StreamComplete("end_turn", TokenUsage(1, 1))
+    stream_provider = LifecycleProvider(events=(stream_event,))
+
+    response = await lifecycle_service(response_provider).complete_prepared(
+        make_request(), telemetry=None
+    )
+    events = [
+        event
+        async for event in lifecycle_service(stream_provider).stream_prepared(
+            make_request(), telemetry=None
+        )
+    ]
+
+    assert response is response_provider.response_value
+    assert events[0] is stream_event
+    assert response_provider.last_telemetry is None
+    assert stream_provider.last_telemetry is None
+
+
+def test_notify_telemetry_does_not_swallow_cancellation():
+    class CancelTelemetry:
+        def upstream_started(self):
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        notify_telemetry(CancelTelemetry(), "upstream_started")
