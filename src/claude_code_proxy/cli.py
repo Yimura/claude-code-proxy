@@ -41,6 +41,7 @@ from .control.client import (
 from .control.schemas import AgentResponse, SessionListResponse, SessionResponse
 from .control.socket import resolve_socket_path
 from .limits import MAX_CONTROL_INTEGER
+from .performance_cli import perf as _performance_report
 
 if TYPE_CHECKING:
     from .runtime import RuntimeServices
@@ -64,6 +65,8 @@ app = typer.Typer(
     invoke_without_command=True,
     help="Run and inspect the Anthropic-compatible model proxy.",
 )
+
+app.command(name="perf")(_performance_report)
 
 
 def _configure_proxy_logging() -> None:

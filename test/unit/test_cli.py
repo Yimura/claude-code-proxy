@@ -22,6 +22,7 @@ def test_bare_app_shows_help_successfully() -> None:
     assert result.exit_code == 0
     assert "proxy" in result.stdout
     assert "ps" in result.stdout
+    assert "perf" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -29,6 +30,7 @@ def test_bare_app_shows_help_successfully() -> None:
     [
         ["unknown"],
         ["ps", "--format", "yaml"],
+        ["perf", "--format", "yaml"],
         ["proxy", "--port", "0"],
         ["proxy", "--port", "65536"],
         ["proxy", "--session-limit", "-1"],
@@ -310,11 +312,12 @@ def test_installed_script_and_module_adapter_subprocess_help() -> None:
         assert completed.returncode == 0, completed.stderr
         assert "proxy" in completed.stdout
         assert "ps" in completed.stdout
+        assert "perf" in completed.stdout
 
 
 
 @pytest.mark.parametrize(
-    "arguments", [["--help"], ["proxy", "--help"], ["ps", "--help"]]
+    "arguments", [["--help"], ["proxy", "--help"], ["ps", "--help"], ["perf", "--help"]]
 )
 def test_help_is_available_on_non_linux(
     arguments: list[str], monkeypatch: pytest.MonkeyPatch
@@ -327,7 +330,7 @@ def test_help_is_available_on_non_linux(
     assert "Usage" in result.stdout
 
 
-@pytest.mark.parametrize("command", ["proxy", "ps"])
+@pytest.mark.parametrize("command", ["proxy", "ps", "perf"])
 def test_command_help_lists_documented_options(command: str) -> None:
     result = runner.invoke(app, [command, "--help"])
 
