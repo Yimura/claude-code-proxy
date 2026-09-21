@@ -177,27 +177,22 @@ def test_create_app_passes_runtime_sessions_to_middleware_and_router(
     runtime = runtime_module.create_runtime(settings(tmp_path))
     observed = {}
 
-    def capture_middleware(sessions):
-        observed["middleware"] = sessions
-
-        async def middleware(request, call_next):
-            return await call_next(request)
-
-        return middleware
+    class CaptureMiddleware:
+        pass
 
     def capture_router(service, sessions):
         observed["router"] = sessions
         return APIRouter()
 
-    monkeypatch.setattr(app_module, "request_logging_middleware", capture_middleware)
+    monkeypatch.setattr(app_module, "RequestLoggingMiddleware", CaptureMiddleware)
     monkeypatch.setattr(app_module, "build_router", capture_router)
 
-    app_module.create_app(runtime)
+    application = app_module.create_app(runtime)
 
-    assert observed == {
-        "middleware": runtime.sessions,
-        "router": runtime.sessions,
-    }
+    [middleware] = application.user_middleware
+    assert middleware.cls is CaptureMiddleware
+    assert middleware.kwargs == {"sessions": runtime.sessions}
+    assert observed == {"router": runtime.sessions}
 
 
 @pytest.mark.parametrize("path", ["/v1/health", "/v1/sessions"])

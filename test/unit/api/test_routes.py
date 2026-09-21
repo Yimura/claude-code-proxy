@@ -36,9 +36,9 @@ from claude_code_proxy.failures import (
 )
 from claude_code_proxy.logging import (
     RequestLogContext,
+    RequestLoggingMiddleware,
     SessionIdentity,
     observe_stream,
-    request_logging_middleware,
 )
 from claude_code_proxy.model_mapping import ModelResolver
 from claude_code_proxy.observability import (
@@ -142,7 +142,7 @@ def application(
     app = FastAPI()
     sessions = sessions or registry()
     if with_middleware:
-        app.middleware("http")(request_logging_middleware(sessions))
+        app.add_middleware(RequestLoggingMiddleware, sessions=sessions)
     app.include_router(build_router(service, sessions))
     return app
 
@@ -2297,3 +2297,91 @@ async def test_observer_close_provider_error_stays_provider_failure(caplog):
     assert performance.outcome == "failed"
     assert performance.failure == logging_module.provider_failure_diagnostic(error)
     assert "PROVIDER_CLOSE_SECRET" not in caplog.text
+
+
+async def _call_full_stack_stream(provider, sessions, send):
+    app = application(provider, sessions=sessions, with_middleware=True)
+    scope = _asgi_scope()
+    scope["headers"] = [
+        (b"host", b"testserver"),
+        (b"content-type", b"application/json"),
+    ]
+    body = json.dumps(messages_payload(stream=True, messages=[])).encode()
+    requested = False
+
+    async def receive():
+        nonlocal requested
+        if not requested:
+            requested = True
+            return {
+                "type": "http.request",
+                "body": body,
+                "more_body": False,
+            }
+        return {"type": "http.disconnect"}
+
+    await app(scope, receive, send)
+
+
+@pytest.mark.asyncio
+async def test_full_stack_body_oserror_finalizes_disconnected(caplog):
+    sessions = registry()
+    provider = ClosingSendFailureProvider()
+    body_messages = 0
+
+    send_error = OSError("FULL_STACK_OSERROR_SECRET")
+
+    async def send(message):
+        nonlocal body_messages
+        if message["type"] != "http.response.body":
+            return
+        body_messages += 1
+        if body_messages == 3:
+            raise send_error
+
+    with caplog.at_level(logging.INFO, logger="claude_code_proxy.logging"):
+        with pytest.raises(OSError) as raised:
+            await _call_full_stack_stream(provider, sessions, send)
+
+    assert raised.value is send_error
+
+    performance = sessions.performance_snapshots().sessions[0].performance
+    assert provider.close_calls == 1
+    assert performance.current_concurrency == 0
+    assert len(performance.recent_requests) == 1
+    assert performance.recent_requests[0].outcome == "client_disconnected"
+    assert caplog.text.count("performance outcome=client_disconnected") == 1
+    assert "unexpected request failure" not in caplog.text
+    assert "FULL_STACK_OSERROR_SECRET" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_full_stack_body_value_error_retains_client_translation(caplog):
+    sessions = registry()
+    provider = ClosingSendFailureProvider()
+    body_messages = 0
+
+    async def send(message):
+        nonlocal body_messages
+        if message["type"] != "http.response.body":
+            return
+        body_messages += 1
+        if body_messages == 3:
+            raise ValueError("FULL_STACK_VALUE_SECRET")
+
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
+        with pytest.raises(ValueError, match="FULL_STACK_VALUE_SECRET"):
+            await _call_full_stack_stream(provider, sessions, send)
+
+    performance = sessions.performance_snapshots().sessions[0].performance
+    assert provider.close_calls == 1
+    assert performance.current_concurrency == 0
+    assert len(performance.recent_requests) == 1
+    terminal = performance.recent_requests[0]
+    assert terminal.outcome == "failed"
+    assert terminal.failure is not None
+    assert terminal.failure.stage == FailureStage.CLIENT_TRANSLATION
+    assert terminal.failure.exception_type == "ValueError"
+    assert caplog.text.count("unexpected request failure") == 1
+    assert caplog.text.count("performance outcome=failed") == 1
+    assert "FULL_STACK_VALUE_SECRET" not in caplog.text

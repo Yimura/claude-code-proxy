@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from .api.routes import build_router
-from .logging import log_startup_summary, request_logging_middleware
+from .logging import RequestLoggingMiddleware, log_startup_summary
 from .runtime import RuntimeServices, create_runtime
 
 
@@ -22,8 +22,8 @@ def create_app(runtime: RuntimeServices | None = None) -> FastAPI:
 
     application = FastAPI(lifespan=lifespan)
     application.state.runtime = runtime
-    application.middleware("http")(
-        request_logging_middleware(runtime.sessions)
+    application.add_middleware(
+        RequestLoggingMiddleware, sessions=runtime.sessions
     )
     application.include_router(build_router(runtime.service, runtime.sessions))
     return application

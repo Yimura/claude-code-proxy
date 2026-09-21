@@ -4,7 +4,6 @@ import json
 import logging
 import re
 from datetime import UTC, datetime
-from types import SimpleNamespace
 
 import pytest
 from starlette.requests import ClientDisconnect
@@ -24,9 +23,11 @@ from claude_code_proxy.failures import (
 )
 from claude_code_proxy.logging import (
     REQUEST_FINALIZER,
+    REQUEST_LOG_CONTEXT,
     AgentIdentity,
     MessageFilter,
     RequestLogContext,
+    RequestLoggingMiddleware,
     SessionIdentity,
     agent_identity,
     client_identity_from_headers,
@@ -40,7 +41,6 @@ from claude_code_proxy.logging import (
     log_unexpected_failure,
     observe_stream,
     palette_index,
-    request_logging_middleware,
     session_identity,
 )
 from claude_code_proxy.performance import Measurement, RequestPerformanceSnapshot
@@ -955,16 +955,21 @@ def test_performance_logging_failure_isolated(monkeypatch):
 @pytest.mark.asyncio
 async def test_middleware_finalizes_client_disconnect_without_unexpected_log(caplog):
     outcomes = []
-    request = SimpleNamespace(state=SimpleNamespace())
-    setattr(request.state, REQUEST_FINALIZER, outcomes.append)
+    scope = {"type": "http", "state": {REQUEST_FINALIZER: outcomes.append}}
 
-    async def disconnect(_request):
+    async def disconnect(_scope, _receive, _send):
         raise ClientDisconnect
 
-    middleware = request_logging_middleware(None)
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(_message):
+        return None
+
+    middleware = RequestLoggingMiddleware(disconnect, None)
     with caplog.at_level(logging.ERROR, logger="claude_code_proxy.logging"):
         with pytest.raises(ClientDisconnect):
-            await middleware(request, disconnect)
+            await middleware(scope, receive, send)
 
     assert outcomes == ["client_disconnected"]
     assert "unexpected" not in caplog.text
@@ -1020,3 +1025,63 @@ async def test_observe_stream_reports_safe_unexpected_diagnostic_once(caplog):
     assert diagnostic.code == "unexpected_exception"
     assert caplog.text.count("unexpected request failure") == 1
     assert "OBSERVED_STREAM_SECRET" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_request_logging_middleware_passes_non_http_scope_through():
+    calls = []
+
+    async def app(scope, receive, send):
+        calls.append((scope, receive, send))
+
+    async def receive():
+        return {"type": "websocket.disconnect"}
+
+    async def send(_message):
+        return None
+
+    scope = {"type": "websocket"}
+    middleware = RequestLoggingMiddleware(app, None)
+
+    await middleware(scope, receive, send)
+
+    assert calls == [(scope, receive, send)]
+
+
+@pytest.mark.asyncio
+async def test_internal_oserror_before_send_is_failed_route_error(caplog):
+    error = OSError("INTERNAL_OSERROR_SECRET")
+    finalized = []
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "headers": [],
+        "state": {
+            REQUEST_FINALIZER: lambda *args: finalized.append(args),
+            REQUEST_LOG_CONTEXT: make_context(),
+        },
+    }
+
+    async def app(_scope, _receive, _send):
+        raise error
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message):
+        return None
+
+    middleware = RequestLoggingMiddleware(app, None)
+    with caplog.at_level(logging.ERROR, logger="claude_code_proxy.logging"):
+        with pytest.raises(OSError) as raised:
+            await middleware(scope, receive, send)
+
+    assert raised.value is error
+    assert len(finalized) == 1
+    outcome, diagnostic = finalized[0]
+    assert outcome == "failed"
+    assert diagnostic.stage == FailureStage.ROUTE
+    assert diagnostic.exception_type == "OSError"
+    assert caplog.text.count("unexpected request failure") == 1
+    assert "INTERNAL_OSERROR_SECRET" not in caplog.text

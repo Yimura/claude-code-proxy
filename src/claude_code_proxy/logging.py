@@ -12,7 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from starlette.requests import ClientDisconnect
+from starlette.requests import ClientDisconnect, Request
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .console_logging import SeverityFormatter as _SeverityFormatter
 from .domain.models import ClientIdentity, StreamError, StreamEvent
@@ -507,16 +508,18 @@ def log_http_failure(
 
 
 def log_middleware_exception(
-    request, sessions: SessionRegistry, error: Exception
-) -> None:
+    request,
+    sessions: SessionRegistry,
+    error: Exception,
+    *,
+    stage: FailureStage = FailureStage.ROUTE,
+) -> FailureDiagnostic:
+    diagnostic = unexpected_failure_diagnostic(error, stage=stage)
     context = getattr(request.state, REQUEST_LOG_CONTEXT, None)
     if context is not None:
-        log_unexpected_failure(context, error)
-        return
+        log_unexpected_failure(context, error, stage=stage)
+        return diagnostic
 
-    diagnostic = unexpected_failure_diagnostic(
-        error, stage=FailureStage.ROUTE
-    )
     session, agent = _fallback_context_identity(request, sessions)
     logger.error(
         "%s %s %s unexpected HTTP failure %s",
@@ -525,6 +528,7 @@ def log_middleware_exception(
         log_text(request.url.path),
         _render_diagnostic(diagnostic),
     )
+    return diagnostic
 
 
 def log_telemetry_failure() -> None:
@@ -543,34 +547,110 @@ def log_finalization_failure() -> None:
         pass
 
 
-def _finalize_client_disconnect(request) -> None:
+def _invoke_state_finalizer(
+    request: Request,
+    outcome: str,
+    failure: FailureDiagnostic | None = None,
+) -> None:
     finalizer = getattr(request.state, REQUEST_FINALIZER, None)
-    if callable(finalizer):
-        finalizer("client_disconnected")
+    if not callable(finalizer):
+        return
+    try:
+        if failure is None:
+            finalizer(outcome)
+        else:
+            finalizer(outcome, failure)
+    except BaseException:
+        pass
 
 
-def request_logging_middleware(sessions: SessionRegistry):
-    async def middleware(request, call_next):
+def _finalize_client_disconnect(request: Request) -> None:
+    _invoke_state_finalizer(request, "client_disconnected")
+
+
+class RequestLoggingMiddleware:
+    def __init__(self, app: ASGIApp, sessions: SessionRegistry) -> None:
+        self._app = app
+        self._sessions = sessions
+
+    async def __call__(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        request = Request(scope, receive=receive)
+        status_code: int | None = None
+        send_started = False
+        send_error: BaseException | None = None
+
+        async def tracked_send(message: Message) -> None:
+            nonlocal status_code, send_started, send_error
+            if message["type"] == "http.response.start":
+                send_started = True
+                status_code = message["status"]
+            try:
+                await send(message)
+            except BaseException as error:
+                send_error = error
+                raise
+
         try:
-            response = await call_next(request)
+            await self._app(scope, receive, tracked_send)
         except ClientDisconnect:
             _finalize_client_disconnect(request)
+            if isinstance(send_error, OSError):
+                raise send_error
+            raise
+        except OSError as error:
+            if error is send_error:
+                _finalize_client_disconnect(request)
+                raise
+            diagnostic = self._record_exception(
+                request, error, send_started
+            )
+            _invoke_state_finalizer(request, "failed", diagnostic)
             raise
         except Exception as error:
-            if not getattr(request.state, FAILURE_LOGGED, False):
-                log_middleware_exception(request, sessions, error)
-                setattr(request.state, FAILURE_LOGGED, True)
+            diagnostic = self._record_exception(
+                request, error, send_started
+            )
+            _invoke_state_finalizer(request, "failed", diagnostic)
             raise
+        self._record_status(request, status_code)
 
-        if (
-            response.status_code >= 300
-            and not getattr(request.state, FAILURE_LOGGED, False)
-        ):
-            log_http_failure(request, sessions, response.status_code)
-            setattr(request.state, FAILURE_LOGGED, True)
-        return response
+    def _record_exception(
+        self, request: Request, error: Exception, send_started: bool
+    ) -> FailureDiagnostic | None:
+        if getattr(request.state, FAILURE_LOGGED, False):
+            return None
+        stage = (
+            FailureStage.CLIENT_TRANSLATION
+            if send_started
+            else FailureStage.ROUTE
+        )
+        diagnostic = unexpected_failure_diagnostic(error, stage=stage)
+        try:
+            log_middleware_exception(
+                request, self._sessions, error, stage=stage
+            )
+        except BaseException:
+            pass
+        setattr(request.state, FAILURE_LOGGED, True)
+        return diagnostic
 
-    return middleware
+    def _record_status(
+        self, request: Request, status_code: int | None
+    ) -> None:
+        if status_code is None or status_code < 300:
+            return
+        if getattr(request.state, FAILURE_LOGGED, False):
+            return
+        try:
+            log_http_failure(request, self._sessions, status_code)
+        except BaseException:
+            pass
+        setattr(request.state, FAILURE_LOGGED, True)
 
 
 def _call_observer_safely(
