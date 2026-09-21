@@ -2,23 +2,39 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
+import json
 import math
 from pathlib import Path
+from time import monotonic
 from types import TracebackType
 from typing import Any, Self
 
 import httpx
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from ..limits import MAX_CONTROL_INTEGER
 from ..text_safety import escaped_text_atom
-from .schemas import HealthResponse, SessionListResponse, SessionResponse
+from .schemas import (
+    HealthResponse,
+    PerformanceListResponse,
+    PerformanceResetResponse,
+    PerformanceStreamEvent,
+    ProcessIdentityResponse,
+    SessionListResponse,
+    SessionResponse,
+)
 
 _PROTOCOL_VERSION = 1
 _DEFAULT_TIMEOUT_SECONDS = 2.0
+_STREAM_TIMEOUT = httpx.Timeout(_DEFAULT_TIMEOUT_SECONDS, read=None)
 _MAX_ERROR_DETAIL = 200
+_MAX_ERROR_BODY_BYTES = 64 * 1024
+_MAX_ERROR_READ_SECONDS = _DEFAULT_TIMEOUT_SECONDS
+# Reset snapshots can be large; cap any single NDJSON record at 64 MiB.
+_MAX_NDJSON_LINE_BYTES = 64 * 1024 * 1024
+_PERFORMANCE_EVENT_ADAPTER = TypeAdapter(PerformanceStreamEvent)
 
 
 class ControlError(Exception):
@@ -60,8 +76,11 @@ class ControlClient:
             timeout=timeout,
         )
         self._closed = False
+        self._active_streams: set[httpx.Response] = set()
 
-    def health(self) -> HealthResponse:
+    def health(
+        self, *, _required_capability: str = "sessions"
+    ) -> HealthResponse:
         """Return validated health and protocol information."""
         payload = self._request_json("/v1/health")
         version = payload.get("protocol_version")
@@ -72,9 +91,7 @@ class ControlClient:
                 f"expected {_PROTOCOL_VERSION}"
             )
         if "capabilities" not in payload:
-            raise IncompatibleProtocol(
-                "Control API does not advertise the required sessions capability"
-            )
+            _raise_missing_capability(_required_capability)
         try:
             response = HealthResponse.model_validate(payload)
             _validate_health_numbers(response)
@@ -85,10 +102,7 @@ class ControlClient:
     def sessions(self, filters: Sequence[str] = ()) -> SessionListResponse:
         """Negotiate capabilities and return validated session snapshots."""
         health = self.health()
-        if "sessions" not in health.capabilities:
-            raise IncompatibleProtocol(
-                "Control API does not advertise the required sessions capability"
-            )
+        _require_capability(health, "sessions")
         params = [("filter", entry) for entry in filters]
         payload = self._request_json("/v1/sessions", params=params)
         try:
@@ -97,12 +111,77 @@ class ControlClient:
         except (ValidationError, ValueError) as error:
             raise ControlError("Control API returned an invalid sessions response") from error
 
+    def performance(
+        self, filters: Sequence[str] = ()
+    ) -> PerformanceListResponse:
+        """Negotiate capabilities and return validated performance snapshots."""
+        health = self.health(_required_capability="performance")
+        _require_capability(health, "performance")
+        params = [("filter", entry) for entry in filters]
+        message = "Control API returned an invalid performance response"
+        payload = self._request_json(
+            "/v1/performance",
+            params=params,
+            missing_endpoint="performance",
+            invalid_json_message=message,
+        )
+        try:
+            return PerformanceListResponse.model_validate(payload)
+        except (ValidationError, ValueError) as error:
+            raise ControlError(message) from None
+
+    def performance_events(
+        self,
+        filters: Sequence[str] = (),
+        *,
+        after: int | None = None,
+        process: ProcessIdentityResponse | None = None,
+    ) -> Iterator[PerformanceStreamEvent]:
+        """Yield validated performance events from the control stream."""
+        if after is not None:
+            _require_control_integer(after)
+        return self._performance_event_stream(filters, after, process)
+
+    def _performance_event_stream(
+        self,
+        filters: Sequence[str],
+        after: int | None,
+        process: ProcessIdentityResponse | None,
+    ) -> Iterator[PerformanceStreamEvent]:
+        health = self.health(_required_capability="performance")
+        _require_capability(health, "performance")
+        _require_capability(health, "performance_events")
+        params = _performance_event_params(filters, after, process)
+        self._ensure_open()
+        try:
+            with self._client.stream(
+                "GET",
+                "/v1/performance/events",
+                params=params,
+                timeout=_STREAM_TIMEOUT,
+            ) as response:
+                self._active_streams.add(response)
+                try:
+                    _validate_stream_response(response)
+                    yield from _validated_performance_events(
+                        response, after=after, process=process
+                    )
+                finally:
+                    self._active_streams.discard(response)
+        except httpx.RequestError as error:
+            raise ControlUnavailable(self.socket_path, str(error)) from error
+
     def close(self) -> None:
-        """Close the owned HTTP client once."""
+        """Close active responses and the owned HTTP client once."""
         if self._closed:
             return
         self._closed = True
-        self._client.close()
+        try:
+            for response in tuple(self._active_streams):
+                response.close()
+        finally:
+            self._active_streams.clear()
+            self._client.close()
 
     def __enter__(self) -> Self:
         self._ensure_open()
@@ -121,29 +200,193 @@ class ControlClient:
         path: str,
         *,
         params: list[tuple[str, str]] | None = None,
+        missing_endpoint: str | None = None,
+        invalid_json_message: str = "Control API returned invalid JSON",
     ) -> dict[str, Any]:
         self._ensure_open()
         try:
             response = self._client.get(path, params=params)
         except httpx.RequestError as error:
             raise ControlUnavailable(self.socket_path, str(error)) from error
-        if path == "/v1/health" and response.status_code == 404:
+        endpoint = "health" if path == "/v1/health" else missing_endpoint
+        if endpoint is not None and response.status_code == 404:
             raise IncompatibleProtocol(
-                "Control API health endpoint is missing (HTTP 404)"
+                f"Control API {endpoint} endpoint is missing (HTTP 404)"
             )
         if not response.is_success:
             raise ControlError(_http_error_message(response))
         try:
             payload = response.json()
         except (ValueError, RecursionError) as error:
-            raise ControlError("Control API returned invalid JSON") from error
+            raise ControlError(invalid_json_message) from None
         if not isinstance(payload, dict):
-            raise ControlError("Control API returned invalid JSON")
+            raise ControlError(invalid_json_message)
         return payload
 
     def _ensure_open(self) -> None:
         if self._closed:
             raise ControlError("Control client is closed")
+
+
+def _validated_performance_events(
+    response: httpx.Response,
+    *,
+    after: int | None,
+    process: ProcessIdentityResponse | None,
+) -> Iterator[PerformanceStreamEvent]:
+    expected_process = process if after is not None else None
+    last_sequence = after
+    for payload in _iter_ndjson_objects(response):
+        try:
+            event = _PERFORMANCE_EVENT_ADAPTER.validate_python(payload)
+        except (ValidationError, ValueError) as error:
+            raise _invalid_performance_stream() from None
+        if isinstance(event, PerformanceResetResponse):
+            expected_process = event.process
+            last_sequence = event.sequence
+            yield event
+            continue
+        if expected_process is None or last_sequence is None:
+            raise _invalid_performance_stream()
+        if event.process != expected_process:
+            raise _invalid_performance_stream()
+        if event.sequence == last_sequence:
+            continue
+        if event.sequence != last_sequence + 1:
+            raise _invalid_performance_stream()
+        last_sequence = event.sequence
+        yield event
+
+
+def _iter_ndjson_objects(response: httpx.Response) -> Iterator[dict[str, Any]]:
+    line = bytearray()
+    for chunk in response.iter_bytes():
+        offset = 0
+        while offset < len(chunk):
+            newline = chunk.find(b"\n", offset)
+            end = len(chunk) if newline < 0 else newline
+            _extend_ndjson_line(line, chunk, offset, end, newline >= 0)
+            if newline < 0:
+                break
+            if line.endswith(b"\r"):
+                line.pop()
+            if line:
+                yield _parse_ndjson_object(bytes(line))
+            line.clear()
+            offset = newline + 1
+    if line:
+        if line.endswith(b"\r"):
+            line.pop()
+        if line:
+            yield _parse_ndjson_object(bytes(line))
+
+
+def _extend_ndjson_line(
+    line: bytearray, chunk: bytes, start: int, end: int, complete: bool
+) -> None:
+    added = end - start
+    total = len(line) + added
+    last = chunk[end - 1] if added else line[-1] if line else None
+    content_length = total - int(complete and last == 13)
+    pending_cr = not complete and total == _MAX_NDJSON_LINE_BYTES + 1 and last == 13
+    if content_length > _MAX_NDJSON_LINE_BYTES and not pending_cr:
+        raise _invalid_performance_stream()
+    line.extend(memoryview(chunk)[start:end])
+
+
+def _parse_ndjson_object(line: bytes) -> dict[str, Any]:
+    try:
+        text = line.decode("utf-8", errors="strict")
+        payload = json.loads(text, parse_constant=_reject_json_constant)
+    except (UnicodeDecodeError, ValueError, RecursionError) as error:
+        raise _invalid_performance_stream() from None
+    if not isinstance(payload, dict):
+        raise _invalid_performance_stream()
+    return payload
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError("non-finite JSON number")
+
+
+def _performance_event_params(
+    filters: Sequence[str],
+    after: int | None,
+    process: ProcessIdentityResponse | None,
+) -> list[tuple[str, str]]:
+    params = [("filter", entry) for entry in filters]
+    if after is None:
+        return params
+    params.append(("after", str(after)))
+    if process is not None:
+        params.extend(
+            (
+                ("pid", str(process.pid)),
+                ("started_at", process.started_at.isoformat()),
+            )
+        )
+    return params
+
+
+def _validate_stream_response(response: httpx.Response) -> None:
+    if response.status_code == 404:
+        raise IncompatibleProtocol(
+            "Control API performance events endpoint is missing (HTTP 404)"
+        )
+    if not response.is_success:
+        raise ControlError(_stream_http_error_message(response))
+    media_type = response.headers.get("content-type", "").split(";", 1)[0]
+    if media_type.strip().lower() != "application/x-ndjson":
+        raise _invalid_performance_stream()
+
+
+def _stream_http_error_message(response: httpx.Response) -> str:
+    content = _read_bounded_response(response)
+    if content is None:
+        return f"Control API returned HTTP {response.status_code}"
+    return _http_error_message(response, content=content)
+
+
+def _read_bounded_response(response: httpx.Response) -> bytes | None:
+    timeout = response.request.extensions.get("timeout")
+    if not isinstance(timeout, dict):
+        return None
+    original_read_timeout = timeout.get("read")
+    deadline = monotonic() + _MAX_ERROR_READ_SECONDS
+    chunks = iter(response.iter_bytes())
+    content = bytearray()
+    try:
+        while True:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return None
+            timeout["read"] = remaining
+            try:
+                chunk = next(chunks)
+            except StopIteration:
+                return bytes(content)
+            except httpx.RequestError:
+                return None
+            if len(chunk) > _MAX_ERROR_BODY_BYTES - len(content):
+                return None
+            content.extend(chunk)
+    finally:
+        timeout["read"] = original_read_timeout
+
+
+def _invalid_performance_stream() -> ControlError:
+    return ControlError("Control API returned an invalid performance event stream")
+
+
+def _require_capability(health: HealthResponse, name: str) -> None:
+    if name not in health.capabilities:
+        _raise_missing_capability(name)
+
+
+def _raise_missing_capability(name: str) -> None:
+    raise IncompatibleProtocol(
+        f"Control API does not advertise the required {name} capability"
+    )
 
 
 def _validate_health_numbers(response: HealthResponse) -> None:
@@ -202,13 +445,15 @@ def _utc_datetime(value: datetime) -> datetime:
         raise ValueError("datetime is outside the supported UTC range") from error
 
 
-def _http_error_message(response: httpx.Response) -> str:
+def _http_error_message(
+    response: httpx.Response, *, content: bytes | None = None
+) -> str:
     message = f"Control API returned HTTP {response.status_code}"
     content_type = response.headers.get("content-type", "").lower()
     if "json" not in content_type:
         return message
     try:
-        payload = response.json()
+        payload = response.json() if content is None else json.loads(content)
     except (ValueError, RecursionError):
         return message
     detail = payload.get("detail") if isinstance(payload, dict) else None
