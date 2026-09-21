@@ -26,11 +26,6 @@ from claude_code_proxy.control.schemas import (
     SessionResponse,
 )
 from claude_code_proxy.domain.models import ClientIdentity
-from claude_code_proxy.failures import (
-    FailureCategory,
-    FailureDiagnostic,
-    FailureStage,
-)
 from claude_code_proxy.limits import MAX_CONTROL_INTEGER
 from claude_code_proxy.observability import (
     SessionMetadata,
@@ -871,20 +866,6 @@ def test_stream_event_alias_discriminates_ordinary_and_reset_events() -> None:
     assert isinstance(reset, PerformanceResetResponse)
 
 
-def test_performance_datetimes_normalize_offsets_and_reject_naive_values() -> None:
-    utc = ProcessIdentityResponse.model_validate(
-        {"pid": 1, "started_at": "2026-01-02T03:04:05Z"}
-    )
-    offset = ProcessIdentityResponse.model_validate(
-        {"pid": 1, "started_at": "2026-01-02T05:04:05+02:00"}
-    )
-    assert utc.started_at == offset.started_at
-    assert offset.started_at.tzinfo is UTC
-    with pytest.raises(ValidationError):
-        ProcessIdentityResponse.model_validate(
-            {"pid": 1, "started_at": "2026-01-02T03:04:05"}
-        )
-
 
 @pytest.mark.parametrize(
     ("model", "factory"),
@@ -913,26 +894,6 @@ def test_session_performance_outcomes_are_closed_strict_and_bounded() -> None:
         with pytest.raises(ValidationError):
             SessionPerformanceResponse.model_validate(payload)
 
-
-def test_failure_diagnostic_maps_only_safe_structured_fields() -> None:
-    diagnostic = FailureDiagnostic(
-        FailureCategory.UPSTREAM_HTTP,
-        FailureStage.RESPONSE,
-        "provider_error",
-        provider_code="rate_limit",
-        exception_type="ProviderError",
-        location="module:function:10",
-    )
-    response = FailureDiagnosticResponse.model_validate(diagnostic)
-    assert response.model_dump(mode="json") == {
-        "category": "upstream_http",
-        "stage": "response",
-        "code": "provider_error",
-        "provider_code": "rate_limit",
-        "exception_type": "ProviderError",
-        "location": "module:function:10",
-    }
-    assert "message" not in FailureDiagnosticResponse.model_fields
 
 
 def test_real_registry_capture_converts_without_raw_content() -> None:
@@ -981,3 +942,51 @@ def test_performance_schema_models_are_frozen(model, factory) -> None:
     field = next(iter(model.model_fields))
     with pytest.raises(ValidationError, match="frozen"):
         setattr(instance, field, None)
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("view.performance.session_id", "other"),
+        ("event.session_id", "other"),
+        ("event.request.session_id", "other"),
+        ("event.session.session_id", "other"),
+        ("event.request.outcome", "failed"),
+        ("event.type", "progress"),
+    ],
+)
+def test_performance_envelopes_reject_inconsistent_lifecycle(
+    path: str, value: str
+) -> None:
+    envelope, *parts = path.split(".")
+    is_view = envelope == "view"
+    model = SessionPerformanceViewResponse if is_view else PerformanceEventResponse
+    payload = performance_view_payload() if is_view else performance_event_payload()
+    target = payload
+    for part in parts[:-1]:
+        target = target[part]
+    target[parts[-1]] = value
+    with pytest.raises(ValidationError):
+        model.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("model", "factory", "path"),
+    [
+        (RequestPerformanceResponse, request_performance_payload, ("started_at",)),
+        (RequestPerformanceResponse, request_performance_payload, ("finished_at",)),
+        (PerformanceListResponse, performance_list_payload, ("captured_at",)),
+        (PerformanceEventResponse, performance_event_payload, ("occurred_at",)),
+        (PerformanceResetResponse, performance_reset_payload, ("occurred_at",)),
+    ],
+)
+def test_performance_envelopes_reject_numeric_datetime_strings(
+    model, factory, path: tuple[str, ...]
+) -> None:
+    payload = factory()
+    target = payload
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = "0"
+    with pytest.raises(ValidationError):
+        model.model_validate(payload)

@@ -96,10 +96,15 @@ class SessionListResponse(_FrozenModel):
     sessions: tuple[SessionResponse, ...]
 
 
-def _require_wire_datetime(value: object) -> object:
-    if not isinstance(value, (str, datetime)):
+def _require_wire_datetime(value: object) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str):
         raise ValueError("datetime must be an ISO string or datetime")
-    return value
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError("datetime must be an ISO string or datetime") from error
 
 
 def _normalize_utc_datetime(value: datetime) -> datetime:
@@ -244,6 +249,12 @@ class SessionPerformanceViewResponse(_TelemetryModel):
     session: SessionResponse
     performance: SessionPerformanceResponse
 
+    @model_validator(mode="after")
+    def validate_session_identity(self) -> Self:
+        if self.session.id != self.performance.session_id:
+            raise ValueError("session identity must match performance identity")
+        return self
+
 
 class PerformanceListResponse(_TelemetryModel):
     process: ProcessIdentityResponse
@@ -263,6 +274,17 @@ OrdinaryPerformanceEventType = Literal[
     "cancelled",
     "client_disconnected",
 ]
+_EVENT_OUTCOMES: dict[OrdinaryPerformanceEventType, RequestOutcome] = {
+    "request_started": "active",
+    "first_output": "active",
+    "progress": "active",
+    "tool_use": "active",
+    "retry": "active",
+    "completed": "completed",
+    "failed": "failed",
+    "cancelled": "cancelled",
+    "client_disconnected": "client_disconnected",
+}
 
 
 class PerformanceEventResponse(_TelemetryModel):
@@ -273,6 +295,16 @@ class PerformanceEventResponse(_TelemetryModel):
     session_id: SafeString
     request: RequestPerformanceResponse
     session: SessionPerformanceResponse
+
+    @model_validator(mode="after")
+    def validate_lifecycle(self) -> Self:
+        if self.request.session_id != self.session_id:
+            raise ValueError("event identity must match request identity")
+        if self.session.session_id != self.session_id:
+            raise ValueError("event identity must match session identity")
+        if self.request.outcome != _EVENT_OUTCOMES[self.type]:
+            raise ValueError("event type must match request outcome")
+        return self
 
 
 class PerformanceResetResponse(_TelemetryModel):

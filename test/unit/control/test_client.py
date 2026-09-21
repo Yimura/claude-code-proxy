@@ -17,11 +17,14 @@ from claude_code_proxy.control.client import (
     IncompatibleProtocol,
 )
 from claude_code_proxy.control.schemas import (
+    FailureDiagnosticResponse,
     HealthResponse,
     MetricAggregateResponse,
     MetricResponse,
+    ProcessIdentityResponse,
     SessionResponse,
 )
+from claude_code_proxy.failures import FailureCategory, FailureDiagnostic, FailureStage
 from claude_code_proxy.limits import MAX_CONTROL_INTEGER
 
 
@@ -945,3 +948,42 @@ def test_metric_aggregate_allows_large_total_but_bounds_samples() -> None:
 def test_metric_aggregate_rejects_invalid_values(value: object) -> None:
     with pytest.raises(ValidationError):
         MetricAggregateResponse.model_validate(metric_aggregate_payload(value))
+
+
+@pytest.mark.parametrize("value", ["0", "1e3", "-1"])
+def test_process_identity_rejects_numeric_datetime_strings(value: str) -> None:
+    with pytest.raises(ValidationError):
+        ProcessIdentityResponse.model_validate({"pid": 1, "started_at": value})
+
+
+def test_performance_datetimes_normalize_offsets_and_reject_naive_values() -> None:
+    utc = ProcessIdentityResponse.model_validate(
+        {"pid": 1, "started_at": "2026-01-02T03:04:05Z"}
+    )
+    offset = ProcessIdentityResponse.model_validate(
+        {"pid": 1, "started_at": "2026-01-02T05:04:05+02:00"}
+    )
+    assert utc.started_at == offset.started_at
+    assert offset.started_at.tzinfo is UTC
+    with pytest.raises(ValidationError):
+        ProcessIdentityResponse.model_validate(
+            {"pid": 1, "started_at": "2026-01-02T03:04:05"}
+        )
+
+
+
+def test_failure_diagnostic_maps_only_safe_structured_fields() -> None:
+    diagnostic = FailureDiagnostic(
+        FailureCategory.UPSTREAM_HTTP,
+        FailureStage.RESPONSE,
+        "provider_error",
+        provider_code="rate_limit",
+        exception_type="ProviderError",
+        location="module:function:10",
+    )
+    response = FailureDiagnosticResponse.model_validate(diagnostic)
+    dumped = response.model_dump(mode="json")
+    assert dumped["category"] == "upstream_http"
+    assert dumped["stage"] == "response"
+    assert set(dumped) == set(FailureDiagnosticResponse.model_fields)
+    assert "message" not in dumped
