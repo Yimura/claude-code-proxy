@@ -11,6 +11,7 @@ from httpx import ASGITransport, AsyncClient
 from starlette.requests import ClientDisconnect
 
 import claude_code_proxy.api.routes as routes_module
+import claude_code_proxy.logging as logging_module
 from claude_code_proxy import cli as cli_module
 from claude_code_proxy.api.routes import build_router
 from claude_code_proxy.config import ModelConfig, ModelDefinition
@@ -1791,3 +1792,68 @@ def test_provider_stream_error_survives_logging_sink_failure(
     performance = latest_performance(sessions)
     assert performance.outcome == "failed"
     assert performance.failure == diagnostic
+
+
+def _assert_diagnostic_rendered(logs: str, diagnostic: FailureDiagnostic) -> None:
+    assert f"category={diagnostic.category}" in logs
+    assert f"stage={diagnostic.stage}" in logs
+    assert f"code={diagnostic.code}" in logs
+
+
+def test_diagnosticless_complete_failure_retains_logged_fallback(caplog):
+    error = ProviderError("busy", provider="fake", status_code=503)
+    sessions = registry()
+
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
+        response = client(Provider(error), sessions=sessions).post(
+            "/v1/messages",
+            json=messages_payload(messages=[]),
+        )
+
+    expected = logging_module.provider_failure_diagnostic(error)
+    assert response.status_code == 503
+    assert latest_performance(sessions).failure == expected
+    _assert_diagnostic_rendered(caplog.text, expected)
+    assert caplog.text.count("provider request failed") == 1
+    assert caplog.text.count("performance outcome=failed") == 1
+
+
+def test_diagnosticless_count_failure_retains_logged_fallback(caplog):
+    error = ProviderError("busy", provider="fake", status_code=503)
+    sessions = registry()
+
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
+        response = client(
+            Provider(count_error=error), sessions=sessions
+        ).post(
+            "/v1/messages/count_tokens",
+            json={"model": "claude-sonnet", "messages": []},
+        )
+
+    expected = logging_module.provider_failure_diagnostic(error)
+    assert response.status_code == 503
+    assert latest_performance(sessions).failure == expected
+    _assert_diagnostic_rendered(caplog.text, expected)
+    assert caplog.text.count("provider request failed") == 1
+    assert caplog.text.count("performance outcome=failed") == 1
+
+
+def test_diagnosticless_semantic_stream_retains_logged_fallback(caplog):
+    error = StreamError(error_type="api_error", provider="fake")
+    sessions = registry()
+
+    with caplog.at_level(logging.WARNING, logger="claude_code_proxy.logging"):
+        response = client(
+            Provider(stream_events=[error]), sessions=sessions
+        ).post(
+            "/v1/messages",
+            json=messages_payload(stream=True, messages=[]),
+        )
+
+    expected = logging_module.stream_failure_diagnostic(error)
+    assert response.status_code == 200
+    assert 'event: error' in response.text
+    assert latest_performance(sessions).failure == expected
+    _assert_diagnostic_rendered(caplog.text, expected)
+    assert caplog.text.count("provider stream failed") == 1
+    assert caplog.text.count("performance outcome=failed") == 1

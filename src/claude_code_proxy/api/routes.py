@@ -34,7 +34,9 @@ from ..logging import (
     log_telemetry_failure,
     log_unexpected_failure,
     observe_stream,
+    provider_failure_diagnostic,
     session_identity,
+    stream_failure_diagnostic,
 )
 from ..observability import ObservationHandle, SessionMetadata, SessionRegistry
 from ..performance import (
@@ -181,7 +183,11 @@ async def _complete_response(
     except ProviderError as error:
         _log_provider_error(raw_request, context, error)
         _finalize_request(
-            sessions, observation, context, "failed", error.diagnostic
+            sessions,
+            observation,
+            context,
+            "failed",
+            provider_failure_diagnostic(error),
         )
         raise _http_error(error) from error
     except asyncio.CancelledError:
@@ -211,7 +217,11 @@ async def _count_response(
     except ProviderError as error:
         _log_provider_error(raw_request, context, error)
         _finalize_request(
-            sessions, observation, context, "failed", error.diagnostic
+            sessions,
+            observation,
+            context,
+            "failed",
+            provider_failure_diagnostic(error),
         )
         raise _http_error(error) from error
     except asyncio.CancelledError:
@@ -255,7 +265,11 @@ def _streaming_response(
     except ProviderError as error:
         _log_provider_error(raw_request, context, error)
         _finalize_request(
-            sessions, observation, context, "failed", error.diagnostic
+            sessions,
+            observation,
+            context,
+            "failed",
+            provider_failure_diagnostic(error),
         )
         raise _http_error(error) from error
     except Exception as error:
@@ -328,8 +342,8 @@ def _stream_terminal_state(raw_request: Request) -> _StreamTerminalState:
 def _mark_stream_error(raw_request: Request, error: StreamError) -> None:
     state = _stream_terminal_state(raw_request)
     state.has_error = True
-    if state.failure is None and error.diagnostic is not None:
-        state.failure = error.diagnostic
+    if state.failure is None:
+        state.failure = stream_failure_diagnostic(error)
 
 
 def _record_stream_error(

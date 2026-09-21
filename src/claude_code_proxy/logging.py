@@ -301,13 +301,13 @@ def _render_diagnostic(diagnostic: FailureDiagnostic) -> str:
     return " ".join(fields)
 
 
-def _provider_diagnostic(error: ProviderError) -> FailureDiagnostic:
+def provider_failure_diagnostic(error: ProviderError) -> FailureDiagnostic:
     return error.diagnostic or FailureDiagnostic(
         FailureCategory.UPSTREAM_HTTP, FailureStage.REQUEST, "provider_error"
     )
 
 
-def _stream_diagnostic(error: StreamError) -> FailureDiagnostic:
+def stream_failure_diagnostic(error: StreamError) -> FailureDiagnostic:
     if error.diagnostic is not None:
         return error.diagnostic
     category = (
@@ -326,7 +326,7 @@ def log_provider_failure(context: RequestLogContext, error: ProviderError) -> No
         _correlation(context),
         log_text(context.method),
         log_text(context.endpoint),
-        _render_diagnostic(_provider_diagnostic(error)),
+        _render_diagnostic(provider_failure_diagnostic(error)),
         error.status_code,
         retryable_status(error.status_code),
         _structured_log_token(context.original_model),
@@ -344,7 +344,7 @@ def log_stream_failure(context: RequestLogContext, error: StreamError) -> None:
         _correlation(context),
         log_text(context.method),
         log_text(context.endpoint),
-        _render_diagnostic(_stream_diagnostic(error)),
+        _render_diagnostic(stream_failure_diagnostic(error)),
         _structured_log_token(error.error_type),
         error.status_code,
         error.retryable,
