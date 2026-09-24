@@ -357,16 +357,22 @@ If the configured mapping file does not exist, the proxy warns and uses built-in
 
 ## Codex Agent orchestration
 
-For `OPENAI_TRANSPORT=codex`, the Codex provider reinforces Claude Code's Agent lifecycle in the upstream system and tool descriptions:
+For `OPENAI_TRANSPORT=codex`, the Codex provider reinforces Claude Code's Agent lifecycle and work discipline in upstream system and tool descriptions:
 
 - Agent completion is push-based and arrives through one automatic parent notification.
 - Parents continue independent work after dispatch instead of polling.
-- `TaskOutput` is not used for Agent tasks.
-- `TaskOutput` remains available for non-Agent background tasks that require explicit retrieval and have no automatic completion notification.
+- Related implementation, tests, fixes, and review stay under coherent owners.
+- Existing workers are reused for follow-ups and rechecks.
+- Subagents avoid recursive delegation unless the parent explicitly authorizes it.
+- Applicable skills still load, but their checklist steps do not become automatic Agent boundaries.
+- Discovery stops when current behavior, change location, constraints, and verification path are known.
+- User decisions escalate early; repository-answerable facts remain agent work.
+- Repeated optional web searches and unchanged rereads yield to implementation, an answer, or bounded escalation.
+- `TaskOutput` remains available only for non-Agent background work requiring explicit retrieval.
 
-This is provider-local guidance, not task-ID filtering or runtime interception. Tool names, input schemas, and capabilities remain unchanged, and LiteLLM, Gemini, and direct Anthropic requests are unaffected.
+This is provider-local, advisory guidance. It does not intercept tool calls, enforce worker counts, remove capabilities, or maintain Agent lifecycle state. Tool names, schemas, and capabilities remain unchanged. LiteLLM, Gemini, and direct Anthropic requests are unaffected.
 
-A billable opt-in evaluation exercises the behavior against a running proxy and real Codex model. It is skipped during normal test runs:
+A billable opt-in evaluation exercises completion delivery, coherent ownership, worker reuse, subagent recursion, and discovery sufficiency against a running proxy and real Codex model. It is skipped during normal test runs:
 
 ```bash
 RUN_CODEX_AGENT_EVAL=1 \
@@ -374,7 +380,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8082 \
 uv run pytest -q test/integration/test_codex_agent_polling.py
 ```
 
-The evaluation simulates a running Agent, requires the parent to continue independent work, fails on `TaskOutput` polling, then delivers one synthetic completion notification. Because model behavior is nondeterministic, keep this evaluation outside required CI.
+The evaluation records safe aggregate behavior and fails when the model polls Agent completion, fragments related work, replaces reusable workers, recursively delegates without authorization, or continues discovery after sufficient local evidence. Because model behavior is nondeterministic, keep this evaluation outside required CI.
 
 ## How It Works
 

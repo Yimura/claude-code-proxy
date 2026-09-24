@@ -1,52 +1,147 @@
+import pytest
+
+from claude_code_proxy.domain.models import (
+    ClientIdentity,
+    CompletionRequest,
+    Message,
+    TextBlock,
+    ToolDefinition,
+)
 from claude_code_proxy.providers.codex.orchestration import (
     AGENT_COMPLETION_POLICY,
     AGENT_GUIDANCE,
+    AGENT_SCOPE_POLICY,
+    DISCOVERY_POLICY,
+    SEND_MESSAGE_GUIDANCE,
+    SUBAGENT_AGENT_GUIDANCE,
+    SUBAGENT_SCOPE_POLICY,
     TASK_OUTPUT_GUIDANCE,
     reconcile_codex_orchestration,
+    reconcile_codex_request,
 )
-from claude_code_proxy.domain.models import TextBlock, ToolDefinition
+from claude_code_proxy.reasoning import ReasoningPolicy
 
 
-def test_agent_adds_system_policy_and_preserves_schema():
-    schema = {"type": "object", "properties": {"prompt": {"type": "string"}}}
-    system = (TextBlock("base system"),)
-    agent = ToolDefinition("Agent", "Launch a worker.", schema)
-
-    reconciled_system, reconciled_tools = reconcile_codex_orchestration(
-        system, (agent,)
+def _agent(schema=None):
+    return ToolDefinition(
+        "Agent",
+        "Launch a worker.",
+        schema
+        or {
+            "type": "object",
+            "properties": {"prompt": {"type": "string"}},
+        },
     )
 
-    assert reconciled_system == (
-        system[0],
+
+def _send_message():
+    return ToolDefinition(
+        "SendMessage",
+        "Message a worker.",
+        {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string"},
+                "message": {"type": "string"},
+            },
+        },
+    )
+
+
+def _request(*, agent_id=None):
+    return CompletionRequest(
+        original_model="claude-opus-5",
+        model="openai/gpt-5.6-sol",
+        response_model="claude-opus-5",
+        max_tokens=100,
+        messages=(Message("user", (TextBlock("work"),)),),
+        reasoning=ReasoningPolicy(None, None),
+        client_identity=ClientIdentity(
+            session_id="session",
+            agent_id=agent_id,
+            parent_agent_id="parent" if agent_id else None,
+        ),
+        system=(TextBlock("base system"),),
+        tools=(
+            _agent(),
+            _send_message(),
+            ToolDefinition("TaskOutput", "Retrieve output."),
+        ),
+    )
+
+
+def test_root_agent_adds_stable_system_and_tool_policies():
+    request = _request()
+
+    reconciled = reconcile_codex_request(request)
+
+    assert reconciled.system == (
+        request.system[0],
         TextBlock(AGENT_COMPLETION_POLICY),
+        TextBlock(AGENT_SCOPE_POLICY),
+        TextBlock(DISCOVERY_POLICY),
     )
-    assert reconciled_tools[0].description == f"Launch a worker.\n\n{AGENT_GUIDANCE}"
-    assert reconciled_tools[0].input_schema is schema
+    assert reconciled.tools[0].description == (
+        f"Launch a worker.\n\n{AGENT_GUIDANCE}"
+    )
+    assert reconciled.tools[1].description == (
+        f"Message a worker.\n\n{SEND_MESSAGE_GUIDANCE}"
+    )
+    assert reconciled.tools[2].description == (
+        f"Retrieve output.\n\n{TASK_OUTPUT_GUIDANCE}"
+    )
 
 
-def test_task_output_keeps_explicit_non_agent_background_use():
-    schema = {"type": "object", "properties": {"task_id": {"type": "string"}}}
-    task_output = ToolDefinition("TaskOutput", "Retrieve task output.", schema)
+def test_subagent_adds_scope_policy_and_agent_warning():
+    request = _request(agent_id="worker-1")
+
+    reconciled = reconcile_codex_request(request)
+
+    assert reconciled.system[-1] == TextBlock(SUBAGENT_SCOPE_POLICY)
+    assert reconciled.tools[0].description.endswith(
+        f"{AGENT_GUIDANCE}\n\n{SUBAGENT_AGENT_GUIDANCE}"
+    )
+
+
+def test_agent_schema_identity_is_preserved():
+    schema = {
+        "type": "object",
+        "properties": {"prompt": {"type": "string"}},
+    }
+    agent = _agent(schema)
+
+    _, tools = reconcile_codex_orchestration((), (agent,))
+
+    assert tools[0].input_schema is schema
+
+
+def test_task_output_guidance_remains_without_agent():
+    task_output = ToolDefinition("TaskOutput", "Retrieve output.")
 
     system, tools = reconcile_codex_orchestration((), (task_output,))
 
     assert system == ()
-    assert tools[0].description == f"Retrieve task output.\n\n{TASK_OUTPUT_GUIDANCE}"
-    assert "non-Agent background tasks" in tools[0].description
-    assert tools[0].input_schema is schema
+    assert tools[0].description == (
+        f"Retrieve output.\n\n{TASK_OUTPUT_GUIDANCE}"
+    )
 
 
 def test_empty_descriptions_receive_guidance_without_leading_separator():
     _, tools = reconcile_codex_orchestration(
         (),
-        (ToolDefinition("Agent"), ToolDefinition("TaskOutput")),
+        (
+            ToolDefinition("Agent"),
+            ToolDefinition("SendMessage"),
+            ToolDefinition("TaskOutput"),
+        ),
     )
 
     assert tools[0].description == AGENT_GUIDANCE
-    assert tools[1].description == TASK_OUTPUT_GUIDANCE
+    assert tools[1].description == SEND_MESSAGE_GUIDANCE
+    assert tools[2].description == TASK_OUTPUT_GUIDANCE
 
 
-def test_unrelated_tools_and_system_are_returned_unchanged():
+def test_unrelated_tools_and_system_remain_unchanged():
     system = (TextBlock("base system"),)
     lookup = ToolDefinition("lookup", "Lookup data.", {"type": "object"})
     tools = (lookup,)
@@ -60,20 +155,30 @@ def test_unrelated_tools_and_system_are_returned_unchanged():
     assert reconciled_tools[0] is lookup
 
 
-def test_reconciliation_is_idempotent():
-    system = (TextBlock("base system"),)
-    tools = (
-        ToolDefinition("Agent", "Launch a worker."),
-        ToolDefinition("TaskOutput", "Retrieve output."),
-    )
+@pytest.mark.parametrize("agent_id", [None, "worker-1"])
+def test_reconciliation_is_idempotent(agent_id):
+    request = _request(agent_id=agent_id)
 
-    first_system, first_tools = reconcile_codex_orchestration(system, tools)
-    second_system, second_tools = reconcile_codex_orchestration(
-        first_system, first_tools
-    )
+    first = reconcile_codex_request(request)
+    second = reconcile_codex_request(first)
 
-    assert second_system is first_system
-    assert second_tools is first_tools
-    assert sum(block.text == AGENT_COMPLETION_POLICY for block in second_system) == 1
-    assert second_tools[0].description.count(AGENT_GUIDANCE) == 1
-    assert second_tools[1].description.count(TASK_OUTPUT_GUIDANCE) == 1
+    assert second is first
+
+
+def test_blank_agent_id_uses_root_policy():
+    request = _request(agent_id="   ")
+
+    reconciled = reconcile_codex_request(request)
+
+    assert TextBlock(SUBAGENT_SCOPE_POLICY) not in reconciled.system
+    assert SUBAGENT_AGENT_GUIDANCE not in reconciled.tools[0].description
+
+
+def test_send_message_remains_unchanged_without_agent():
+    send_message = _send_message()
+
+    system, tools = reconcile_codex_orchestration((), (send_message,))
+
+    assert system == ()
+    assert tools == (send_message,)
+    assert tools[0] is send_message

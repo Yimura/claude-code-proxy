@@ -252,14 +252,30 @@ def request(session_id=None, **changes):
     return replace(base, **changes)
 
 
-def orchestration_request():
+def orchestration_request(*, agent_id=None):
     return request(
         system=(TextBlock("base system"),),
+        client_identity=ClientIdentity(
+            session_id="session-1",
+            agent_id=agent_id,
+            parent_agent_id="parent" if agent_id else None,
+        ),
         tools=(
             ToolDefinition(
                 "Agent",
                 "Launch worker.",
                 {"type": "object", "properties": {"prompt": {"type": "string"}}},
+            ),
+            ToolDefinition(
+                "SendMessage",
+                "Message worker.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "to": {"type": "string"},
+                        "message": {"type": "string"},
+                    },
+                },
             ),
             ToolDefinition(
                 "TaskOutput",
