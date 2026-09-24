@@ -11,9 +11,10 @@ from textual.containers import Vertical
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Input, Label, Select, Static
 
+from .details import RequestDetails, SessionDetails
 from .formatting import safe_cell
 from .state import SortDirection, SortField, TuiState
-from .widgets import RequestDetails, RequestTable, SessionDetails
+from .widgets import RequestTable
 
 
 class _DismissableModal(ModalScreen[None]):

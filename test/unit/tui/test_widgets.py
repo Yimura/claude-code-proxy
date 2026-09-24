@@ -7,11 +7,11 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 
 from claude_code_proxy.tui.app import ConnectionPhase, ConnectionStatus
+from claude_code_proxy.tui.details import SessionDetails
 from claude_code_proxy.tui.state import StateDelta, TuiState, apply_stream_event
 from claude_code_proxy.tui.widgets import (
     ConnectionHeader,
     RequestTable,
-    SessionDetails,
     SessionTable,
     WidthMode,
 )

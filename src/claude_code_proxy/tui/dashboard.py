@@ -15,6 +15,7 @@ from textual.widgets import DataTable, Footer, Static
 from ..cli_common import terminal_text
 from ..control.schemas import PerformanceResetResponse
 from . import app as app_core
+from .details import RequestDetails, SessionDetails
 from .screens import (
     FilterScreen,
     HelpScreen,
@@ -41,9 +42,7 @@ from .state import (
 )
 from .widgets import (
     ConnectionHeader,
-    RequestDetails,
     RequestTable,
-    SessionDetails,
     SessionTable,
     WidthMode,
     width_mode,

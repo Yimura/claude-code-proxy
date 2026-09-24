@@ -9,11 +9,7 @@ from typing import Iterable, Protocol
 from rich.text import Text
 from textual.widgets import DataTable, Static
 
-from ..control.schemas import (
-    MetricAggregateResponse,
-    RequestPerformanceResponse,
-    SessionPerformanceViewResponse,
-)
+from ..control.schemas import RequestPerformanceResponse
 from .formatting import (
     format_aggregate,
     format_cache_ratio,
@@ -69,6 +65,8 @@ _MODE_COLUMNS = {
         "session", "state", "elapsed", "ttft", "result",
     ),
 }
+
+
 class _Phase(Protocol):
     value: str
 
@@ -115,7 +113,7 @@ class ConnectionHeader(Static):
 
 def _header_text(
     state: TuiState,
-    status: ConnectionStatus,
+    status: ConnectionStatusLike,
     *,
     visible_count: int,
     now: datetime,
@@ -340,139 +338,6 @@ def _request_cells(
     )
     return tuple(safe_cell(value) for value in values)
 
-
-class SessionDetails(Static):
-    """Read-only full session and safe agent hierarchy."""
-
-    def __init__(self, *, id: str = "session-details") -> None:
-        super().__init__(id=id, markup=False)
-
-    def sync_state(self, state: TuiState) -> None:
-        selected = state.selected_session_id
-        if selected is None:
-            self.update(safe_cell("No session selected"))
-            return
-        self.update(session_detail_text(state, selected))
-
-
-class RequestDetails(Static):
-    """Read-only request metrics and structured failure fields."""
-
-    def __init__(self, *, id: str = "request-details") -> None:
-        super().__init__(id=id, markup=False)
-
-    def sync_state(self, state: TuiState) -> None:
-        request = selected_request(state)
-        if request is None:
-            self.update(safe_cell("No request selected"))
-            return
-        self.update(request_detail_text(request))
-
-
-def session_detail_text(state: TuiState, identifier: str) -> Text:
-    view = state.sessions[identifier]
-    session = view.session
-    performance = view.performance
-    lines: list[tuple[str, object]] = [
-        ("Session", session.id),
-        ("Models", f"client {session.client_model} · resolved {session.model}"),
-        ("Route", f"{session.provider} · {session.transport}"),
-        ("State / phase", f"{session.state} / {state.phase_for(identifier)}"),
-        ("Effort / context", f"{session.effort} / {session.context_window or '—'}"),
-        ("First / last / elapsed", f"{session.first_seen.isoformat()} / {session.last_seen.isoformat()} / {session.elapsed_seconds:g}s"),
-        ("Requests", f"{session.requests} · active {performance.current_concurrency} · peak {performance.peak_concurrency}"),
-        ("Outcomes", _outcomes(performance.outcomes)),
-        ("Input tokens", _aggregate_detail(performance.input_tokens)),
-        ("Output tokens", _aggregate_detail(performance.output_tokens)),
-        ("Cache read", _aggregate_detail(performance.cache_read_tokens)),
-        ("Cache create", _aggregate_detail(performance.cache_creation_tokens)),
-        ("Reasoning", _aggregate_detail(performance.reasoning_tokens)),
-        ("Tools / retries", f"{_aggregate_detail(performance.tool_calls)} / {_aggregate_detail(performance.retries)}"),
-        ("Latest result", session.last_result or "—"),
-    ]
-    text = _detail_lines(lines)
-    text.append("\nAgents\n")
-    if not session.agents:
-        text.append_text(safe_cell("  none"))
-    for agent in session.agents:
-        parent = agent.parent_id or "root"
-        agent_line = (
-            f"  {agent.id} · parent {parent} · model {agent.model} · "
-            f"state {agent.state} · requests {agent.requests} · "
-            f"active {agent.active_requests}"
-        )
-        text.append_text(safe_cell(agent_line))
-        text.append("\n")
-    return text
-
-
-def request_detail_text(request: RequestPerformanceResponse) -> Text:
-    lines: list[tuple[str, object]] = [
-        ("Request", request.id),
-        ("Operation / outcome", f"{request.operation} / {request.outcome}"),
-        ("Started", request.started_at.isoformat()),
-        ("Finished", request.finished_at.isoformat() if request.finished_at else "active"),
-        ("Duration", metric_detail(request.duration)),
-        ("Upstream", metric_detail(request.upstream_duration)),
-        ("TTFT", metric_detail(request.ttft)),
-        ("Input tokens", metric_detail(request.input_tokens)),
-        ("Output tokens", metric_detail(request.output_tokens)),
-        ("Cache read", metric_detail(request.cache_read_tokens)),
-        ("Cache create", metric_detail(request.cache_creation_tokens)),
-        ("Reasoning", metric_detail(request.reasoning_tokens)),
-        ("Tool calls", metric_detail(request.tool_calls)),
-        ("Retries", metric_detail(request.retries)),
-        ("Peak concurrency", metric_detail(request.peak_concurrency)),
-        ("Continuation", request.reasoning_continuation),
-    ]
-    if request.failure is not None:
-        failure = request.failure
-        lines.extend(
-            (
-                ("Failure category / stage", f"{failure.category} / {failure.stage}"),
-                ("Failure code", failure.code),
-                ("Provider code", failure.provider_code or "—"),
-                ("Exception type", failure.exception_type or "—"),
-                ("Location", failure.location or "—"),
-            )
-        )
-    return _detail_lines(lines)
-
-
-def selected_request(state: TuiState) -> RequestPerformanceResponse | None:
-    session_id = state.selected_session_id
-    request_id = state.selected_request_id
-    if session_id is None or request_id is None:
-        return None
-    performance = state.sessions[session_id].performance
-    for request in performance.active_requests + performance.recent_requests:
-        if request.id == request_id:
-            return request
-    return None
-
-
-def _detail_lines(lines: Iterable[tuple[str, object]]) -> Text:
-    text = Text(no_wrap=False, overflow="fold")
-    for label, value in lines:
-        text.append(label + ": ", style="bold")
-        text.append_text(safe_cell(value))
-        text.append("\n")
-    return text
-
-
-def _aggregate_detail(metric: MetricAggregateResponse) -> str:
-    return (
-        f"{format_aggregate(metric)} "
-        f"(observed {metric.observed_samples}, unavailable "
-        f"{metric.unavailable_samples}, not applicable "
-        f"{metric.not_applicable_samples})"
-    )
-
-
-def _outcomes(outcomes: object) -> str:
-    if not outcomes:
-        return "none"
-    return ", ".join(f"{key} {value}" for key, value in sorted(outcomes.items()))
 
 
 def _duration(seconds: int) -> str:

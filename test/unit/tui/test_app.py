@@ -11,6 +11,7 @@ from claude_code_proxy.tui.app import (
     ConnectionStatus,
     TuiApp,
 )
+from claude_code_proxy.tui.details import SessionDetails
 from claude_code_proxy.tui.screens import (
     FilterScreen,
     HelpScreen,
@@ -19,12 +20,7 @@ from claude_code_proxy.tui.screens import (
     SortScreen,
 )
 from claude_code_proxy.tui.state import SortField
-from claude_code_proxy.tui.widgets import (
-    RequestTable,
-    SessionDetails,
-    SessionTable,
-    WidthMode,
-)
+from claude_code_proxy.tui.widgets import RequestTable, SessionTable, WidthMode
 from test.unit.tui.support import reset, view
 
 
