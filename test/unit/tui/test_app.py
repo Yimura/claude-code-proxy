@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from textual.widgets import Select
 
 from claude_code_proxy.tui.app import (
     AppResult,
@@ -128,6 +129,22 @@ async def test_overlay_bindings(key: str, screen_type: type) -> None:
         assert isinstance(app.screen, screen_type)
         await pilot.press("escape")
         assert not isinstance(app.screen, screen_type)
+
+
+async def test_sort_overlay_applies_selected_field_and_direction() -> None:
+    app = app_with_data("safe-a")
+    async with app.run_test(size=(140, 40)) as pilot:
+        app.drain_pending()
+        await pilot.press("s")
+        screen = app.screen
+        assert isinstance(screen, SortScreen)
+        screen.query_one("#sort-field", Select).value = "model"
+        screen.query_one("#sort-direction", Select).value = "descending"
+        await pilot.click("#sort-apply")
+
+        assert app.state.sort.field is SortField.MODEL
+        assert app.state.sort.direction.value == "descending"
+        assert not isinstance(app.screen, SortScreen)
 
 
 async def test_sort_overlay_exposes_all_sort_fields_and_applies_direction() -> None:

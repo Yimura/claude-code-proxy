@@ -25,6 +25,7 @@ from .screens import (
     SortScreen,
 )
 from .state import (
+    FilterField,
     FilterTerm,
     SortDirection,
     SortField,
@@ -283,7 +284,7 @@ class TuiApp(App[app_core.AppResult]):
             return
         if field not in _FILTER_FIELDS:
             return
-        term = FilterTerm(cast(object, field), value)
+        term = FilterTerm(cast(FilterField, field), value)
         self.state = with_filter(self.state, term)
         self._refresh_all(StateDelta(order_changed=True))
 

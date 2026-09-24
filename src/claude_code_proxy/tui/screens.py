@@ -9,7 +9,7 @@ from textual import on
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Input, Label, Select, Static
+from textual.widgets import Button, Input, Label, Select, Static
 
 from .details import RequestDetails, SessionDetails
 from .formatting import safe_cell
@@ -167,15 +167,16 @@ class SortScreen(_DismissableModal):
                 allow_blank=False,
                 id="sort-direction",
             )
+            yield Button("Apply", id="sort-apply", variant="primary")
             yield Static(
-                safe_cell("Enter applies · Escape cancels"),
+                safe_cell("Escape cancels"),
                 markup=False,
                 classes="overlay-hint",
             )
 
-    def on_key(self, event) -> None:
-        if event.key == "enter":
-            self.submit_sort()
+    @on(Button.Pressed, "#sort-apply")
+    def apply_pressed(self) -> None:
+        self.submit_sort()
 
     def submit_sort(self) -> None:
         field = self.query_one("#sort-field", Select).value

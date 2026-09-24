@@ -173,7 +173,7 @@ class SessionTable(DataTable[Text]):
         if not delta.selection_changed:
             selected = self.selected_key or selected
         order = visible_session_ids(state)
-        rebuild = mode is not self.mode or order != self._order or delta.replace_all
+        rebuild = mode is not self.mode or order != self._order
         self._state = state
         if rebuild:
             self._rebuild(state, order, mode, now)

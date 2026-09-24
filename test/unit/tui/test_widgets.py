@@ -108,6 +108,30 @@ async def test_session_table_has_one_stable_key_per_session_and_preserves_select
         assert table.selected_key == "safe-b"
 
 
+async def test_session_table_updates_reset_cells_without_rebuilding_columns() -> None:
+    app = WidgetHarness()
+    initial = state_with("safe-a")
+    async with app.run_test(size=(140, 40)):
+        table = app.query_one(SessionTable)
+        table.sync_state(
+            initial, StateDelta(replace_all=True), mode=WidthMode.WIDE
+        )
+        original_columns = tuple(table.columns.values())
+        updated, delta = apply_stream_event(
+            initial,
+            reset(view("safe-a", model="changed-model"), sequence=8),
+        )
+        table.sync_state(updated, delta, mode=WidthMode.WIDE)
+
+        assert all(
+            current is original
+            for current, original in zip(
+                table.columns.values(), original_columns, strict=True
+            )
+        )
+        assert table.get_cell("safe-a", "model").plain == "changed-model"
+
+
 async def test_session_table_cells_are_literal_safe_rich_text() -> None:
     base = view("safe-[bold]id")
     poisoned = base.model_copy(

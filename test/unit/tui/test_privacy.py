@@ -36,6 +36,7 @@ async def test_session_id_filter_is_masked_and_cleared_before_dismiss() -> None:
         field = screen.query_one("#filter-value", Input)
         field.value = RAW
         assert field.password is True
+        assert RAW not in str(field.render())
         screen.submit_filter()
         assert field.value == ""
         await pilot.pause()
