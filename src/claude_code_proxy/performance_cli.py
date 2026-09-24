@@ -227,4 +227,3 @@ def _display_model(value: str, no_trunc: bool) -> str:
     if no_trunc:
         return terminal_text(value)
     return terminal_text(value, maximum=_MODEL_DISPLAY_LENGTH)
-
