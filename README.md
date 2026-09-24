@@ -158,6 +158,38 @@ History and aggregates are memory-only. Each retained session keeps its latest 2
 
 `perf --watch` is snapshot-first when no valid resume cursor exists, then append-only. The CLI validates each NDJSON frame, emits each event once, does not reconnect, exits cleanly on an interrupt, and reports clean EOF rather than silently waiting on a replacement process.
 
+### Interactive live TUI
+
+The TUI requires performance collection and interactive TTY input and output. For a source deployment, start collector mode in one terminal and the dashboard in another:
+
+```bash
+uv run claude-code-proxy proxy --performance collector
+uv run claude-code-proxy tui
+```
+
+The `logging` mode also supplies TUI data. Mode `off` does not: the command exits with a fixed, safe error naming control protocol v1 and the required `performance` and `performance_events` capabilities. Inside the default Compose service, collector mode is already enabled; attach an interactive terminal with:
+
+```bash
+docker compose exec proxy claude-code-proxy tui
+```
+
+The dashboard is keyboard-driven:
+
+- ↑/↓ or `j`/`k` select; Tab/Shift+Tab switches between session and request panes.
+- Enter opens or advances into details; Escape moves back or closes an overlay.
+- `/` opens quick search, `f` adds a filter, `s` selects a sort, and `c` clears search and filters while preserving the current sort.
+- `?` opens the in-app key reference; `q` or Ctrl+C exits cleanly.
+
+Quick search updates locally while typing. It is a case-insensitive substring search across the safe public session ID, client and resolved model, provider, transport, stable state, transient phase, effort, and latest result. Filters are additive. Repeated filters for the same field are OR alternatives; different fields are ANDed. The public fields are `id`, `state`, `provider`, `transport`, `model`, and `effort`: `id` is a case-insensitive prefix match; all other public fields are case-insensitive exact matches. A `session_id` filter accepts an exact raw client session ID for private lookup. It is masked while entered, sent only to the local control endpoint, immediately cleared, HMAC-resolved by the proxy, and replaced in TUI state by safe public IDs; it is never displayed or retained.
+
+Sorting supports baseline, session ID, state/phase, recency, model, elapsed, TTFT, input tokens, output tokens, cache ratio, or tool calls, in ascending or descending direction. Baseline order follows first observation and safe ID, with newly observed sessions appended. Equal observed values use safe ID as a deterministic tie-breaker. Unavailable sort values always remain last in either direction. Unavailable and not-applicable values render as `—`. Partial aggregates render with `+?`; zero remains a real observed value.
+
+Responsive layouts switch by whole columns rather than truncating every metric. At 120 columns or wider, wide mode shows the full session metric set and the detail pane. At 90–119 columns, medium mode keeps model, state, request/activity, elapsed, TTFT, token, and result columns. Terminals narrower than 90 columns show the essential session, state/phase, elapsed, TTFT, and result columns; Enter opens full-width details. At any width shorter than 22 rows, the side detail pane is hidden and Enter opens the full-width detail view.
+
+When the stream drops, the TUI retains the last snapshot as stale, marks the connection as disconnected/reconnecting, and retries after 0.5, 1, 2, and 4 seconds. A reset from a replacement proxy process is authoritative even when its sequence is lower: stale rows and cursor state are replaced before the header returns to CONNECTED. The command exits nonzero after retry exhaustion. Capability mismatch is not retried.
+
+TUI state is ephemeral and memory-only. It disappears when the dashboard exits and is not an audit trail; durable console logs remain the operational record according to the deployment's storage and retention policy. The same exclusion boundary applies to both: neither the TUI nor application-managed telemetry/logging records prompts, messages, system instructions, tool names, descriptions, schemas, inputs or results, credentials, authorization values, API keys, encrypted reasoning, raw client session/agent identifiers, exception messages or locals, or provider request or response payloads.
+
 Performance capabilities and routes remain on the Unix-socket control boundary. With mode `off`, health omits `performance` and `performance_events`, both `/v1/performance` and `/v1/performance/events` return 404, and `perf` exits with collector startup guidance. The endpoints are never added to the public TCP API. In Docker the socket remains container-local unless an operator deliberately changes the deployment boundary.
 
 The privacy contract is exclusion-based. Captures, snapshots, journals, control JSON/NDJSON, CLI/TUI output, and structured performance records never retain or emit prompts, messages, system instructions, tool names, tool descriptions, tool schemas, tool inputs or results, credentials, authorization values, API keys, provider request or response payloads, exception messages or locals, encrypted reasoning, or raw client session, agent, or parent-agent IDs. Public session and agent IDs are process-local keyed HMAC values; request IDs are generated opaque values. Provider payloads still receive the content needed to execute the request, but that payload is not a telemetry surface.
