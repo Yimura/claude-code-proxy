@@ -252,3 +252,7 @@ class ConnectionPump:
                 on_reset()
             if self._stopped.is_set():
                 return
+
+
+# Keep the public import path stable while the Textual layer remains cohesive.
+from .dashboard import TuiApp, run_tui  # noqa: E402
