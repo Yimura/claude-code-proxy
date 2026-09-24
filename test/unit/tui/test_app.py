@@ -88,6 +88,51 @@ async def test_connected_only_after_reset_and_disconnect_keeps_dimmed_rows() -> 
         assert app.screen.has_class("disconnected")
 
 
+@pytest.mark.parametrize(
+    ("phase", "label"),
+    [
+        (ConnectionPhase.DISCONNECTED, "DISCONNECTED"),
+        (ConnectionPhase.RECONNECTING, "RECONNECTING"),
+    ],
+)
+async def test_later_connection_status_remains_authoritative_over_queued_reset(
+    phase: ConnectionPhase,
+    label: str,
+) -> None:
+    app = TuiApp(
+        Path("/safe/control.sock"), pump=InertPump(), start_stream=False
+    )
+    async with app.run_test(size=(140, 40)) as pilot:
+        app.pending.offer(reset(view("safe-stale")))
+
+        app.accept_status(ConnectionStatus(phase, 1))
+
+        assert "safe-stale" in app.state.sessions
+        await pilot.pause(0.2)
+        assert app.connection_status.phase is phase
+        assert app.screen.has_class("disconnected")
+        assert label in str(app.query_one("#connection-header").render())
+        assert {key.value for key in app.query_one(SessionTable).rows} == {
+            "safe-stale"
+        }
+
+
+async def test_reset_without_later_status_becomes_connected() -> None:
+    app = TuiApp(
+        Path("/safe/control.sock"), pump=InertPump(), start_stream=False
+    )
+    async with app.run_test(size=(140, 40)) as pilot:
+        app.pending.offer(reset(view("safe-live")))
+        app.drain_pending()
+        await pilot.pause()
+
+        assert app.connection_status.phase is ConnectionPhase.CONNECTED
+        assert not app.screen.has_class("disconnected")
+        assert "CONNECTED" in str(
+            app.query_one("#connection-header").render()
+        )
+
+
 async def test_active_elapsed_refreshes_once_per_second_without_events() -> None:
     item = view("safe-active", state="active")
     app = app_with_data()

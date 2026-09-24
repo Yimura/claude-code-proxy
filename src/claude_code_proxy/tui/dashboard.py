@@ -56,6 +56,12 @@ _SHORT_HEIGHT = 22
 _FILTER_FIELDS = frozenset(
     {"id", "state", "provider", "transport", "model", "effort"}
 )
+_STALE_CONNECTION_PHASES = frozenset(
+    {
+        app_core.ConnectionPhase.DISCONNECTED,
+        app_core.ConnectionPhase.RECONNECTING,
+    }
+)
 
 
 class TuiApp(App[app_core.AppResult]):
@@ -183,6 +189,8 @@ class TuiApp(App[app_core.AppResult]):
 
     def accept_status(self, status: app_core.ConnectionStatus) -> None:
         """Apply connection state while retaining stale snapshot rows."""
+        if status.phase in _STALE_CONNECTION_PHASES:
+            self.drain_pending()
         self.connection_status = status
         self._set_connection_class()
         self._refresh_header()
@@ -247,10 +255,7 @@ class TuiApp(App[app_core.AppResult]):
         empty.display = bool(message)
 
     def _set_connection_class(self) -> None:
-        disconnected = self.connection_status.phase in {
-            app_core.ConnectionPhase.DISCONNECTED,
-            app_core.ConnectionPhase.RECONNECTING,
-        }
+        disconnected = self.connection_status.phase in _STALE_CONNECTION_PHASES
         self.screen.set_class(disconnected, "disconnected")
 
     def on_data_table_row_highlighted(
