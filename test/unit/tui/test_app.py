@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import CancelledError
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+import threading
 
 import pytest
 from textual.widgets import Select
@@ -306,3 +308,114 @@ async def test_quit_keys_stop_stream_and_exit_zero(key: str) -> None:
 
     assert pump.stops >= 1
     assert app.return_value == AppResult(0)
+
+
+def test_stream_callback_race_drops_delivery_after_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = TuiApp(
+        Path("/safe/control.sock"), pump=InertPump(), start_stream=False
+    )
+    barrier = threading.Barrier(2)
+    delivered: list[str] = []
+    failures: list[BaseException] = []
+
+    def pause_then_schedule(callback, *args) -> None:
+        barrier.wait(timeout=1)
+        barrier.wait(timeout=1)
+        callback(*args)
+
+    monkeypatch.setattr(app, "call_from_thread", pause_then_schedule)
+
+    def invoke_from_stream() -> None:
+        try:
+            app._call_from_stream(delivered.append, "late")
+        except BaseException as error:
+            failures.append(error)
+
+    worker = threading.Thread(target=invoke_from_stream)
+    worker.start()
+    barrier.wait(timeout=1)
+    app.stop_stream()
+    barrier.wait(timeout=1)
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert delivered == []
+
+
+def test_queued_stream_callback_rechecks_stop_before_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = TuiApp(
+        Path("/safe/control.sock"), pump=InertPump(), start_stream=False
+    )
+    scheduled: list[tuple[object, tuple[object, ...]]] = []
+    delivered: list[str] = []
+    monkeypatch.setattr(
+        app,
+        "call_from_thread",
+        lambda callback, *args: scheduled.append((callback, args)),
+    )
+
+    app._call_from_stream(delivered.append, "queued")
+    app.stop_stream()
+    callback, args = scheduled.pop()
+    callback(*args)
+
+    assert delivered == []
+
+
+def test_stream_callback_delivers_before_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = TuiApp(
+        Path("/safe/control.sock"), pump=InertPump(), start_stream=False
+    )
+    delivered: list[str] = []
+    monkeypatch.setattr(
+        app,
+        "call_from_thread",
+        lambda callback, *args: callback(*args),
+    )
+
+    app._call_from_stream(delivered.append, "live")
+
+    assert delivered == ["live"]
+
+
+@pytest.mark.parametrize("error_type", [CancelledError, RuntimeError])
+def test_stream_callback_ignores_scheduler_shutdown_error_after_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    app = TuiApp(
+        Path("/safe/control.sock"), pump=InertPump(), start_stream=False
+    )
+
+    def stop_then_fail(callback, *args) -> None:
+        app.stop_stream()
+        raise error_type("app loop stopped")
+
+    monkeypatch.setattr(app, "call_from_thread", stop_then_fail)
+
+    app._call_from_stream(lambda: None)
+
+
+@pytest.mark.parametrize("error_type", [CancelledError, RuntimeError])
+def test_stream_callback_surfaces_scheduler_error_before_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    app = TuiApp(
+        Path("/safe/control.sock"), pump=InertPump(), start_stream=False
+    )
+
+    def fail(callback, *args) -> None:
+        raise error_type("unexpected scheduler failure")
+
+    monkeypatch.setattr(app, "call_from_thread", fail)
+
+    with pytest.raises(error_type, match="unexpected scheduler failure"):
+        app._call_from_stream(lambda: None)

@@ -150,9 +150,14 @@ class TuiApp(App[app_core.AppResult]):
     ) -> None:
         if self._stream_stopped:
             return
+
+        def deliver_if_running() -> None:
+            if not self._stream_stopped:
+                callback(*args)
+
         try:
-            self.call_from_thread(callback, *args)
-        except CancelledError:
+            self.call_from_thread(deliver_if_running)
+        except (CancelledError, RuntimeError):
             if not self._stream_stopped:
                 raise
 
