@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 
 from rich.text import Text
 from textual import on
@@ -82,6 +83,7 @@ class FilterScreen(_DismissableModal):
         super().__init__()
         self._callback = callback
         self._selected_field = "id"
+        self._value_input: Input | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="overlay-card"):
@@ -100,23 +102,41 @@ class FilterScreen(_DismissableModal):
             )
 
     def on_mount(self) -> None:
-        self.query_one("#filter-value", Input).focus()
+        self._value_input = self.query_one("#filter-value", Input)
+        self._value_input.focus()
 
     def select_field(self, field: str) -> None:
         if field not in {value for _, value in _FILTER_OPTIONS}:
             return
-        self._selected_field = field
-        selector = self.query_one("#filter-field", Select)
-        selector.value = field
-        self.query_one("#filter-value", Input).password = field == "session_id"
+        self.query_one("#filter-field", Select).value = field
+        self._transition_field(field)
 
     @on(Select.Changed, "#filter-field")
     def field_changed(self, event: Select.Changed) -> None:
         if isinstance(event.value, str):
-            self._selected_field = event.value
-            self.query_one("#filter-value", Input).password = (
-                event.value == "session_id"
-            )
+            self._transition_field(event.value)
+
+    def _transition_field(self, field: str) -> None:
+        value_input = self.query_one("#filter-value", Input)
+        crosses_private_boundary = (
+            field != self._selected_field
+            and "session_id" in {field, self._selected_field}
+        )
+        if crosses_private_boundary:
+            value_input.clear()
+        value_input.password = field == "session_id"
+        self._selected_field = field
+
+    def action_close(self) -> None:
+        self._scrub_input()
+        super().action_close()
+
+    def dismiss(self, result=None):
+        self._scrub_input()
+        return super().dismiss(result)
+
+    def on_unmount(self) -> None:
+        self._scrub_input()
 
     @on(Input.Submitted, "#filter-value")
     def input_submitted(self) -> None:
@@ -130,6 +150,10 @@ class FilterScreen(_DismissableModal):
             return
         self._callback(self._selected_field, value)
         self.dismiss()
+
+    def _scrub_input(self) -> None:
+        if self._value_input is not None and self._value_input.value:
+            self._value_input.set_reactive(Input.value, "")
 
 
 _SORT_OPTIONS = tuple((safe_cell(item.value), item.value) for item in SortField)
@@ -227,6 +251,21 @@ class SessionDetailScreen(_DismissableScreen):
         self.query_one(RequestDetails).sync_state(self._state)
         self.query_one(RequestTable).focus()
 
+    def sync_state(self, state: TuiState) -> None:
+        self._state = state
+        if not self.is_mounted:
+            return
+        self.query_one(SessionDetails).sync_state(state)
+        self.query_one(RequestTable).sync_state(state)
+        self.query_one(RequestDetails).sync_state(state)
+
+    def refresh_clock(self, state: TuiState, now: datetime) -> None:
+        self._state = state
+        if not self.is_mounted:
+            return
+        self.query_one(RequestTable).refresh_active(state, now)
+        self.query_one(RequestDetails).sync_state(state, now=now)
+
 
 class RequestDetailScreen(_DismissableModal):
     """Full request metric and safe failure detail overlay."""
@@ -237,6 +276,17 @@ class RequestDetailScreen(_DismissableModal):
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="overlay-card request-detail-card"):
-            details = RequestDetails()
-            details.sync_state(self._state)
-            yield details
+            yield RequestDetails()
+
+    def on_mount(self) -> None:
+        self.query_one(RequestDetails).sync_state(self._state)
+
+    def sync_state(self, state: TuiState) -> None:
+        self._state = state
+        if self.is_mounted:
+            self.query_one(RequestDetails).sync_state(state)
+
+    def refresh_clock(self, state: TuiState, now: datetime) -> None:
+        self._state = state
+        if self.is_mounted:
+            self.query_one(RequestDetails).sync_state(state, now=now)

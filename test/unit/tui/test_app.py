@@ -12,17 +12,18 @@ from claude_code_proxy.tui.app import (
     ConnectionStatus,
     TuiApp,
 )
-from claude_code_proxy.tui.details import SessionDetails
+from claude_code_proxy.tui.details import RequestDetails, SessionDetails
 from claude_code_proxy.tui.screens import (
     FilterScreen,
     HelpScreen,
+    RequestDetailScreen,
     SearchScreen,
     SessionDetailScreen,
     SortScreen,
 )
 from claude_code_proxy.tui.state import SortField
 from claude_code_proxy.tui.widgets import RequestTable, SessionTable, WidthMode
-from test.unit.tui.support import reset, view
+from test.unit.tui.support import reset, view, with_requests
 
 
 class InertPump:
@@ -189,6 +190,108 @@ async def test_narrow_enter_opens_full_width_session_screen() -> None:
         await pilot.press("enter")
         assert isinstance(app.screen, SessionDetailScreen)
         await pilot.press("escape")
+
+
+async def test_short_terminal_enter_opens_full_width_session_screen() -> None:
+    app = app_with_data("safe-a")
+    async with app.run_test(size=(140, 18)) as pilot:
+        app.drain_pending()
+        await pilot.press("enter")
+
+        assert isinstance(app.screen, SessionDetailScreen)
+
+
+async def test_open_session_detail_receives_authoritative_reset() -> None:
+    app = app_with_data("safe-a")
+    async with app.run_test(size=(80, 24)) as pilot:
+        app.drain_pending()
+        await pilot.press("enter")
+        screen = app.screen
+        assert isinstance(screen, SessionDetailScreen)
+
+        app.pending.offer(
+            reset(view("safe-a", model="replacement-model"), sequence=8)
+        )
+        app.drain_pending()
+        await pilot.pause()
+
+        rendered = str(screen.query_one(SessionDetails).render())
+        assert "replacement-model" in rendered
+        assert "provider-model" not in rendered
+
+
+async def test_open_session_detail_refreshes_active_elapsed() -> None:
+    app = TuiApp(
+        Path("/safe/control.sock"), pump=InertPump(), start_stream=False
+    )
+    app.pending.offer(reset(view("safe-active", state="active")))
+    async with app.run_test(size=(80, 24)) as pilot:
+        app.drain_pending()
+        await pilot.press("enter")
+        screen = app.screen
+        assert isinstance(screen, SessionDetailScreen)
+        table = screen.query_one(RequestTable)
+        details = screen.query_one(RequestDetails)
+        before_row = table.get_cell("request-safe-active", "elapsed").plain
+        before_detail = str(details.render())
+
+        app.refresh_clock(now=datetime.now(UTC) + timedelta(seconds=2))
+        await pilot.pause()
+
+        assert table.get_cell("request-safe-active", "elapsed").plain != before_row
+        assert str(details.render()) != before_detail
+
+
+async def test_session_detail_request_selection_updates_visible_detail() -> None:
+    item = with_requests(
+        view("safe-a"), recent_ids=("recent-a", "recent-b")
+    )
+    app = TuiApp(
+        Path("/safe/control.sock"), pump=InertPump(), start_stream=False
+    )
+    app.pending.offer(reset(item))
+    async with app.run_test(size=(80, 24)) as pilot:
+        app.drain_pending()
+        await pilot.press("enter")
+        screen = app.screen
+        assert isinstance(screen, SessionDetailScreen)
+        table = screen.query_one(RequestTable)
+        details = screen.query_one(RequestDetails)
+        assert "recent-a" in str(details.render())
+
+        table.action_cursor_down()
+        await pilot.pause()
+
+        assert app.state.selected_request_id == "recent-b"
+        assert "recent-b" in str(details.render())
+
+
+async def test_open_request_detail_receives_reset_and_clock_refresh() -> None:
+    active = with_requests(view("safe-a"), active_ids=("request-a",))
+    app = TuiApp(
+        Path("/safe/control.sock"), pump=InertPump(), start_stream=False
+    )
+    app.pending.offer(reset(active))
+    async with app.run_test(size=(140, 40)) as pilot:
+        app.drain_pending()
+        screen = RequestDetailScreen(app.state)
+        app.push_screen(screen)
+        await pilot.pause()
+        details = screen.query_one(RequestDetails)
+        before = str(details.render())
+
+        app.refresh_clock(now=datetime.now(UTC) + timedelta(seconds=2))
+        await pilot.pause()
+        assert str(details.render()) != before
+
+        completed = with_requests(
+            view("safe-a"), recent_ids=("request-a",)
+        )
+        app.pending.offer(reset(completed, sequence=8))
+        app.drain_pending()
+        await pilot.pause()
+
+        assert "completed" in str(details.render())
 
 
 @pytest.mark.parametrize("key", ["q", "ctrl+c"])

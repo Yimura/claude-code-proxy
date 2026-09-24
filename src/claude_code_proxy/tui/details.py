@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from datetime import datetime
 
 from rich.text import Text
 from textual.widgets import Static
 
 from ..control.schemas import (
     MetricAggregateResponse,
+    PerformanceAgentIdentityResponse,
     RequestPerformanceResponse,
 )
-from .formatting import format_aggregate, metric_detail, safe_cell
+from .formatting import (
+    format_aggregate,
+    format_request_elapsed,
+    metric_detail,
+    safe_cell,
+)
 from .state import TuiState
 
 
@@ -35,12 +42,23 @@ class RequestDetails(Static):
     def __init__(self, *, id: str = "request-details") -> None:
         super().__init__(id=id, markup=False)
 
-    def sync_state(self, state: TuiState) -> None:
+    def sync_state(
+        self,
+        state: TuiState,
+        *,
+        now: datetime | None = None,
+    ) -> None:
         request = selected_request(state)
         if request is None:
             self.update(safe_cell("No request selected"))
             return
-        self.update(request_detail_text(request))
+        self.update(
+            request_detail_text(
+                request,
+                outcome=state.phase_for_request(request),
+                now=now,
+            )
+        )
 
 
 def session_detail_text(state: TuiState, identifier: str) -> Text:
@@ -75,35 +93,56 @@ def session_detail_text(state: TuiState, identifier: str) -> Text:
             f"{_aggregate_detail(performance.tool_calls)} / "
             f"{_aggregate_detail(performance.retries)}",
         ),
-        ("Latest result", session.last_result or "—"),
+        (
+            "Latest result",
+            performance.latest_request.outcome
+            if performance.latest_request is not None
+            else "—",
+        ),
     ]
     text = _detail_lines(lines)
-    text.append("\nAgents\n")
-    if not session.agents:
+    text.append_text(_agent_hierarchy(session.agents))
+    return text
+
+
+def _agent_hierarchy(
+    agents: tuple[PerformanceAgentIdentityResponse, ...],
+) -> Text:
+    text = Text("\nAgents\n")
+    if not agents:
         text.append_text(safe_cell("  none"))
-    for agent in session.agents:
+    for agent in agents:
         parent = agent.parent_id or "root"
         agent_line = (
             f"  {agent.id} · parent {parent} · model {agent.model} · "
-            f"state {agent.state} · requests {agent.requests} · "
-            f"active {agent.active_requests}"
+            f"state {agent.state} · effort {agent.effort} · "
+            f"requests {agent.requests} · active {agent.active_requests} · "
+            f"last seen {agent.last_seen.isoformat()}"
         )
         text.append_text(safe_cell(agent_line))
         text.append("\n")
     return text
 
 
-def request_detail_text(request: RequestPerformanceResponse) -> Text:
+def request_detail_text(
+    request: RequestPerformanceResponse,
+    *,
+    outcome: str | None = None,
+    now: datetime | None = None,
+) -> Text:
     """Build complete literal request detail content."""
     lines: list[tuple[str, object]] = [
         ("Request", request.id),
-        ("Operation / outcome", f"{request.operation} / {request.outcome}"),
+        (
+            "Operation / outcome",
+            f"{request.operation} / {outcome or request.outcome}",
+        ),
         ("Started", request.started_at.isoformat()),
         (
             "Finished",
             request.finished_at.isoformat() if request.finished_at else "active",
         ),
-        ("Duration", metric_detail(request.duration)),
+        ("Duration", format_request_elapsed(request, now=now)),
         ("Upstream", metric_detail(request.upstream_duration)),
         ("TTFT", metric_detail(request.ttft)),
         ("Input tokens", metric_detail(request.input_tokens)),

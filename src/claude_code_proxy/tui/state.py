@@ -17,6 +17,7 @@ from ..control.schemas import (
     PerformanceSessionIdentityResponse,
     PerformanceStreamEvent,
     ProcessIdentityResponse,
+    RequestPerformanceResponse,
     SessionPerformanceViewResponse,
 )
 from .formatting import cache_ratio_value, finite_non_negative
@@ -149,6 +150,15 @@ class TuiState:
         if observed is not None:
             return observed.phase
         return self.sessions[session_id].session.state
+
+    def phase_for_request(self, request: RequestPerformanceResponse) -> str:
+        """Return a transient phase only for its observed active request."""
+        if request.outcome != "active":
+            return request.outcome
+        observed = self.phases.get(request.session_id)
+        if observed is not None and observed.request_id == request.id:
+            return observed.phase
+        return "active"
 
     def select_session(self, session_id: str | None) -> TuiState:
         """Select a visible session and its first retained request."""

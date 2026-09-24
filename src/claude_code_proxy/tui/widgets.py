@@ -59,7 +59,7 @@ _MODE_COLUMNS = {
     WidthMode.WIDE: tuple(_COLUMNS),
     WidthMode.MEDIUM: (
         "session", "model", "state", "requests", "active", "elapsed",
-        "ttft", "tokens", "tools", "result",
+        "ttft", "tokens", "result",
     ),
     WidthMode.NARROW: (
         "session", "state", "elapsed", "ttft", "result",
@@ -77,6 +77,7 @@ class ConnectionStatusLike(Protocol):
 
 
 _REQUEST_COLUMNS: tuple[tuple[str, str, int], ...] = (
+    ("request", "REQUEST", 14),
     ("operation", "OPERATION", 12),
     ("outcome", "OUTCOME", 18),
     ("elapsed", "ELAPSED", 10),
@@ -248,7 +249,7 @@ def _session_cells(
         "cache": format_cache_ratio(performance),
         "tools": format_aggregate(performance.tool_calls),
         "retries": format_aggregate(performance.retries),
-        "result": session.last_result or "—",
+        "result": latest.outcome if latest is not None else "—",
     }
     return tuple(safe_cell(values[column]) for column in _MODE_COLUMNS[mode])
 
@@ -276,9 +277,9 @@ class RequestTable(DataTable[Text]):
         identifiers = tuple(item.id for item in requests)
         selected = state.selected_request_id or self.selected_key
         if identifiers != self._request_ids:
-            self._rebuild(requests, now)
+            self._rebuild(state, requests, now)
         else:
-            self._update_requests(requests, now)
+            self._update_requests(state, requests, now)
         self.select_key(selected)
 
     def select_key(self, identifier: str | None) -> None:
@@ -289,10 +290,15 @@ class RequestTable(DataTable[Text]):
         selected = state.selected_session_id
         if selected is None:
             return
-        self._update_requests(state.sessions[selected].performance.active_requests, now)
+        self._update_requests(
+            state,
+            state.sessions[selected].performance.active_requests,
+            now,
+        )
 
     def _rebuild(
         self,
+        state: TuiState,
         requests: tuple[RequestPerformanceResponse, ...],
         now: datetime | None,
     ) -> None:
@@ -300,12 +306,17 @@ class RequestTable(DataTable[Text]):
         for key, label, column_width in _REQUEST_COLUMNS:
             self.add_column(safe_cell(label), key=key, width=column_width)
         for request in requests:
-            self.add_row(*_request_cells(request, now), key=request.id, height=1)
+            self.add_row(
+                *_request_cells(state, request, now),
+                key=request.id,
+                height=1,
+            )
         self._columns_ready = True
         self._request_ids = tuple(item.id for item in requests)
 
     def _update_requests(
         self,
+        state: TuiState,
         requests: Iterable[RequestPerformanceResponse],
         now: datetime | None,
     ) -> None:
@@ -317,19 +328,21 @@ class RequestTable(DataTable[Text]):
             if request.id not in retained:
                 continue
             for column, value in zip(
-                columns, _request_cells(request, now), strict=True
+                columns, _request_cells(state, request, now), strict=True
             ):
                 self.update_cell(request.id, column, value)
 
 
 def _request_cells(
+    state: TuiState,
     request: RequestPerformanceResponse,
     now: datetime | None,
 ) -> tuple[Text, ...]:
     tokens = f"{metric_detail(request.input_tokens)} / {metric_detail(request.output_tokens)}"
     values = (
+        request.id,
         request.operation,
-        request.outcome,
+        state.phase_for_request(request),
         format_request_elapsed(request, now=now),
         format_latest_metric(request.ttft),
         tokens,

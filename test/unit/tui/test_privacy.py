@@ -45,6 +45,105 @@ async def test_session_id_filter_is_masked_and_cleared_before_dismiss() -> None:
     assert RAW not in repr(screen)
 
 
+async def test_switching_from_session_id_scrubs_before_unmasking() -> None:
+    app = TuiApp(
+        Path("/safe/control.sock"), pump=InertPump(), start_stream=False
+    )
+    callbacks: list[tuple[str, str]] = []
+    async with app.run_test(size=(100, 30)) as pilot:
+        screen = FilterScreen(
+            lambda field, value: (
+                callbacks.append((field, value)),
+                app.apply_filter(field, value),
+            )
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        screen.select_field("session_id")
+        field = screen.query_one("#filter-value", Input)
+        field.value = RAW
+
+        screen.select_field("id")
+        await pilot.pause()
+
+        assert field.value == ""
+        assert field.password is False
+        assert RAW not in str(field.render())
+        screen.submit_filter()
+        assert callbacks == []
+        assert app.state.filters == ()
+        assert RAW not in repr(app.state)
+        assert RAW not in repr(app)
+
+
+async def test_switching_to_session_id_clears_prior_unmasked_value() -> None:
+    app = TuiApp(
+        Path("/safe/control.sock"), pump=InertPump(), start_stream=False
+    )
+    callbacks: list[tuple[str, str]] = []
+    async with app.run_test(size=(100, 30)) as pilot:
+        screen = FilterScreen(
+            lambda field, value: callbacks.append((field, value))
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        field = screen.query_one("#filter-value", Input)
+        field.value = "ordinary-filter-marker"
+
+        screen.select_field("session_id")
+        await pilot.pause()
+
+        assert field.value == ""
+        assert field.password is True
+        screen.submit_filter()
+        assert callbacks == []
+        assert app.state.filters == ()
+
+
+async def test_escape_scrubs_masked_session_id_before_unmount() -> None:
+    app = TuiApp(
+        Path("/safe/control.sock"), pump=InertPump(), start_stream=False
+    )
+    callbacks: list[tuple[str, str]] = []
+    async with app.run_test(size=(100, 30)) as pilot:
+        screen = FilterScreen(
+            lambda field, value: callbacks.append((field, value))
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        screen.select_field("session_id")
+        field = screen.query_one("#filter-value", Input)
+        field.value = RAW
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert field.value == ""
+        assert callbacks == []
+        assert app.state.filters == ()
+        assert RAW not in repr(screen)
+        assert RAW not in repr(app.state)
+        assert RAW not in repr(app)
+
+
+async def test_programmatic_dismiss_scrubs_before_returning() -> None:
+    app = TuiApp(
+        Path("/safe/control.sock"), pump=InertPump(), start_stream=False
+    )
+    async with app.run_test(size=(100, 30)) as pilot:
+        screen = FilterScreen(lambda field, value: None)
+        app.push_screen(screen)
+        await pilot.pause()
+        screen.select_field("session_id")
+        field = screen.query_one("#filter-value", Input)
+        field.value = RAW
+
+        screen.dismiss()
+
+        assert field.value == ""
+        assert RAW not in repr(screen)
+
+
 async def test_raw_session_filter_retains_only_returned_safe_ids(
     monkeypatch,
 ) -> None:

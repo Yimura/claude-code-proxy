@@ -7,7 +7,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 
 from claude_code_proxy.tui.app import ConnectionPhase, ConnectionStatus
-from claude_code_proxy.tui.details import SessionDetails
+from claude_code_proxy.tui.details import RequestDetails, SessionDetails
 from claude_code_proxy.tui.state import StateDelta, TuiState, apply_stream_event
 from claude_code_proxy.tui.widgets import (
     ConnectionHeader,
@@ -15,7 +15,7 @@ from claude_code_proxy.tui.widgets import (
     SessionTable,
     WidthMode,
 )
-from test.unit.tui.support import reset, view, with_agent, with_requests
+from test.unit.tui.support import event, reset, view, with_agent, with_requests
 
 
 class WidgetHarness(App[None]):
@@ -24,6 +24,7 @@ class WidgetHarness(App[None]):
         yield SessionTable()
         yield SessionDetails()
         yield RequestTable()
+        yield RequestDetails()
 
 
 def state_with(*identifiers: str) -> TuiState:
@@ -31,6 +32,17 @@ def state_with(*identifiers: str) -> TuiState:
         TuiState.empty(), reset(*(view(item) for item in identifiers))
     )
     return state
+
+
+def view_with_latest_outcome(outcome: str):
+    item = view("safe-outcome")
+    payload = item.model_dump(mode="json")
+    request = payload["performance"]["recent_requests"][0]
+    request["outcome"] = outcome
+    payload["performance"]["latest_request"] = request
+    payload["performance"]["outcomes"] = {outcome: 1}
+    payload["session"]["last_result"] = "failed"
+    return type(item).model_validate(payload)
 
 
 @pytest.mark.parametrize(
@@ -50,7 +62,7 @@ def state_with(*identifiers: str) -> TuiState:
             WidthMode.MEDIUM,
             {
                 "session", "model", "state", "requests", "active",
-                "elapsed", "ttft", "tokens", "tools", "result",
+                "elapsed", "ttft", "tokens", "result",
             },
         ),
         (
@@ -174,9 +186,60 @@ async def test_request_table_orders_active_before_recent_and_uses_safe_keys() ->
             "active-b", "active-a", "recent-a", "recent-b"
         )
         assert {key.value for key in table.columns} == {
-            "operation", "outcome", "elapsed", "ttft", "tokens",
-            "tools", "retries",
+            "request", "operation", "outcome", "elapsed", "ttft",
+            "tokens", "tools", "retries",
         }
+        assert table.get_cell("active-b", "request").plain == "active-b"
+
+
+@pytest.mark.parametrize(
+    ("event_type", "expected_phase"),
+    [("request_started", "active"), ("tool_use", "tool-use")],
+)
+async def test_request_phase_applies_only_to_matching_active_request(
+    event_type: str,
+    expected_phase: str,
+) -> None:
+    item = with_requests(
+        view("safe-session"), active_ids=("phase-request", "other-request")
+    )
+    state, _ = apply_stream_event(TuiState.empty(), reset(item))
+    state, _ = apply_stream_event(
+        state,
+        event(item, event_type=event_type, sequence=8),
+    )
+    app = WidgetHarness()
+    async with app.run_test(size=(140, 40)) as pilot:
+        table = app.query_one(RequestTable)
+        details = app.query_one(RequestDetails)
+        table.sync_state(state)
+        details.sync_state(state)
+        await pilot.pause()
+
+        assert table.get_cell("phase-request", "outcome").plain == expected_phase
+        assert table.get_cell("other-request", "outcome").plain == "active"
+        assert f"messages / {expected_phase}" in str(details.render())
+
+        state = state.select_request("other-request")
+        details.sync_state(state)
+        assert "messages / active" in str(details.render())
+
+
+@pytest.mark.parametrize("outcome", ["cancelled", "client_disconnected"])
+async def test_session_result_uses_latest_request_outcome(outcome: str) -> None:
+    item = view_with_latest_outcome(outcome)
+    state, _ = apply_stream_event(TuiState.empty(), reset(item))
+    app = WidgetHarness()
+    async with app.run_test(size=(140, 40)):
+        table = app.query_one(SessionTable)
+        details = app.query_one(SessionDetails)
+        table.sync_state(
+            state, StateDelta(replace_all=True), mode=WidthMode.WIDE
+        )
+        details.sync_state(state)
+
+        assert table.get_cell("safe-outcome", "result").plain == outcome
+        assert f"Latest result: {outcome}" in str(details.render())
 
 
 async def test_header_shows_connection_retry_process_visibility_and_sort() -> None:
@@ -217,4 +280,6 @@ async def test_session_details_include_safe_agent_hierarchy_but_table_does_not()
         rendered = str(details.render())
         assert "safe-agent" in rendered
         assert "parent" in rendered
+        assert "effort high" in rendered
+        assert "last seen 2026-01-02T03:04:05+00:00" in rendered
         assert "reasoning" in rendered.casefold()

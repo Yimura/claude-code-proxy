@@ -162,6 +162,7 @@ class TuiApp(App[app_core.AppResult]):
         observed = now or datetime.now(UTC)
         self.query_one(SessionTable).refresh_active(self.state, observed)
         self.query_one(RequestTable).refresh_active(self.state, observed)
+        self._refresh_open_detail_clocks(observed)
         self._refresh_header(observed)
 
     def _refresh_all(self, delta: StateDelta) -> None:
@@ -171,9 +172,20 @@ class TuiApp(App[app_core.AppResult]):
         self.query_one(SessionDetails).sync_state(self.state)
         self.query_one(RequestTable).sync_state(self.state)
         self.query_one(RequestDetails).sync_state(self.state)
+        self._sync_open_details()
         self._refresh_header()
         self._refresh_empty_state()
         self._set_connection_class()
+
+    def _sync_open_details(self) -> None:
+        for screen in self.screen_stack:
+            if isinstance(screen, (SessionDetailScreen, RequestDetailScreen)):
+                screen.sync_state(self.state)
+
+    def _refresh_open_detail_clocks(self, now: datetime) -> None:
+        for screen in self.screen_stack:
+            if isinstance(screen, (SessionDetailScreen, RequestDetailScreen)):
+                screen.refresh_clock(self.state, now)
 
     def _apply_responsive_layout(self) -> None:
         self.width_mode = width_mode(self.size.width)
@@ -233,10 +245,12 @@ class TuiApp(App[app_core.AppResult]):
         self.query_one(SessionDetails).sync_state(self.state)
         self.query_one(RequestTable).sync_state(self.state)
         self.query_one(RequestDetails).sync_state(self.state)
+        self._sync_open_details()
 
     def _select_request(self, identifier: str) -> None:
         self.state = select_request(self.state, identifier)
         self.query_one(RequestDetails).sync_state(self.state)
+        self._sync_open_details()
 
     def action_select_next(self) -> None:
         table = _focused_table(self)
@@ -254,7 +268,7 @@ class TuiApp(App[app_core.AppResult]):
             return
         if self.state.selected_session_id is None:
             return
-        if self.width_mode is WidthMode.NARROW:
+        if not self.query_one("#details-pane").display:
             self.push_screen(SessionDetailScreen(self.state))
             return
         self.query_one(RequestTable).focus()
