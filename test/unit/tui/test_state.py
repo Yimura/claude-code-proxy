@@ -91,11 +91,15 @@ def test_event_appends_genuinely_new_session() -> None:
 def test_cursor_advances_without_row_change() -> None:
     state, _ = apply_stream_event(TuiState.empty(), reset(view("session")))
     sessions = state.sessions
+    process = state.process
+    captured_at = state.captured_at
 
     state, delta = apply_stream_event(state, cursor(8))
 
     assert state.cursor == 8
     assert state.sessions is sessions
+    assert state.process is process
+    assert state.captured_at is captured_at
     assert delta.changed_session_ids == frozenset()
     assert delta.replace_all is False
 

@@ -170,12 +170,7 @@ def apply_stream_event(
     if isinstance(event, PerformanceEventResponse):
         return _apply_event(state, event)
     if isinstance(event, PerformanceCursorResponse):
-        updated = replace(
-            state,
-            process=event.process,
-            captured_at=event.occurred_at,
-            cursor=event.sequence,
-        )
+        updated = replace(state, cursor=event.sequence)
         return updated, StateDelta()
     raise ValueError("unsupported performance stream event")
 
