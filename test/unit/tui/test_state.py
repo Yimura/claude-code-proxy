@@ -422,6 +422,29 @@ def test_every_dynamic_sort_obeys_direction_and_safe_id_tie_breaker(
 
 @pytest.mark.parametrize(
     "field",
+    tuple(
+        field
+        for field in SortField
+        if field not in {SortField.BASELINE, SortField.SESSION_ID}
+    ),
+)
+@pytest.mark.parametrize("direction", tuple(SortDirection))
+def test_dynamic_sort_ties_use_safe_id_in_both_directions(
+    field: SortField,
+    direction: SortDirection,
+) -> None:
+    state, _ = apply_stream_event(
+        TuiState.empty(),
+        reset(view("b"), view("a")),
+    )
+
+    state = with_sort(state, SortSpec(field, direction))
+
+    assert visible_session_ids(state) == ("a", "b")
+
+
+@pytest.mark.parametrize(
+    "field",
     [
         SortField.ELAPSED,
         SortField.TTFT,
