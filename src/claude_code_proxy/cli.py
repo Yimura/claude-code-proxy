@@ -7,7 +7,8 @@ from dataclasses import replace
 from datetime import datetime
 import json
 from pathlib import Path
-from typing import Annotated, TYPE_CHECKING
+import sys
+from typing import Annotated, Any, TYPE_CHECKING
 
 import typer
 
@@ -67,6 +68,55 @@ app = typer.Typer(
 )
 
 app.command(name="perf", help="Show or watch performance telemetry.")(_performance_report)
+
+
+def _interactive_tty() -> bool:
+    """Return whether both terminal streams are interactive."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _load_tui_runner() -> Callable[[Path], Any]:
+    """Load Textual only after command validation and TTY checks."""
+    from .tui import run
+
+    return run
+
+
+def _report_tui_failure(message: str) -> None:
+    typer.echo(f"Error: {_bounded_error(message)}", err=True)
+    typer.echo(
+        "source: start `claude-code-proxy proxy --performance collector`",
+        err=True,
+    )
+    typer.echo(
+        "Docker: run `docker compose exec proxy claude-code-proxy tui`",
+        err=True,
+    )
+
+
+@app.command()
+def tui(
+    socket: Annotated[
+        Path | None,
+        typer.Option("--socket", help="Control Unix socket path."),
+    ] = None,
+) -> None:
+    """Open the interactive live performance dashboard."""
+    if not _interactive_tty():
+        typer.echo("Error: tui requires interactive TTY input and output", err=True)
+        raise typer.Exit(code=1)
+    try:
+        _load_current_directory_environment()
+        socket_path = resolve_socket_path(socket)
+        result = _load_tui_runner()(socket_path)
+    except KeyboardInterrupt:
+        return
+    except Exception:
+        _report_tui_failure("Unable to start interactive dashboard")
+        raise typer.Exit(code=1) from None
+    if result.exit_code:
+        _report_tui_failure(result.message or "Interactive dashboard stopped")
+        raise typer.Exit(code=1)
 
 
 def _configure_proxy_logging() -> None:
