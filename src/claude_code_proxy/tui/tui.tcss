@@ -1,0 +1,128 @@
+Screen {
+    layout: vertical;
+    background: $surface;
+    color: $text;
+}
+
+#connection-header {
+    height: 1;
+    width: 100%;
+    padding: 0 1;
+    background: $primary-background;
+    color: $text;
+}
+
+#dashboard {
+    height: 1fr;
+    width: 100%;
+}
+
+#empty-state {
+    height: auto;
+    min-height: 1;
+    padding: 1 2;
+    color: $text-muted;
+    text-align: center;
+}
+
+#session-table {
+    height: 2fr;
+    width: 100%;
+}
+
+#details-pane {
+    height: 2fr;
+    min-height: 10;
+    layout: grid;
+    grid-size: 2 2;
+    grid-columns: 1fr 2fr;
+    grid-rows: 1fr 1fr;
+    border-top: solid $primary;
+}
+
+#session-details {
+    row-span: 2;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+#request-table {
+    height: 1fr;
+}
+
+#request-details {
+    height: 1fr;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+Screen.disconnected #dashboard {
+    opacity: 55%;
+}
+
+DataTable:focus {
+    border: solid $accent;
+}
+
+DataTable > .datatable--cursor {
+    background: $accent 35%;
+    color: $text;
+    text-style: bold;
+}
+
+Screen.narrow #session-table,
+Screen.short #session-table {
+    height: 1fr;
+}
+
+.overlay-card {
+    width: 72;
+    max-width: 95%;
+    height: auto;
+    max-height: 90%;
+    align: center middle;
+    padding: 1 2;
+    border: round $primary;
+    background: $panel;
+}
+
+.help-card {
+    width: 54;
+}
+
+.request-detail-card {
+    height: 85%;
+    overflow-y: auto;
+}
+
+.overlay-hint {
+    height: 1;
+    color: $text-muted;
+    margin-top: 1;
+}
+
+ModalScreen {
+    align: center middle;
+    background: $background 65%;
+}
+
+SessionDetailScreen {
+    layout: vertical;
+    padding: 0 1;
+}
+
+#screen-session-details {
+    height: auto;
+    max-height: 45%;
+    overflow-y: auto;
+}
+
+#screen-request-table {
+    height: 1fr;
+}
+
+#screen-request-details {
+    height: auto;
+    max-height: 45%;
+    overflow-y: auto;
+}
