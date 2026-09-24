@@ -192,13 +192,17 @@ def with_aggregates(
 def reset(
     *views: SessionPerformanceViewResponse,
     sequence: int = 7,
+    process_pid: int = 42,
 ) -> PerformanceResetResponse:
     snapshot = performance_response().model_dump(mode="json")
+    process = deepcopy(_PROCESS)
+    process["pid"] = process_pid
+    snapshot["process"] = process
     snapshot["cursor"] = sequence
     snapshot["sessions"] = [item.model_dump(mode="json") for item in views]
     return PerformanceResetResponse.model_validate(
         {
-            "process": snapshot["process"],
+            "process": process,
             "sequence": sequence,
             "occurred_at": snapshot["captured_at"],
             "type": "reset",
@@ -212,12 +216,15 @@ def event(
     *,
     event_type: str,
     sequence: int,
+    process_pid: int = 42,
 ) -> PerformanceEventResponse:
     request = item.performance.latest_request
     assert request is not None
+    process = deepcopy(_PROCESS)
+    process["pid"] = process_pid
     return PerformanceEventResponse.model_validate(
         {
-            "process": deepcopy(_PROCESS),
+            "process": process,
             "sequence": sequence,
             "occurred_at": _CAPTURED_AT,
             "type": event_type,
@@ -229,10 +236,16 @@ def event(
     )
 
 
-def cursor(sequence: int) -> PerformanceCursorResponse:
+def cursor(
+    sequence: int,
+    *,
+    process_pid: int = 42,
+) -> PerformanceCursorResponse:
+    process = deepcopy(_PROCESS)
+    process["pid"] = process_pid
     return PerformanceCursorResponse.model_validate(
         {
-            "process": deepcopy(_PROCESS),
+            "process": process,
             "sequence": sequence,
             "occurred_at": _CAPTURED_AT,
             "type": "cursor",

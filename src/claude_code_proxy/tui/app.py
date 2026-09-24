@@ -24,6 +24,13 @@ from ..control.schemas import (
 _BACKOFF_SECONDS = (0.5, 1.0, 2.0, 4.0)
 _INVALID_STREAM = "Control API returned an invalid performance event stream"
 _STREAM_CLOSED = "Performance stream closed"
+_PROTOCOL_MESSAGE = (
+    "TUI requires control protocol v1 with performance and "
+    "performance_events capabilities"
+)
+_UNAVAILABLE_MESSAGE = (
+    "Unable to connect to the performance event stream after retries"
+)
 
 
 class PendingEvents:
@@ -61,17 +68,39 @@ class PendingEvents:
             return items
 
     def _offer_reset(self, event: PerformanceResetResponse) -> None:
-        if self._reset is not None and event.sequence <= self._reset.sequence:
+        current = self._reset
+        if current is not None and current.process != event.process:
+            self._events.clear()
+            self._cursor = None
+        elif current is not None and event.sequence <= current.sequence:
             return
+        else:
+            self._discard_items_superseded_by(event)
         self._reset = event
-        self._events.clear()
-        self._cursor = None
+
+    def _discard_items_superseded_by(
+        self,
+        reset: PerformanceResetResponse,
+    ) -> None:
+        self._events = {
+            session_id: event
+            for session_id, event in self._events.items()
+            if event.process == reset.process and event.sequence > reset.sequence
+        }
+        if self._cursor is not None and (
+            self._cursor.process != reset.process
+            or self._cursor.sequence <= reset.sequence
+        ):
+            self._cursor = None
 
     def _is_superseded_by_reset(
         self,
         event: PerformanceEventResponse | PerformanceCursorResponse,
     ) -> bool:
-        return self._reset is not None and event.sequence <= self._reset.sequence
+        return self._reset is not None and (
+            event.process != self._reset.process
+            or event.sequence <= self._reset.sequence
+        )
 
     def _offer_event(self, event: PerformanceEventResponse) -> None:
         current = self._events.get(event.session_id)
@@ -149,12 +178,12 @@ class ConnectionPump:
                 if self._stopped.is_set():
                     return AppResult(0)
                 raise ControlError(_STREAM_CLOSED)
-            except IncompatibleProtocol as error:
-                return AppResult(1, str(error))
-            except (ControlUnavailable, ControlError) as error:
+            except IncompatibleProtocol:
+                return AppResult(1, _PROTOCOL_MESSAGE)
+            except (ControlUnavailable, ControlError):
                 if saw_reset:
                     failures = 0
-                outcome = self._retry(error, failures, on_status)
+                outcome = self._retry(failures, on_status)
                 if isinstance(outcome, AppResult):
                     return outcome
                 failures = outcome
@@ -170,13 +199,12 @@ class ConnectionPump:
 
     def _retry(
         self,
-        error: ControlError,
         failures: int,
         on_status: Callable[[ConnectionStatus], None],
     ) -> int | AppResult:
         on_status(ConnectionStatus(ConnectionPhase.DISCONNECTED, failures))
         if failures >= len(_BACKOFF_SECONDS):
-            return AppResult(1, str(error))
+            return AppResult(1, _UNAVAILABLE_MESSAGE)
         delay = _BACKOFF_SECONDS[failures]
         next_failure = failures + 1
         on_status(
@@ -193,7 +221,12 @@ class ConnectionPump:
     ) -> None:
         client = self._client_factory(self._socket_path)
         with self._lock:
-            self._active_client = client
+            stopped = self._stopped.is_set()
+            if not stopped:
+                self._active_client = client
+        if stopped:
+            client.close()
+            return
         try:
             with client:
                 with client.performance_events() as stream:

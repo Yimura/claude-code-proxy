@@ -18,6 +18,13 @@ from claude_code_proxy.tui.app import (
 from test.unit.tui.support import cursor, event, reset, view
 
 _SOCKET_PATH = Path("/run/control.sock")
+_PROTOCOL_MESSAGE = (
+    "TUI requires control protocol v1 with performance and "
+    "performance_events capabilities"
+)
+_UNAVAILABLE_MESSAGE = (
+    "Unable to connect to the performance event stream after retries"
+)
 
 
 def test_pending_events_keep_latest_complete_event_per_session() -> None:
@@ -48,6 +55,50 @@ def test_reset_supersedes_older_pending_and_keeps_newer_events() -> None:
     batch = pending.drain()
 
     assert [item.sequence for item in batch] == [20, 21, 22]
+
+
+def test_new_process_reset_replaces_higher_sequence_pending_reset() -> None:
+    pending = PendingEvents()
+    active = view("session", state="active")
+    pending.offer(reset(active, sequence=100, process_pid=41))
+    pending.offer(event(active, event_type="progress", sequence=101, process_pid=41))
+
+    pending.offer(reset(active, sequence=0, process_pid=42))
+
+    batch = pending.drain()
+    assert [(item.process.pid, item.sequence) for item in batch] == [(42, 0)]
+
+
+def test_same_process_reset_keeps_already_buffered_newer_items() -> None:
+    pending = PendingEvents()
+    active = view("session", state="active")
+    pending.offer(event(active, event_type="progress", sequence=21))
+    pending.offer(cursor(22))
+
+    pending.offer(reset(active, sequence=20))
+
+    assert [item.sequence for item in pending.drain()] == [20, 21, 22]
+
+
+def test_same_process_stale_reset_does_not_replace_pending_reset() -> None:
+    pending = PendingEvents()
+    active = view("session", state="active")
+    pending.offer(reset(active, sequence=20))
+
+    pending.offer(reset(active, sequence=19))
+
+    assert [item.sequence for item in pending.drain()] == [20]
+
+
+def test_pending_reset_rejects_late_items_from_another_process() -> None:
+    pending = PendingEvents()
+    active = view("session", state="active")
+    pending.offer(reset(active, sequence=20, process_pid=42))
+
+    pending.offer(event(active, event_type="progress", sequence=21, process_pid=41))
+    pending.offer(cursor(22, process_pid=41))
+
+    assert [item.sequence for item in pending.drain()] == [20]
 
 
 def test_pending_events_ignore_items_not_newer_than_reset() -> None:
@@ -116,8 +167,10 @@ class FakeClient:
         self.stream: FakeStream | None = None
         self.closed = False
         self.close_calls = 0
+        self.enter_calls = 0
 
     def __enter__(self):
+        self.enter_calls += 1
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -170,8 +223,7 @@ def test_connection_pump_retries_with_exact_backoff_then_fails() -> None:
     assert statuses[0].phase is ConnectionPhase.CONNECTING
     assert sum(status.phase is ConnectionPhase.RECONNECTING for status in statuses) == 4
     assert all(status.phase is not ConnectionPhase.CONNECTED for status in statuses)
-    assert result.exit_code == 1
-    assert "missing" in result.message
+    assert result == AppResult(1, _UNAVAILABLE_MESSAGE)
 
 
 def test_fresh_reset_resets_retry_failure_budget() -> None:
@@ -194,7 +246,7 @@ def test_fresh_reset_resets_retry_failure_budget() -> None:
     result = pump.run(lambda item: None, lambda status: None)
 
     assert waits == [0.5, 0.5, 1.0, 2.0, 4.0]
-    assert result == AppResult(1, str(unavailable("fifth")))
+    assert result == AppResult(1, _UNAVAILABLE_MESSAGE)
 
 
 def test_stream_eof_after_reset_is_retryable() -> None:
@@ -216,7 +268,7 @@ def test_stream_eof_after_reset_is_retryable() -> None:
 
     assert waits == [0.5]
     assert len(delivered) == 1
-    assert result == AppResult(1, "stop after proving retry")
+    assert result == AppResult(1, _PROTOCOL_MESSAGE)
 
 
 def test_control_error_is_retryable_and_first_item_must_be_reset() -> None:
@@ -238,7 +290,7 @@ def test_control_error_is_retryable_and_first_item_must_be_reset() -> None:
     result = pump.run(lambda item: None, lambda status: None)
 
     assert waits == [0.5, 1.0]
-    assert result == AppResult(1, "fatal")
+    assert result == AppResult(1, _PROTOCOL_MESSAGE)
 
 
 def test_connection_pump_does_not_retry_protocol_mismatch() -> None:
@@ -254,8 +306,23 @@ def test_connection_pump_does_not_retry_protocol_mismatch() -> None:
     result = pump.run(lambda item: None, lambda status: None)
 
     assert waits == []
-    assert result.exit_code == 1
-    assert result.message == "missing performance_events"
+    assert result == AppResult(1, _PROTOCOL_MESSAGE)
+
+
+def test_retry_failure_does_not_retain_sensitive_error_details() -> None:
+    marker = "Authorization=secret provider body"
+    pump = ConnectionPump(
+        _SOCKET_PATH,
+        client_factory=SequencedClientFactory([ControlError(marker)] * 5),
+        wait=lambda delay: False,
+    )
+
+    result = pump.run(lambda item: None, lambda status: None)
+
+    assert result == AppResult(1, _UNAVAILABLE_MESSAGE)
+    for sensitive in ("Authorization", "secret", "provider body"):
+        assert sensitive not in result.message
+        assert sensitive not in repr(result)
 
 
 class BlockingStream(FakeStream):
@@ -335,3 +402,22 @@ def test_stop_event_interrupts_backoff_wait() -> None:
 
     assert not worker.is_alive()
     assert results == [AppResult(0)]
+
+
+def test_stop_during_client_factory_closes_without_opening_client() -> None:
+    client = FakeClient(())
+    pump: ConnectionPump
+
+    def stopping_factory(socket_path: Path) -> FakeClient:
+        assert socket_path == _SOCKET_PATH
+        pump.stop()
+        return client
+
+    pump = ConnectionPump(_SOCKET_PATH, client_factory=stopping_factory)
+
+    result = pump.run(lambda item: None, lambda status: None)
+
+    assert result == AppResult(0)
+    assert client.close_calls == 1
+    assert client.enter_calls == 0
+    assert client.stream is None
