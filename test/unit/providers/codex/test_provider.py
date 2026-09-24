@@ -25,6 +25,11 @@ from claude_code_proxy.providers.base import ProviderError
 from claude_code_proxy.providers.codex.orchestration import (
     AGENT_COMPLETION_POLICY,
     AGENT_GUIDANCE,
+    AGENT_SCOPE_POLICY,
+    DISCOVERY_POLICY,
+    SEND_MESSAGE_GUIDANCE,
+    SUBAGENT_AGENT_GUIDANCE,
+    SUBAGENT_SCOPE_POLICY,
     TASK_OUTPUT_GUIDANCE,
 )
 from claude_code_proxy.providers.codex.provider import (
@@ -1239,21 +1244,43 @@ async def test_count_tokens_uses_local_counter_only():
     assert calls[0].model == "openai/gpt-5"
 
 
-async def test_stream_applies_codex_agent_completion_guidance():
+async def test_stream_applies_codex_agent_orchestration_guidance():
     Client.responses = [completed_response()]
 
     await collect(CodexProvider(Auth(), Client), orchestration_request())
 
     payload = Client.requests[0][2]["json"]
-    assert payload["instructions"] == f"base system\n\n{AGENT_COMPLETION_POLICY}"
+    expected = "\n\n".join((
+        "base system",
+        AGENT_COMPLETION_POLICY,
+        AGENT_SCOPE_POLICY,
+        DISCOVERY_POLICY,
+    ))
+    assert payload["instructions"] == expected
     assert payload["tools"][0]["description"].endswith(AGENT_GUIDANCE)
-    assert payload["tools"][1]["description"].endswith(TASK_OUTPUT_GUIDANCE)
+    assert payload["tools"][1]["description"].endswith(SEND_MESSAGE_GUIDANCE)
+    assert payload["tools"][2]["description"].endswith(TASK_OUTPUT_GUIDANCE)
     source_tools = orchestration_request().tools
-    assert payload["tools"][0]["parameters"] == source_tools[0].input_schema
-    assert payload["tools"][1]["parameters"] == source_tools[1].input_schema
+    for translated, source in zip(payload["tools"], source_tools, strict=True):
+        assert translated["parameters"] == source.input_schema
 
 
-async def test_count_tokens_applies_codex_agent_completion_guidance():
+async def test_stream_applies_subagent_scope_guidance():
+    Client.responses = [completed_response()]
+
+    await collect(
+        CodexProvider(Auth(), Client),
+        orchestration_request(agent_id="worker-1"),
+    )
+
+    payload = Client.requests[0][2]["json"]
+    assert payload["instructions"].endswith(SUBAGENT_SCOPE_POLICY)
+    assert payload["tools"][0]["description"].endswith(
+        f"{AGENT_GUIDANCE}\n\n{SUBAGENT_AGENT_GUIDANCE}"
+    )
+
+
+async def test_count_tokens_applies_codex_agent_orchestration_guidance():
     captured = []
 
     async def count_tokens(completion_request, telemetry=None):
@@ -1263,6 +1290,10 @@ async def test_count_tokens_applies_codex_agent_completion_guidance():
     provider = CodexProvider(Auth(), Client, token_counter=count_tokens)
 
     assert await provider.count_tokens(orchestration_request()) == 17
-    assert captured[0].system[-1] == TextBlock(AGENT_COMPLETION_POLICY)
+    assert captured[0].system[-2:] == (
+        TextBlock(AGENT_SCOPE_POLICY),
+        TextBlock(DISCOVERY_POLICY),
+    )
     assert captured[0].tools[0].description.endswith(AGENT_GUIDANCE)
-    assert captured[0].tools[1].description.endswith(TASK_OUTPUT_GUIDANCE)
+    assert captured[0].tools[1].description.endswith(SEND_MESSAGE_GUIDANCE)
+    assert captured[0].tools[2].description.endswith(TASK_OUTPUT_GUIDANCE)
