@@ -14,9 +14,21 @@
     "big": "sol"
   },
   "mappings": {
-    "haiku": {"tier": "small", "effort": "medium"},
-    "sonnet": {"tier": "big", "effort": "medium"},
-    "opus": {"tier": "big", "effort": "high"},
-    "fable": {"model": "sol", "effort": "xhigh"}
+    "haiku": {
+      "model": "terra",
+      "effort": "medium"
+    },
+    "sonnet": {
+      "model": "sol",
+      "effort": "low"
+    },
+    "opus": {
+      "model": "sol",
+      "effort": "medium"
+    },
+    "fable": {
+      "model": "sol",
+      "effort": "xhigh"
+    }
   }
 }
