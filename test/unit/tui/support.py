@@ -13,6 +13,7 @@ from claude_code_proxy.control.schemas import (
 )
 from test.unit.test_performance_cli import (
     aggregate,
+    metric,
     performance_response,
     request_payload,
     view_payload,
@@ -136,6 +137,41 @@ def with_agent(
     )
     identity = item.session.model_copy(update={"agents": (agent,)})
     return item.model_copy(update={"session": identity})
+
+
+def with_latest_metrics(
+    item: SessionPerformanceViewResponse,
+    *,
+    duration: int | float | None = None,
+    ttft: int | float | None = None,
+) -> SessionPerformanceViewResponse:
+    payload = item.model_dump(mode="json")
+    latest = payload["performance"]["latest_request"]
+    assert latest is not None
+    if duration is not None:
+        latest["duration"] = metric(value=duration)
+    if ttft is not None:
+        latest["ttft"] = metric(value=ttft)
+    payload["performance"]["recent_requests"][0] = latest
+    return SessionPerformanceViewResponse.model_validate(payload)
+
+
+def without_requests(
+    item: SessionPerformanceViewResponse,
+) -> SessionPerformanceViewResponse:
+    payload = item.model_dump(mode="json")
+    performance = payload["performance"]
+    performance["requests"] = 0
+    performance["active_requests"] = []
+    performance["recent_requests"] = []
+    performance["outcomes"] = {}
+    performance["current_concurrency"] = 0
+    performance["latest_request"] = None
+    session = payload["session"]
+    session["requests"] = 0
+    session["active_requests"] = 0
+    session["last_result"] = None
+    return SessionPerformanceViewResponse.model_validate(payload)
 
 
 def with_aggregates(
