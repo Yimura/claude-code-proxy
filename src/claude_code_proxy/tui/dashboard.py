@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
+from concurrent.futures import CancelledError
 from datetime import UTC, datetime
 from pathlib import Path
+import threading
 from typing import cast
 
-from textual import events, work
+from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Container, Vertical
 from textual.widgets import DataTable, Footer, Static
@@ -94,6 +97,7 @@ class TuiApp(App[app_core.AppResult]):
         self._pump = pump or app_core.ConnectionPump(socket_path)
         self._start_stream = start_stream
         self._stream_stopped = False
+        self._stream_thread: threading.Thread | None = None
 
     def compose(self) -> ComposeResult:
         yield ConnectionHeader()
@@ -113,7 +117,7 @@ class TuiApp(App[app_core.AppResult]):
         self._refresh_all(StateDelta(replace_all=True))
         self.query_one(SessionTable).focus()
         if self._start_stream:
-            self._run_stream()
+            self._start_stream_thread()
 
     def on_resize(self, event: events.Resize) -> None:
         self._apply_responsive_layout()
@@ -122,13 +126,35 @@ class TuiApp(App[app_core.AppResult]):
     def on_unmount(self) -> None:
         self.stop_stream()
 
-    @work(thread=True, name="performance-stream", exclusive=True, exit_on_error=False)
+    def _start_stream_thread(self) -> None:
+        """Start a daemon so an uninterruptible socket read cannot block exit."""
+        thread = threading.Thread(
+            target=self._run_stream,
+            name="performance-stream",
+            daemon=True,
+        )
+        self._stream_thread = thread
+        thread.start()
+
     def _run_stream(self) -> None:
         result = self._pump.run(
             self.pending.offer,
-            lambda status: self.call_from_thread(self.accept_status, status),
+            lambda status: self._call_from_stream(self.accept_status, status),
         )
-        self.call_from_thread(self._finish_stream, result)
+        self._call_from_stream(self._finish_stream, result)
+
+    def _call_from_stream(
+        self,
+        callback: Callable[..., object],
+        *args: object,
+    ) -> None:
+        if self._stream_stopped:
+            return
+        try:
+            self.call_from_thread(callback, *args)
+        except CancelledError:
+            if not self._stream_stopped:
+                raise
 
     def stop_stream(self) -> None:
         """Idempotently stop the control stream and close its active client."""
