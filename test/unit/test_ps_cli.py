@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+from click import unstyle
 from wcwidth import wcswidth
 
 from claude_code_proxy import cli as cli_module
@@ -56,9 +57,10 @@ def test_ps_watch_table_rejects_non_tty_before_environment_or_client(
     result = runner.invoke(app, ["ps", "--watch"])
 
     assert result.exit_code == 2
-    assert "--watch" in result.stderr
-    assert "--format" in result.stderr
-    assert "json instead" in result.stderr
+    stderr = unstyle(result.stderr)
+    assert "--watch" in stderr
+    assert "--format" in stderr
+    assert "json instead" in stderr
     assert FakeClient.instances == []
 
 
