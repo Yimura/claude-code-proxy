@@ -110,9 +110,13 @@ uv run claude-code-proxy ps --filter state=active --filter provider=openai
 uv run claude-code-proxy ps --filter session_id=abc123 --format json
 uv run claude-code-proxy ps --format json
 uv run claude-code-proxy ps --no-trunc
+uv run claude-code-proxy ps --watch
+uv run claude-code-proxy ps --watch --format json
 ```
 
 Filters use `key=value` and may be repeated. Repeated values for one key are alternatives, while different keys are combined. Supported keys are `id`, `session_id`, `state`, `provider`, `transport`, `model`, and `effort`. `id` accepts an unambiguous prefix of the opaque public ID. `session_id` accepts an exact raw client session ID, hashes it internally, and returns only the matching opaque row; the raw value remains transient private-control input and is never included in registry snapshots or command output. Output defaults to a table, `--format json` returns the complete structured rows, and `--no-trunc` preserves full session and model values in table output. Source commands automatically select a socket under `XDG_RUNTIME_DIR` or another private runtime fallback. Use `--socket PATH` to override the socket for one command, or set `CONTROL_SOCKET_PATH` to an absolute socket path whose private parent directory already exists.
+
+`ps --watch` table output renders the same normal `ps` table immediately, then refreshes it in place once per second. It requires TTY standard output and rewrites only rows owned by the previous frame; it does not clear or take over the whole terminal. With `--format json`, `ps --watch` works through pipes and non-TTY output as JSON Lines: one compact JSON array per line. Each array is a complete session snapshot with the same fields and ordering as one-shot JSON.
 
 Each row has a safe, opaque, process-local hashed session ID. States are `active` while one or more requests are running, `idle` after the latest request completes, and `failed` after the latest request fails. Rows and their latest metadata are retained in memory only until the proxy process restarts; they are not prompt history. By default the registry retains the 1,000 most recently inactive logical rows, while active rows are never evicted.
 
@@ -156,7 +160,7 @@ Every metric distinguishes three states. `observed` includes zero as a real valu
 
 History and aggregates are memory-only. Each retained session keeps its latest 20 finalized requests plus current active requests; lifetime aggregates cover the retained session row for the current process. A restart clears every row, aggregate, cursor, and event. The process-wide 4,096-event journal feeds each watcher through a bounded 64-event subscriber queue. Ordinary events carry increasing `sequence` values. A reset frame contains a current snapshot and its `cursor`; cursor-control frames advance filtered streams when an ordinary event does not match. A stale cursor, process mismatch, restart, or subscriber overflow produces another reset instead of pretending continuity.
 
-`perf --watch` is snapshot-first when no valid resume cursor exists, then append-only. The CLI validates each NDJSON frame, emits each event once, does not reconnect, exits cleanly on an interrupt, and reports clean EOF rather than silently waiting on a replacement process.
+`perf --watch` is an append-only performance event stream, not repeated session snapshots. It is snapshot-first when no valid resume cursor exists, then emits appended events. The CLI validates each NDJSON frame, emits each event once, does not reconnect, exits cleanly on an interrupt, and reports clean EOF rather than silently waiting on a replacement process.
 
 ### Interactive live TUI
 
