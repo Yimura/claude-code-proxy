@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 import json
-import math
 from pathlib import Path
 from typing import Annotated
 
@@ -26,11 +25,8 @@ from .control.client import (
     IncompatibleProtocol,
 )
 from .control.schemas import (
-    MetricAggregateResponse,
-    MetricResponse,
     PerformanceListResponse,
     PerformanceStreamEvent,
-    SessionPerformanceResponse,
     SessionPerformanceViewResponse,
 )
 from .control.socket import resolve_socket_path
@@ -38,6 +34,12 @@ from .performance_watch_cli import (
     INVALID_PERFORMANCE_STREAM,
     render_watch_event,
     watch_table_header,
+)
+from .tui.formatting import (
+    format_aggregate as _format_aggregate,
+    format_cache_ratio as _format_cache_ratio,
+    format_latest_metric as _format_latest_metric,
+    format_session_tokens as _format_tokens,
 )
 
 _MODEL_DISPLAY_LENGTH = 24
@@ -225,78 +227,3 @@ def _display_model(value: str, no_trunc: bool) -> str:
     if no_trunc:
         return terminal_text(value)
     return terminal_text(value, maximum=_MODEL_DISPLAY_LENGTH)
-
-
-def _format_latest_metric(metric: MetricResponse | None) -> str:
-    if metric is None or metric.status != "observed":
-        return "—"
-    value = _finite_non_negative(metric.value)
-    return f"{value:.2f}s"
-
-
-def _format_tokens(performance: SessionPerformanceResponse) -> str:
-    input_metrics = (
-        performance.input_tokens,
-        performance.cache_read_tokens,
-        performance.cache_creation_tokens,
-    )
-    input_total = _format_aggregate_group(input_metrics)
-    output_total = _format_aggregate(performance.output_tokens)
-    return f"{input_total} / {output_total}"
-
-
-def _format_aggregate_group(
-    metrics: tuple[MetricAggregateResponse, ...],
-) -> str:
-    observed = sum(item.observed_samples for item in metrics)
-    if observed == 0:
-        return "—"
-    value = sum(item.value for item in metrics)
-    partial = any(item.unavailable_samples for item in metrics)
-    return _format_number(value) + ("+?" if partial else "")
-
-
-def _format_aggregate(metric: MetricAggregateResponse) -> str:
-    if metric.observed_samples == 0:
-        return "—"
-    marker = "+?" if metric.unavailable_samples else ""
-    return _format_number(metric.value) + marker
-
-
-def _format_cache_ratio(performance: SessionPerformanceResponse) -> str:
-    cache_metrics = (
-        performance.cache_read_tokens,
-        performance.cache_creation_tokens,
-    )
-    if any(item.not_applicable_samples for item in cache_metrics):
-        return "—"
-    metrics = (performance.input_tokens, *cache_metrics)
-    observed = sum(item.observed_samples for item in metrics)
-    if observed == 0 or performance.cache_read_tokens.observed_samples == 0:
-        return "—"
-    total = sum(item.value for item in metrics)
-    ratio = 0.0 if total == 0 else performance.cache_read_tokens.value / total * 100
-    marker = "+?" if any(item.unavailable_samples for item in metrics) else ""
-    return _format_percentage(ratio) + marker
-
-
-def _format_percentage(value: float) -> str:
-    rounded = round(_finite_non_negative(value), 1)
-    if rounded.is_integer():
-        return f"{int(rounded)}%"
-    return f"{rounded:.1f}%"
-
-
-def _format_number(value: int | float) -> str:
-    safe = _finite_non_negative(value)
-    if isinstance(safe, float) and not safe.is_integer():
-        return f"{safe:g}"
-    return str(int(safe))
-
-
-def _finite_non_negative(value: object) -> int | float:
-    if type(value) not in (int, float):
-        raise ValueError("metric is not numeric")
-    if value < 0 or isinstance(value, float) and not math.isfinite(value):
-        raise ValueError("metric is not finite and non-negative")
-    return value

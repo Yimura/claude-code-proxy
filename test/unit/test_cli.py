@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
+from types import SimpleNamespace
 
 import pytest
 from click import unstyle
@@ -23,6 +24,7 @@ def test_bare_app_shows_help_successfully() -> None:
     assert "proxy" in result.stdout
     assert "ps" in result.stdout
     assert "perf" in result.stdout
+    assert "tui" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -313,11 +315,19 @@ def test_installed_script_and_module_adapter_subprocess_help() -> None:
         assert "proxy" in completed.stdout
         assert "ps" in completed.stdout
         assert "perf" in completed.stdout
+        assert "tui" in completed.stdout
 
 
 
 @pytest.mark.parametrize(
-    "arguments", [["--help"], ["proxy", "--help"], ["ps", "--help"], ["perf", "--help"]]
+    "arguments",
+    [
+        ["--help"],
+        ["proxy", "--help"],
+        ["ps", "--help"],
+        ["perf", "--help"],
+        ["tui", "--help"],
+    ],
 )
 def test_help_is_available_on_non_linux(
     arguments: list[str], monkeypatch: pytest.MonkeyPatch
@@ -330,7 +340,7 @@ def test_help_is_available_on_non_linux(
     assert "Usage" in result.stdout
 
 
-@pytest.mark.parametrize("command", ["proxy", "ps", "perf"])
+@pytest.mark.parametrize("command", ["proxy", "ps", "perf", "tui"])
 def test_command_help_lists_documented_options(command: str) -> None:
     result = runner.invoke(app, [command, "--help"])
 
@@ -339,8 +349,112 @@ def test_command_help_lists_documented_options(command: str) -> None:
     if command == "proxy":
         for option in ("--host", "--port", "--socket", "--session-limit"):
             assert option in help_text
-    else:
-        for option in ("--filter", "--format", "--no-trunc", "--socket"):
-            assert option in help_text
-        if command == "perf":
-            assert "--watch" in help_text
+        return
+    if command == "tui":
+        assert "--socket" in help_text
+        assert "--filter" not in help_text
+        return
+    for option in ("--filter", "--format", "--no-trunc", "--socket"):
+        assert option in help_text
+    if command == "perf":
+        assert "--watch" in help_text
+
+
+def test_cli_import_and_help_keep_textual_app_lazy() -> None:
+    script = """
+import sys
+from claude_code_proxy.cli import app
+from typer.testing import CliRunner
+result = CliRunner().invoke(app, [\"--help\"])
+assert result.exit_code == 0
+assert \"claude_code_proxy.tui.app\" not in sys.modules
+assert not any(name == \"textual\" or name.startswith(\"textual.\") for name in sys.modules)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_tui_rejects_non_tty_before_loading_textual(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_module, "_interactive_tty", lambda: False)
+    monkeypatch.setattr(
+        cli_module,
+        "_load_tui_runner",
+        lambda: pytest.fail("TUI loaded before interactive TTY check"),
+    )
+
+    result = runner.invoke(app, ["tui"])
+
+    assert result.exit_code == 1
+    assert "interactive TTY" in result.stderr
+    assert len(result.stderr) < 300
+
+
+def test_tui_loads_environment_resolves_socket_then_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, object]] = []
+    socket_path = tmp_path / "control.sock"
+    monkeypatch.setattr(cli_module, "_interactive_tty", lambda: True)
+    monkeypatch.setattr(
+        cli_module,
+        "_load_current_directory_environment",
+        lambda: calls.append(("environment", None)),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "resolve_socket_path",
+        lambda value: calls.append(("socket", value)) or socket_path,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_load_tui_runner",
+        lambda: calls.append(("load", None))
+        or (lambda value: calls.append(("run", value)) or SimpleNamespace(exit_code=0, message="")),
+    )
+
+    result = runner.invoke(app, ["tui", "--socket", str(socket_path)])
+
+    assert result.exit_code == 0
+    assert calls == [
+        ("environment", None),
+        ("socket", socket_path),
+        ("load", None),
+        ("run", socket_path),
+    ]
+
+
+def test_tui_nonzero_result_prints_safe_capability_and_docker_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_module, "_interactive_tty", lambda: True)
+    monkeypatch.setattr(cli_module, "resolve_socket_path", lambda value: Path("/safe.sock"))
+    monkeypatch.setattr(
+        cli_module,
+        "_load_tui_runner",
+        lambda: lambda value: SimpleNamespace(
+            exit_code=1,
+            message=(
+                "TUI requires control protocol v1 with performance and "
+                "performance_events capabilities"
+            ),
+        ),
+    )
+
+    result = runner.invoke(app, ["tui"])
+
+    assert result.exit_code == 1
+    assert "protocol v1" in result.stderr
+    assert "performance" in result.stderr
+    assert "performance_events" in result.stderr
+    assert "performance collector" in result.stderr
+    assert "docker compose exec proxy claude-code-proxy tui" in result.stderr
+    assert "Traceback" not in result.stderr

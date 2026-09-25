@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -10,7 +7,6 @@ import selectors
 import signal
 import socket
 import subprocess
-import sys
 import time
 from typing import cast
 
@@ -24,318 +20,22 @@ from claude_code_proxy.control.schemas import (
     PerformanceResetResponse,
     PerformanceStreamEvent,
 )
-
-_STARTUP_TIMEOUT_SECONDS = 15.0
-_STARTUP_STABILITY_SECONDS = 0.5
-_PROCESS_TIMEOUT_SECONDS = 10.0
-_STARTUP_ATTEMPTS = 5
-_ADDRESS_IN_USE_MARKERS = (
-    "address already in use",
-    "eaddrinuse",
-    "errno 98",
-    "errno 48",
-    "winerror 10048",
+from test.integration import control_plane_support
+from test.integration.control_plane_support import (
+    PROCESS_TIMEOUT_SECONDS as _PROCESS_TIMEOUT_SECONDS,
+    RunningProxy as _RunningProxy,
+    StartupExit as _StartupExit,
+    StartupTimeout as _StartupTimeout,
+    cleanup_running_proxy as _cleanup_running_proxy,
+    cli_executable as _cli_executable,
+    control_get as _control_get,
+    launch_proxy_attempt as _launch_proxy_attempt,
+    proxy_process as _proxy_process,
+    public_get as _public_get,
+    start_proxy_with_retries as _start_proxy_with_retries,
+    stop_process as _stop_process,
+    write_mapping as _write_mapping,
 )
-
-
-class _StartupExit(RuntimeError):
-    pass
-
-
-class _StartupTimeout(RuntimeError):
-    pass
-
-
-@dataclass(frozen=True)
-class _RunningProxy:
-    process: subprocess.Popen[str]
-    environment: dict[str, str]
-    socket_path: Path
-    port: int
-
-
-def _cli_executable() -> Path:
-    executable = Path(sys.executable).with_name("claude-code-proxy")
-    assert executable.is_file(), (
-        f"console script not found beside current Python: {executable}"
-    )
-    assert os.access(executable, os.X_OK), (
-        f"console script is not executable: {executable}"
-    )
-    return executable
-
-
-def _reserve_loopback_port() -> tuple[socket.socket, int]:
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.bind(("127.0.0.1", 0))
-    return listener, listener.getsockname()[1]
-
-
-def _isolated_environment(
-    tmp_path: Path,
-    socket_path: Path,
-    mapping_path: Path,
-    runtime_path: Path,
-    port: int,
-) -> dict[str, str]:
-    environment = os.environ.copy()
-    sensitive_fragments = ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
-    for name in tuple(environment):
-        if any(fragment in name.upper() for fragment in sensitive_fragments):
-            environment.pop(name)
-    environment.pop("PYTHONPATH", None)
-    environment.update(
-        {
-            "CONTROL_SOCKET_PATH": str(socket_path),
-            "HOME": str(tmp_path / "home"),
-            "MODEL_MAPPING_PATH": str(mapping_path),
-            "OPENCODE_DATA_DIR": str(runtime_path),
-            "OPENAI_TRANSPORT": "litellm",
-            "PROXY_HOST": "127.0.0.1",
-            "PROXY_PORT": str(port),
-            "SESSION_RETENTION_LIMIT": "2",
-            "USE_VERTEX_AUTH": "False",
-            "VERTEX_LOCATION": "unset",
-            "VERTEX_PROJECT": "unset",
-        }
-    )
-    return environment
-
-
-def _public_get(client: httpx.Client, port: int, path: str) -> httpx.Response:
-    return client.get(f"http://127.0.0.1:{port}{path}")
-
-
-def _control_get(socket_path: Path, path: str) -> httpx.Response:
-    transport = httpx.HTTPTransport(uds=str(socket_path))
-    with httpx.Client(
-        transport=transport,
-        base_url="http://control",
-        timeout=0.5,
-        trust_env=False,
-    ) as client:
-        return client.get(path)
-
-
-def _require_running_process(running: _RunningProxy) -> None:
-    if running.process.poll() is not None:
-        raise _StartupExit(
-            f"proxy exited during startup with {running.process.returncode}"
-        )
-
-
-def _public_is_ready(client: httpx.Client, running: _RunningProxy) -> bool:
-    response = _public_get(client, running.port, "/")
-    return response.status_code == 200 and response.json() == {
-        "message": "Anthropic Proxy for LiteLLM"
-    }
-
-
-def _control_is_owned_by_child(running: _RunningProxy) -> bool:
-    response = _control_get(running.socket_path, "/v1/health")
-    payload = response.json()
-    return (
-        response.status_code == 200
-        and isinstance(payload, dict)
-        and payload.get("pid") == running.process.pid
-    )
-
-
-def _confirm_stable_start(
-    running: _RunningProxy,
-    public_client: httpx.Client,
-) -> bool:
-    """Catch delayed bind failure because public HTTP has no process identity."""
-    deadline = time.monotonic() + _STARTUP_STABILITY_SECONDS
-    while time.monotonic() < deadline:
-        _require_running_process(running)
-        time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
-    _require_running_process(running)
-    return _control_is_owned_by_child(running) and _public_is_ready(
-        public_client, running
-    )
-
-
-def _wait_for_both_servers(running: _RunningProxy) -> None:
-    deadline = time.monotonic() + _STARTUP_TIMEOUT_SECONDS
-    with httpx.Client(timeout=0.5, trust_env=False) as public_client:
-        while time.monotonic() < deadline:
-            _require_running_process(running)
-            try:
-                control_ready = _control_is_owned_by_child(running)
-                public_ready = _public_is_ready(public_client, running)
-                if control_ready and public_ready:
-                    if _confirm_stable_start(running, public_client):
-                        return
-            except (httpx.HTTPError, ValueError):
-                pass
-            time.sleep(0.05)
-    raise _StartupTimeout("proxy did not make both servers ready before timeout")
-
-
-def _stop_process(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=_PROCESS_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=_PROCESS_TIMEOUT_SECONDS)
-
-
-def _cleanup_running_proxy(running: _RunningProxy) -> tuple[str, str]:
-    _stop_process(running.process)
-    stdout, stderr = running.process.communicate(timeout=1)
-    running.socket_path.unlink(missing_ok=True)
-    return stdout, stderr
-
-
-def _launch_proxy_attempt(
-    tmp_path: Path,
-    mapping_path: Path,
-    executable: Path,
-    attempt: int,
-    *,
-    performance: str | None = None,
-) -> _RunningProxy:
-    attempt_path = tmp_path / f"proxy-attempt-{attempt}"
-    attempt_path.mkdir(mode=0o700)
-    attempt_path.chmod(0o700)
-    socket_path = attempt_path / "control.sock"
-    reservation, port = _reserve_loopback_port()
-    environment = _isolated_environment(
-        tmp_path,
-        socket_path,
-        mapping_path,
-        attempt_path / "opencode",
-        port,
-    )
-    reservation.close()
-    command = [str(executable), "proxy"]
-    if performance is not None:
-        command.extend(("--performance", performance))
-    process = subprocess.Popen(
-        command,
-        cwd=tmp_path,
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="strict",
-    )
-    return _RunningProxy(process, environment, socket_path, port)
-
-
-def _address_in_use(stdout: str, stderr: str) -> bool:
-    output = f"{stdout}\n{stderr}".casefold()
-    return any(marker in output for marker in _ADDRESS_IN_USE_MARKERS)
-
-
-def _startup_diagnostic(
-    attempt: int,
-    error: Exception,
-    stdout: str,
-    stderr: str,
-) -> str:
-    return (
-        f"attempt {attempt}: {error}\n"
-        f"proxy stdout:\n{stdout}\nproxy stderr:\n{stderr}"
-    )
-
-
-def _start_proxy_with_retries(
-    tmp_path: Path,
-    mapping_path: Path,
-    executable: Path,
-    max_attempts: int = _STARTUP_ATTEMPTS,
-    *,
-    performance: str | None = None,
-) -> _RunningProxy:
-    address_conflicts: list[str] = []
-    for attempt in range(1, max_attempts + 1):
-        if performance is not None:
-            running = _launch_proxy_attempt(
-                tmp_path,
-                mapping_path,
-                executable,
-                attempt,
-                performance=performance,
-            )
-        else:
-            running = _launch_proxy_attempt(
-                tmp_path,
-                mapping_path,
-                executable,
-                attempt,
-            )
-        try:
-            _wait_for_both_servers(running)
-            return running
-        except _StartupExit as error:
-            stdout, stderr = _cleanup_running_proxy(running)
-            diagnostic = _startup_diagnostic(attempt, error, stdout, stderr)
-            if _address_in_use(stdout, stderr):
-                address_conflicts.append(diagnostic)
-                continue
-            raise AssertionError(diagnostic) from error
-        except Exception as error:
-            stdout, stderr = _cleanup_running_proxy(running)
-            diagnostic = _startup_diagnostic(attempt, error, stdout, stderr)
-            raise AssertionError(diagnostic) from error
-        except BaseException as error:
-            try:
-                _cleanup_running_proxy(running)
-            except BaseException as cleanup_error:
-                error.add_note(f"startup cleanup failure: {cleanup_error!r}")
-            raise
-    raise AssertionError(
-        "proxy exhausted startup retries after address conflicts:\n"
-        + "\n".join(address_conflicts)
-    )
-
-
-@contextmanager
-def _proxy_process(
-    tmp_path: Path,
-    mapping_path: Path,
-    executable: Path,
-    *,
-    performance: str | None = None,
-) -> Iterator[_RunningProxy]:
-    running = _start_proxy_with_retries(
-        tmp_path, mapping_path, executable, performance=performance
-    )
-    failure: Exception | None = None
-    try:
-        yield running
-    except Exception as error:
-        failure = error
-    finally:
-        stdout, stderr = _cleanup_running_proxy(running)
-    if failure is not None:
-        raise AssertionError(
-            f"{failure}\nproxy stdout:\n{stdout}\nproxy stderr:\n{stderr}"
-        ) from failure
-
-
-def _write_mapping(path: Path) -> None:
-    path.write_text(
-        json.dumps(
-            {
-                "models": {
-                    "smoke": {
-                        "target": "openai/smoke-model",
-                        "context_window": 1000,
-                    }
-                },
-                "tiers": {"small": "smoke"},
-                "mappings": {"haiku": {"tier": "small", "effort": "medium"}},
-            }
-        ),
-        encoding="utf-8",
-    )
 
 
 def _assert_http_contract(running: _RunningProxy) -> None:
@@ -544,18 +244,18 @@ def test_responsive_port_collision_exits_during_stabilization_and_retries(
             return "", "[Errno 98] address already in use"
         return "", ""
 
-    module = sys.modules[__name__]
-    monkeypatch.setattr(module, "_launch_proxy_attempt", launch)
+    module = control_plane_support
+    monkeypatch.setattr(module, "launch_proxy_attempt", launch)
     monkeypatch.setattr(
         module,
-        "_public_get",
+        "public_get",
         lambda _client, _port, _path: _FakeResponse(
             {"message": "Anthropic Proxy for LiteLLM"}
         ),
     )
-    monkeypatch.setattr(module, "_control_get", control_get)
-    monkeypatch.setattr(module, "_cleanup_running_proxy", cleanup)
-    monkeypatch.setattr(module, "_STARTUP_STABILITY_SECONDS", 0)
+    monkeypatch.setattr(module, "control_get", control_get)
+    monkeypatch.setattr(module, "cleanup_running_proxy", cleanup)
+    monkeypatch.setattr(module, "STARTUP_STABILITY_SECONDS", 0)
 
     running = _start_proxy_with_retries(
         tmp_path,
@@ -563,7 +263,7 @@ def test_responsive_port_collision_exits_during_stabilization_and_retries(
         tmp_path / "claude-code-proxy",
         max_attempts=2,
     )
-    _cleanup_running_proxy(running)
+    control_plane_support.cleanup_running_proxy(running)
 
     assert running is second
     assert starts == [1, 2]
@@ -594,10 +294,10 @@ def test_startup_base_exception_cleans_once_without_retry(
         cleaned.append(cleaned_running)
         return "", ""
 
-    module = sys.modules[__name__]
-    monkeypatch.setattr(module, "_launch_proxy_attempt", launch)
-    monkeypatch.setattr(module, "_wait_for_both_servers", wait)
-    monkeypatch.setattr(module, "_cleanup_running_proxy", cleanup)
+    module = control_plane_support
+    monkeypatch.setattr(module, "launch_proxy_attempt", launch)
+    monkeypatch.setattr(module, "wait_for_both_servers", wait)
+    monkeypatch.setattr(module, "cleanup_running_proxy", cleanup)
 
     with pytest.raises(type(interruption)) as caught:
         _start_proxy_with_retries(
@@ -637,10 +337,10 @@ def test_startup_retries_after_address_in_use(
         cleaned.append(running)
         return "", "[Errno 98] address already in use"
 
-    module = sys.modules[__name__]
-    monkeypatch.setattr(module, "_launch_proxy_attempt", launch)
-    monkeypatch.setattr(module, "_wait_for_both_servers", wait)
-    monkeypatch.setattr(module, "_cleanup_running_proxy", cleanup)
+    module = control_plane_support
+    monkeypatch.setattr(module, "launch_proxy_attempt", launch)
+    monkeypatch.setattr(module, "wait_for_both_servers", wait)
+    monkeypatch.setattr(module, "cleanup_running_proxy", cleanup)
 
     running = _start_proxy_with_retries(
         tmp_path,
@@ -684,10 +384,10 @@ def test_startup_does_not_retry_non_address_exit_or_live_timeout(
         cleaned.append(cleaned_running)
         return "", stderr
 
-    module = sys.modules[__name__]
-    monkeypatch.setattr(module, "_launch_proxy_attempt", launch)
-    monkeypatch.setattr(module, "_wait_for_both_servers", wait)
-    monkeypatch.setattr(module, "_cleanup_running_proxy", cleanup)
+    module = control_plane_support
+    monkeypatch.setattr(module, "launch_proxy_attempt", launch)
+    monkeypatch.setattr(module, "wait_for_both_servers", wait)
+    monkeypatch.setattr(module, "cleanup_running_proxy", cleanup)
 
     with pytest.raises(AssertionError, match="attempt 1"):
         _start_proxy_with_retries(
