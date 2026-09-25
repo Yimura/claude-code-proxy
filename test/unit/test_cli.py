@@ -356,8 +356,17 @@ def test_command_help_lists_documented_options(command: str) -> None:
         return
     for option in ("--filter", "--format", "--no-trunc", "--socket"):
         assert option in help_text
-    if command == "perf":
+    if command in {"ps", "perf"}:
         assert "--watch" in help_text
+
+
+def test_ps_help_describes_one_second_session_snapshot_refresh() -> None:
+    result = runner.invoke(app, ["ps", "--help"])
+
+    assert result.exit_code == 0
+    help_text = unstyle(result.stdout)
+    assert "--watch" in help_text
+    assert "Refresh session snapshots once per second." in help_text
 
 
 def test_cli_import_and_help_keep_textual_app_lazy() -> None:

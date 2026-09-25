@@ -36,7 +36,7 @@ def validate_watch_output(
     """Reject terminal frame output when stdout is not interactive."""
     if output_format is OutputFormat.TABLE and not output.isatty():
         raise typer.BadParameter(
-            "table watch output requires a TTY",
+            "table watch output requires a TTY; use --format json instead",
             param_hint="--watch",
         )
 
