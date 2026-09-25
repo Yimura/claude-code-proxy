@@ -147,7 +147,7 @@ requires-dist = [
     { name = "textual", specifier = ">=6.6.0" },
     { name = "typer", specifier = ">=0.21.1" },
     { name = "uvicorn", specifier = ">=0.53.0" },
-    { name = "wcwidth", specifier = ">=0.2.13" },
+    { name = "wcwidth", specifier = ">=0.3.0" },
 ]
 
 [package.metadata.requires-dev]

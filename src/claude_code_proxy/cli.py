@@ -43,6 +43,7 @@ from .control.schemas import AgentResponse, SessionListResponse, SessionResponse
 from .control.socket import resolve_socket_path
 from .limits import MAX_CONTROL_INTEGER
 from .performance_cli import perf as _performance_report
+from .ps_watch_cli import validate_watch_output, watch_sessions
 
 if TYPE_CHECKING:
     from .runtime import RuntimeServices
@@ -215,13 +216,31 @@ def ps(
         Path | None,
         typer.Option("--socket", help="Control Unix socket path."),
     ] = None,
+    watch: Annotated[
+        bool,
+        typer.Option(
+            "--watch",
+            help="Refresh session snapshots once per second.",
+        ),
+    ] = False,
 ) -> None:
     """List sessions observed by a running proxy."""
     normalized = _validated_filters(filters or ())
+    if watch:
+        validate_watch_output(output_format, sys.stdout)
     try:
         _load_current_directory_environment()
         socket_path = resolve_socket_path(socket)
         with ControlClient(socket_path) as client:
+            if watch:
+                watch_sessions(
+                    client,
+                    normalized,
+                    output_format,
+                    no_trunc,
+                    _render_sessions,
+                )
+                return
             result = client.sessions(normalized)
         typer.echo(_render_sessions(result, output_format, no_trunc))
     except ControlUnavailable as error:
@@ -267,10 +286,17 @@ def _render_sessions(
     result: SessionListResponse,
     output_format: OutputFormat,
     no_trunc: bool,
+    compact_json: bool = False,
 ) -> str:
     try:
         if output_format is OutputFormat.JSON:
             payload = [item.model_dump(mode="json") for item in result.sessions]
+            if compact_json:
+                return json.dumps(
+                    payload,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
             return json.dumps(payload, indent=2, allow_nan=False)
         return _render_table(result, no_trunc)
     except (TypeError, ValueError, RecursionError) as error:

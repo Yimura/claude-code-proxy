@@ -54,3 +54,24 @@ def test_readme_documents_complete_performance_operator_contract() -> None:
     )
     for snippet in required_snippets:
         assert snippet in text
+
+
+def test_readme_documents_ps_watch_output_contract() -> None:
+    text = README.read_text(encoding="utf-8")
+
+    required_snippets = (
+        "uv run claude-code-proxy ps --watch",
+        "uv run claude-code-proxy ps --watch --format json",
+        "same normal `ps` table immediately",
+        "refreshes it in place once per second",
+        "requires TTY standard output",
+        "only rows owned by the previous frame",
+        "does not clear or take over the whole terminal",
+        "works through pipes and non-TTY output",
+        "JSON Lines",
+        "one compact JSON array per line",
+        "complete session snapshot with the same fields and ordering as one-shot JSON",
+        "`perf --watch` is an append-only performance event stream, not repeated session snapshots",
+    )
+    for snippet in required_snippets:
+        assert snippet in text

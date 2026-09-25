@@ -290,7 +290,7 @@ def test_module_adapter_and_console_script_declaration() -> None:
     assert metadata["project"]["scripts"]["claude-code-proxy"] == "claude_code_proxy.cli:app"
     assert "Operating System :: POSIX :: Linux" in metadata["project"]["classifiers"]
     assert "typer>=0.21.1" in metadata["project"]["dependencies"]
-    assert "wcwidth>=0.2.13" in metadata["project"]["dependencies"]
+    assert "wcwidth>=0.3.0" in metadata["project"]["dependencies"]
 
 
 def test_installed_script_and_module_adapter_subprocess_help() -> None:
@@ -356,8 +356,17 @@ def test_command_help_lists_documented_options(command: str) -> None:
         return
     for option in ("--filter", "--format", "--no-trunc", "--socket"):
         assert option in help_text
-    if command == "perf":
+    if command in {"ps", "perf"}:
         assert "--watch" in help_text
+
+
+def test_ps_help_describes_one_second_session_snapshot_refresh() -> None:
+    result = runner.invoke(app, ["ps", "--help"])
+
+    assert result.exit_code == 0
+    help_text = unstyle(result.stdout)
+    assert "--watch" in help_text
+    assert "Refresh session snapshots once per second." in help_text
 
 
 def test_cli_import_and_help_keep_textual_app_lazy() -> None:

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+from click import unstyle
 from wcwidth import wcswidth
 
 from claude_code_proxy import cli as cli_module
@@ -37,6 +38,156 @@ def reset_fake_client(
     FakeClient.error = None
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli_module, "ControlClient", FakeClient)
+
+
+def test_ps_watch_table_rejects_non_tty_before_environment_or_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli_module,
+        "_load_current_directory_environment",
+        lambda: pytest.fail("environment loaded before watch output validation"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "resolve_socket_path",
+        lambda _: pytest.fail("socket resolved before watch output validation"),
+    )
+
+    result = runner.invoke(app, ["ps", "--watch"])
+
+    assert result.exit_code == 2
+    stderr = unstyle(result.stderr)
+    assert "--watch" in stderr
+    assert "--format" in stderr
+    assert "json instead" in stderr
+    assert FakeClient.instances == []
+
+
+def test_ps_watch_json_delegates_normalized_options_in_one_client_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    environment_socket = tmp_path / "environment.sock"
+    explicit_socket = tmp_path / "explicit.sock"
+    monkeypatch.setenv("CONTROL_SOCKET_PATH", str(environment_socket))
+    calls: list[tuple[FakeClient, tuple[str, ...], cli_common.OutputFormat, bool]] = []
+
+    def watch_sessions(
+        client: FakeClient,
+        filters: tuple[str, ...],
+        output_format: cli_common.OutputFormat,
+        no_trunc: bool,
+        renderer: object,
+    ) -> None:
+        assert client.entered
+        assert not client.exited
+        assert renderer is cli_module._render_sessions
+        calls.append((client, filters, output_format, no_trunc))
+
+    monkeypatch.setattr(
+        cli_module,
+        "watch_sessions",
+        watch_sessions,
+        raising=False,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "ps",
+            "--watch",
+            "--format",
+            "json",
+            "--filter",
+            " state = active ",
+            "--filter",
+            "model = opus",
+            "--socket",
+            str(explicit_socket),
+            "--no-trunc",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert len(FakeClient.instances) == 1
+    client = FakeClient.instances[0]
+    assert client.socket_path == explicit_socket.absolute()
+    assert calls == [
+        (
+            client,
+            ("state=active", "model=opus"),
+            cli_common.OutputFormat.JSON,
+            True,
+        )
+    ]
+    assert client.entered
+    assert client.exited
+
+
+def test_ps_watch_control_error_is_reported_safely_and_closes_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def watch_sessions(*_: object) -> None:
+        raise ControlError("watch failed\nforged")
+
+    monkeypatch.setattr(
+        cli_module,
+        "watch_sessions",
+        watch_sessions,
+        raising=False,
+    )
+
+    result = runner.invoke(app, ["ps", "--watch", "--format", "json"])
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "watch failed\\x0aforged" in result.stderr
+    assert "\nforged" not in result.stderr
+    assert "Traceback" not in result.stderr
+    assert FakeClient.instances[0].entered
+    assert FakeClient.instances[0].exited
+
+
+def test_ps_watch_keyboard_interrupt_exits_zero_and_closes_client() -> None:
+    FakeClient.error = KeyboardInterrupt()
+
+    result = runner.invoke(app, ["ps", "--watch", "--format", "json"])
+
+    assert result.exit_code == 0
+    assert result.stdout == ""
+    assert "Aborted" not in result.output
+    assert FakeClient.instances[0].entered
+    assert FakeClient.instances[0].exited
+
+
+def test_render_sessions_compact_json_matches_pretty_payload_on_one_line() -> None:
+    snapshot = response(
+        session(
+            "session-id",
+            client_model="line\nbreak",
+            model="ansi\x1bmodel",
+            agents=(agent("agent-id"),),
+        )
+    )
+
+    pretty = cli_module._render_sessions(
+        snapshot,
+        cli_common.OutputFormat.JSON,
+        False,
+    )
+    compact = cli_module._render_sessions(
+        snapshot,
+        cli_common.OutputFormat.JSON,
+        False,
+        True,
+    )
+
+    assert json.loads(compact) == json.loads(pretty)
+    assert json.loads(compact) == [snapshot.sessions[0].model_dump(mode="json")]
+    assert "\n" not in compact
+    assert compact.startswith('[{"id":"session-id",')
+    assert "\n  {" in pretty
 
 
 def test_ps_success_output_is_byte_exact() -> None:
@@ -646,6 +797,24 @@ def test_ps_json_empty_result_is_empty_array() -> None:
 
     assert result.exit_code == 0
     assert json.loads(result.stdout) == []
+
+
+def test_ps_json_pretty_output_is_byte_exact() -> None:
+    item = session("session-id", agents=(agent("agent-id"),))
+    FakeClient.result = response(item)
+
+    result = runner.invoke(app, ["ps", "--format", "json"])
+
+    assert result.exit_code == 0
+    assert result.stdout == (
+        json.dumps(
+            [item.model_dump(mode="json")],
+            indent=2,
+            allow_nan=False,
+        )
+        + "\n"
+    )
+    assert result.stderr == ""
 
 
 @pytest.mark.parametrize(
