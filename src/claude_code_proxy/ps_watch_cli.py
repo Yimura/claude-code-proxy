@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-import math
 import shutil
 import sys
 import time
 from typing import Protocol, TextIO
 
 import typer
+from wcwidth import iter_graphemes
 
 from .cli_common import OutputFormat, display_width
 from .control.schemas import SessionListResponse
@@ -50,10 +50,22 @@ def physical_rows(frame: str, columns: int) -> int:
     if columns <= 0:
         raise ValueError("terminal columns must be positive")
 
-    return sum(
-        max(1, math.ceil(display_width(line) / columns))
-        for line in frame.split("\n")
-    )
+    return sum(_physical_line_rows(line, columns) for line in frame.split("\n"))
+
+
+def _physical_line_rows(line: str, columns: int) -> int:
+    rows = 1
+    occupied = 0
+    for grapheme in iter_graphemes(line):
+        width = display_width(grapheme)
+        if occupied and occupied + width > columns:
+            rows += 1
+            occupied = 0
+        while width > columns:
+            rows += 1
+            width -= columns
+        occupied += width
+    return rows
 
 
 class PlainLineWriter:

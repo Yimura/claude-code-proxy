@@ -75,6 +75,7 @@ def test_plain_line_writer_writes_and_flushes_each_record() -> None:
         ("wrapped", 3, 3),
         ("one\n\n123456", 3, 4),
         ("界界a", 2, 3),
+        ("aa界aa", 3, 3),
         ("e\N{COMBINING ACUTE ACCENT}", 1, 1),
     ],
 )

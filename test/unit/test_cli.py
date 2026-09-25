@@ -290,7 +290,7 @@ def test_module_adapter_and_console_script_declaration() -> None:
     assert metadata["project"]["scripts"]["claude-code-proxy"] == "claude_code_proxy.cli:app"
     assert "Operating System :: POSIX :: Linux" in metadata["project"]["classifiers"]
     assert "typer>=0.21.1" in metadata["project"]["dependencies"]
-    assert "wcwidth>=0.2.13" in metadata["project"]["dependencies"]
+    assert "wcwidth>=0.3.0" in metadata["project"]["dependencies"]
 
 
 def test_installed_script_and_module_adapter_subprocess_help() -> None:
