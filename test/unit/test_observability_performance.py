@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from claude_code_proxy.config import CodexOrchestrationMode
 from claude_code_proxy.domain.models import (
     CompletionResponse,
     TextBlock,
@@ -12,6 +13,11 @@ from claude_code_proxy.domain.models import (
 )
 from claude_code_proxy.event_journal import EventJournal
 from claude_code_proxy.limits import MAX_CONTROL_INTEGER
+from claude_code_proxy.performance import Measurement
+from claude_code_proxy.providers.codex.orchestration_policy import (
+    OrchestrationDecision,
+    OrchestrationDecisionCode,
+)
 from claude_code_proxy.observability import (
     AmbiguousSessionId,
     ObservationHandle,
@@ -88,6 +94,53 @@ async def test_performance_begin_and_finish_publish_safe_shared_snapshots() -> N
     assert events.current_sequence == 2
     assert (await replay.receive(1)).type == "completed"
     replay.close()
+
+
+@pytest.mark.asyncio
+async def test_orchestration_decision_reserves_then_publishes_once() -> None:
+    clock = Clock()
+    events = EventJournal()
+    sessions = registry(clock, events=events)
+    handle = sessions.begin(metadata())
+    observer = sessions.observer(handle)
+    subscription = events.subscribe(after=1)
+    decision = OrchestrationDecision(
+        CodexOrchestrationMode.ENFORCE,
+        OrchestrationDecisionCode.LINEAGE_UNKNOWN,
+        Measurement.unavailable(),
+        True,
+        False,
+    )
+
+    observer.orchestration_decision(decision)
+
+    published = await subscription.receive(1)
+    assert published.type == "orchestration"
+    assert published.request.orchestration_decision == "lineage_unknown"
+    assert published.session.lineage_unavailable == 1
+    assert events.current_sequence == 2
+    assert await subscription.receive(0) is None
+    subscription.close()
+
+
+def test_orchestration_decision_ignores_unknown_or_finalized_handle() -> None:
+    clock = Clock()
+    sessions = registry(clock)
+    handle = sessions.begin(metadata())
+    observer = sessions.observer(handle)
+    decision = OrchestrationDecision(
+        CodexOrchestrationMode.ADVISORY,
+        OrchestrationDecisionCode.ADVISORY,
+        Measurement.observed(1),
+        False,
+        True,
+    )
+    sessions.finish(handle, "completed")
+
+    observer.orchestration_decision(decision)
+
+    snapshot = sessions.performance_snapshots().sessions[0].performance
+    assert snapshot.lineage_unavailable == 0
 
 
 def test_performance_overlap_keeps_base_and_reducer_concurrency_coherent() -> None:

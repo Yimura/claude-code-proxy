@@ -584,6 +584,29 @@ class SessionRegistry:
                     occurred_at, now,
                 )
 
+    def orchestration_decision(
+        self, handle: ObservationHandle, decision: object
+    ) -> None:
+        with self._lock:
+            target = self._request_locked(handle)
+            if target is None:
+                return
+            record, request = target
+            occurred_at, now = self._sample_event_clocks_locked(request)
+            with self._events.reserve(1) as reservation:
+                if not request.record_orchestration_decision(decision):
+                    return
+                assert record.performance is not None
+                record.performance.record_orchestration_decision(request)
+                self._commit_events_locked(
+                    reservation,
+                    record,
+                    request,
+                    ("orchestration",),
+                    occurred_at,
+                    now,
+                )
+
     def finish(
         self,
         handle: ObservationHandle,

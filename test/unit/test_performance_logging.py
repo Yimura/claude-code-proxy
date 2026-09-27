@@ -32,6 +32,12 @@ def performance_snapshot(**changes):
         "retries": Measurement.observed(0),
         "peak_concurrency": Measurement.observed(1),
         "reasoning_continuation": "unavailable",
+        "orchestration_mode": "not_applicable",
+        "orchestration_decision": "not_applicable",
+        "orchestration_depth": Measurement.not_applicable(),
+        "orchestration_authorization_present": False,
+        "active_workers": Measurement.unavailable(),
+        "revision_deduplication": Measurement.unavailable(),
         "failure": None,
     }
     values.update(changes)

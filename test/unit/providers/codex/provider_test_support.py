@@ -13,6 +13,7 @@ from claude_code_proxy.domain.models import (
     ToolDefinition,
 )
 from claude_code_proxy.logging import RequestLogContext, SessionIdentity
+from claude_code_proxy.performance import Measurement
 from claude_code_proxy.providers.codex.provider import CODEX_RESPONSES_URL
 from claude_code_proxy.reasoning import ReasoningPolicy
 
@@ -59,7 +60,13 @@ class RecordingOrchestration:
             raise self.failure
         return SimpleNamespace(
             request=self.transform(completion_request),
-            decision=object(),
+            decision=SimpleNamespace(
+                mode="advisory",
+                code="advisory",
+                depth=Measurement.not_applicable(),
+                authorization_present=False,
+                agent_allowed=True,
+            ),
         )
 
 
@@ -75,6 +82,9 @@ class RecordingTelemetry:
 
     def set_reasoning_continuation(self, value):
         self.calls.append(("set_reasoning_continuation", value))
+
+    def orchestration_decision(self, decision):
+        self.calls.append(("orchestration_decision", decision))
 
 
 class Response:

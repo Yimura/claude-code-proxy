@@ -7,6 +7,7 @@ import re
 import pytest
 from starlette.requests import ClientDisconnect
 
+from claude_code_proxy.config import CodexOrchestrationMode
 from claude_code_proxy.console_logging import LOG_FORMAT, SeverityFormatter
 from claude_code_proxy.domain.models import (
     ClientIdentity,
@@ -32,6 +33,7 @@ from claude_code_proxy.logging import (
     client_identity_from_headers,
     configure_logging,
     effective_effort,
+    log_orchestration_decision,
     log_provider_failure,
     log_session_started,
     log_startup_summary,
@@ -42,7 +44,12 @@ from claude_code_proxy.logging import (
     session_identity,
 )
 from claude_code_proxy.providers.base import ProviderError
+from claude_code_proxy.performance import Measurement
 from claude_code_proxy.providers.codex.auth import CodexAccountIdentity
+from claude_code_proxy.providers.codex.orchestration_policy import (
+    OrchestrationDecision,
+    OrchestrationDecisionCode,
+)
 from claude_code_proxy.reasoning import ReasoningPolicy
 
 from test.unit.logging_test_support import make_context
@@ -92,6 +99,33 @@ def test_client_identity_from_headers_normalizes_blank_and_orphan_parent():
 
     assert blank == ClientIdentity()
     assert orphan == ClientIdentity()
+
+
+def test_orchestration_log_contains_only_fixed_bounded_fields(caplog):
+    decision = OrchestrationDecision(
+        CodexOrchestrationMode.ENFORCE,
+        OrchestrationDecisionCode.LINEAGE_UNKNOWN,
+        Measurement.unavailable(),
+        True,
+        False,
+    )
+
+    with caplog.at_level(logging.INFO, logger="claude_code_proxy.logging"):
+        log_orchestration_decision(decision)
+
+    assert caplog.messages == [
+        "orchestration mode=enforce decision=lineage_unknown "
+        "depth_status=unavailable depth_value=unavailable authorization=true"
+    ]
+    rendered = caplog.text
+    for forbidden in (
+        "session",
+        "agent",
+        "prompt",
+        "credential",
+        "error",
+    ):
+        assert forbidden not in rendered.lower()
 
 
 def test_startup_summary_reports_litellm_transport(caplog):

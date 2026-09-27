@@ -441,6 +441,37 @@ def _performance_fields(
     )
 
 
+def log_orchestration_decision(decision: object) -> None:
+    """Emit one fixed-shape orchestration decision without identity data."""
+    try:
+        depth = getattr(decision, "depth")
+        status = _structured_log_token(depth.status)
+        value = (
+            _structured_log_token(depth.value)
+            if depth.status == "observed"
+            else "unavailable"
+        )
+        authorization = (
+            "true"
+            if getattr(decision, "authorization_present") is True
+            else "false"
+        )
+        logger.info(
+            "orchestration mode=%s decision=%s depth_status=%s "
+            "depth_value=%s authorization=%s",
+            _structured_log_token(getattr(decision, "mode")),
+            _structured_log_token(getattr(decision, "code")),
+            status,
+            value,
+            authorization,
+        )
+    except BaseException:
+        try:
+            logger.warning("orchestration logging failed")
+        except BaseException:
+            pass
+
+
 def log_performance(
     snapshot: RequestPerformanceSnapshot,
     context: RequestLogContext,

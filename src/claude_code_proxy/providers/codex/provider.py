@@ -13,6 +13,7 @@ from ...domain.models import (
     StreamError,
     StreamStart,
 )
+from ...logging import log_orchestration_decision
 from ...performance import ProviderTelemetry, notify_telemetry
 from ...public_identity import PublicIdentity
 from ...failures import (
@@ -191,6 +192,12 @@ class CodexProvider:
         try:
             orchestration = self._orchestration.reconcile(request)
             request = orchestration.request
+            notify_telemetry(
+                telemetry,
+                "orchestration_decision",
+                orchestration.decision,
+            )
+            log_orchestration_decision(orchestration.decision)
             identity = CodexIdentity.from_client(request.client_identity)
             return request, identity, build_request(request, identity)
         except Exception as error:
@@ -424,7 +431,14 @@ class CodexProvider:
     ) -> int:
         if self._token_counter is None:
             return 1000
-        reconciled = self._orchestration.reconcile(request).request
+        orchestration = self._orchestration.reconcile(request)
+        reconciled = orchestration.request
+        notify_telemetry(
+            telemetry,
+            "orchestration_decision",
+            orchestration.decision,
+        )
+        log_orchestration_decision(orchestration.decision)
         if telemetry is None:
             return await self._token_counter(reconciled)
         return await self._token_counter(reconciled, telemetry=telemetry)

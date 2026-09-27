@@ -378,6 +378,13 @@ def test_session_snapshot_has_exact_safe_fields() -> None:
         "retries",
         "current_concurrency",
         "peak_concurrency",
+        "nested_allowed",
+        "nested_denied",
+        "depth_limit_reached",
+        "lineage_unavailable",
+        "maximum_observed_depth",
+        "active_workers",
+        "revision_deduplication",
         "latest_request",
     }
 

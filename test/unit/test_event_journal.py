@@ -144,6 +144,15 @@ def event(event_type: str = "progress") -> JournalEvent:
     )
 
 
+def test_journal_accepts_orchestration_event_on_existing_sequence() -> None:
+    journal = EventJournal()
+
+    published = journal.publish(event("orchestration"))
+
+    assert published.sequence == 1
+    assert published.type == "orchestration"
+
+
 def test_journal_event_carries_matching_immutable_activity() -> None:
     published = event()
 

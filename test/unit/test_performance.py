@@ -5,6 +5,7 @@ import sys
 
 import pytest
 
+from claude_code_proxy.config import CodexOrchestrationMode
 from claude_code_proxy.domain.models import (
     CompletionResponse,
     RedactedThinking,
@@ -29,15 +30,22 @@ from claude_code_proxy.performance import (
     Measurement,
     RequestPerformance,
     RequestPerformanceSnapshot,
+    SessionPerformance,
+)
+from claude_code_proxy.providers.codex.orchestration_policy import (
+    OrchestrationDecision,
+    OrchestrationDecisionCode,
 )
 
 
 STARTED = datetime(2026, 9, 21, 10, tzinfo=UTC)
 
 
-def request(operation: str = "messages") -> RequestPerformance:
+def request(
+    operation: str = "messages", request_id: str = "request-1"
+) -> RequestPerformance:
     return RequestPerformance(
-        request_id="request-1",
+        request_id=request_id,
         session_id="session-1",
         operation=operation,
         started_at=STARTED,
@@ -115,6 +123,12 @@ def test_snapshot_has_exact_safe_fields_and_is_frozen() -> None:
         "retries",
         "peak_concurrency",
         "reasoning_continuation",
+        "orchestration_mode",
+        "orchestration_decision",
+        "orchestration_depth",
+        "orchestration_authorization_present",
+        "active_workers",
+        "revision_deduplication",
         "failure",
     }
     snapshot = request().snapshot(10.0)
@@ -141,6 +155,80 @@ def test_messages_begin_with_required_metric_states() -> None:
     assert snapshot.retries == Measurement.unavailable()
     assert snapshot.peak_concurrency == Measurement.observed(1)
     assert snapshot.reasoning_continuation == "unavailable"
+    assert snapshot.orchestration_mode == "not_applicable"
+    assert snapshot.orchestration_decision == "not_applicable"
+    assert snapshot.orchestration_depth == Measurement.not_applicable()
+    assert snapshot.orchestration_authorization_present is False
+    assert snapshot.active_workers == Measurement.unavailable()
+    assert snapshot.revision_deduplication == Measurement.unavailable()
+
+
+def test_orchestration_decision_records_only_closed_safe_fields() -> None:
+    performance = request()
+    decision = OrchestrationDecision(
+        CodexOrchestrationMode.ENFORCE,
+        OrchestrationDecisionCode.NESTED_ALLOWED,
+        Measurement.observed(2),
+        True,
+        True,
+    )
+
+    performance.record_orchestration_decision(decision)
+    snapshot = performance.snapshot(10.0)
+
+    assert snapshot.orchestration_mode == "enforce"
+    assert snapshot.orchestration_decision == "nested_allowed"
+    assert snapshot.orchestration_depth == Measurement.observed(2)
+    assert snapshot.orchestration_authorization_present is True
+    assert snapshot.active_workers == Measurement.unavailable()
+    assert snapshot.revision_deduplication == Measurement.unavailable()
+
+
+def test_session_aggregates_orchestration_decisions_without_inferred_metrics() -> None:
+    requests = (
+        request(),
+        request(request_id="request-2"),
+        request(request_id="request-3"),
+    )
+    session = SessionPerformance("session-1")
+    for performance in requests:
+        session.start(performance)
+    decisions = (
+        OrchestrationDecision(
+            CodexOrchestrationMode.ENFORCE,
+            OrchestrationDecisionCode.NESTED_ALLOWED,
+            Measurement.observed(2),
+            True,
+            True,
+        ),
+        OrchestrationDecision(
+            CodexOrchestrationMode.ENFORCE,
+            OrchestrationDecisionCode.DEPTH_LIMIT_REACHED,
+            Measurement.observed(3),
+            True,
+            False,
+        ),
+        OrchestrationDecision(
+            CodexOrchestrationMode.ENFORCE,
+            OrchestrationDecisionCode.AUTHORIZATION_EXPIRED,
+            Measurement.observed(2),
+            True,
+            False,
+        ),
+    )
+
+    for performance, decision in zip(requests, decisions, strict=True):
+        performance.record_orchestration_decision(decision)
+        session.record_orchestration_decision(performance)
+    snapshot = session.snapshot(10.0)
+
+    assert snapshot.nested_allowed == 1
+    assert snapshot.nested_denied == 1
+    assert snapshot.depth_limit_reached == 1
+    assert snapshot.lineage_unavailable == 0
+    assert snapshot.maximum_observed_depth == Measurement.observed(3)
+    assert snapshot.active_workers == Measurement.unavailable()
+    assert snapshot.revision_deduplication == Measurement.unavailable()
 
 
 def test_count_tokens_has_exact_not_applicable_metrics() -> None:

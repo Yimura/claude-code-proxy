@@ -1,5 +1,6 @@
 """Provider-neutral request performance measurements and reduction."""
 
+import asyncio
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -58,6 +59,8 @@ class ProviderTelemetry(Protocol):
         self, value: ReasoningContinuation
     ) -> None: ...
 
+    def orchestration_decision(self, decision: object) -> None: ...
+
 
 class RequestTelemetry(ProviderTelemetry, Protocol):
     """Observe a provider request lifecycle without retaining its content."""
@@ -82,7 +85,9 @@ def notify_telemetry(
     try:
         callback = getattr(telemetry, method_name)
         callback(*args)
-    except Exception:
+    except asyncio.CancelledError:
+        raise
+    except BaseException:
         logger.warning("telemetry callback failed")
 
 
@@ -105,6 +110,9 @@ class SafeProviderTelemetry:
             self._telemetry, "set_reasoning_continuation", value
         )
 
+    def orchestration_decision(self, decision: object) -> None:
+        notify_telemetry(self._telemetry, "orchestration_decision", decision)
+
 
 class _TelemetryRegistry(Protocol):
     def upstream_started(self, handle: object) -> None: ...
@@ -123,6 +131,10 @@ class _TelemetryRegistry(Protocol):
 
     def set_reasoning_continuation(
         self, handle: object, value: ReasoningContinuation
+    ) -> None: ...
+
+    def orchestration_decision(
+        self, handle: object, decision: object
     ) -> None: ...
 
 
@@ -159,6 +171,9 @@ class RequestTelemetryObserver:
     ) -> None:
         self._registry.set_reasoning_continuation(self._handle, value)
 
+    def orchestration_decision(self, decision: object) -> None:
+        self._registry.orchestration_decision(self._handle, decision)
+
 
 _METRIC_STATUSES = frozenset({"observed", "unavailable", "not_applicable"})
 _OPERATIONS = frozenset({"messages", "count_tokens"})
@@ -167,6 +182,29 @@ _TERMINAL_OUTCOMES = frozenset({
     "failed",
     "cancelled",
     "client_disconnected",
+})
+_ORCHESTRATION_MODES = frozenset({
+    "off",
+    "advisory",
+    "enforce",
+    "not_applicable",
+})
+_ORCHESTRATION_DECISIONS = frozenset({
+    "not_applicable",
+    "advisory",
+    "root_allowed",
+    "nested_allowed",
+    "nested_denied",
+    "lineage_ambiguous",
+    "lineage_unknown",
+    "lineage_cyclic",
+    "authorization_expired",
+    "depth_limit_reached",
+})
+_LINEAGE_UNAVAILABLE_DECISIONS = frozenset({
+    "lineage_ambiguous",
+    "lineage_unknown",
+    "lineage_cyclic",
 })
 _REASONING_CONTINUATIONS = frozenset({
     "expected",
@@ -338,6 +376,12 @@ class RequestPerformanceSnapshot:
     retries: Measurement
     peak_concurrency: Measurement
     reasoning_continuation: ReasoningContinuation
+    orchestration_mode: str
+    orchestration_decision: str
+    orchestration_depth: Measurement
+    orchestration_authorization_present: bool
+    active_workers: Measurement
+    revision_deduplication: Measurement
     failure: FailureDiagnostic | None
 
 
@@ -359,6 +403,13 @@ class SessionPerformanceSnapshot:
     retries: MetricAggregate
     current_concurrency: int
     peak_concurrency: int
+    nested_allowed: int
+    nested_denied: int
+    depth_limit_reached: int
+    lineage_unavailable: int
+    maximum_observed_depth: Measurement
+    active_workers: Measurement
+    revision_deduplication: Measurement
     latest_request: RequestPerformanceSnapshot | None
 
 
@@ -386,6 +437,11 @@ class RequestPerformance:
         "_retries",
         "_peak_concurrency",
         "_reasoning_continuation",
+        "_orchestration_mode",
+        "_orchestration_decision",
+        "_orchestration_depth",
+        "_orchestration_authorization_present",
+        "_orchestration_recorded",
         "_failure",
     )
 
@@ -417,6 +473,11 @@ class RequestPerformance:
         self._initialize_metrics(operation)
         self._retries: int | None = None
         self._peak_concurrency = initial_concurrency
+        self._orchestration_mode = "not_applicable"
+        self._orchestration_decision = "not_applicable"
+        self._orchestration_depth = Measurement.not_applicable()
+        self._orchestration_authorization_present = False
+        self._orchestration_recorded = False
         self._failure: FailureDiagnostic | None = None
 
     @property
@@ -567,6 +628,18 @@ class RequestPerformance:
         if not self._is_terminal and self._operation == "messages":
             self._reasoning_continuation = continuation
 
+    def record_orchestration_decision(self, decision: object) -> bool:
+        values = _orchestration_values(decision)
+        if self._is_terminal or self._orchestration_recorded:
+            return False
+        mode, code, depth, authorization_present = values
+        self._orchestration_mode = mode
+        self._orchestration_decision = code
+        self._orchestration_depth = depth
+        self._orchestration_authorization_present = authorization_present
+        self._orchestration_recorded = True
+        return True
+
     def finish(
         self,
         outcome: RequestOutcome,
@@ -617,6 +690,14 @@ class RequestPerformance:
             retries=self._retry_measurement(),
             peak_concurrency=Measurement.observed(self._peak_concurrency),
             reasoning_continuation=self._reasoning_continuation,
+            orchestration_mode=self._orchestration_mode,
+            orchestration_decision=self._orchestration_decision,
+            orchestration_depth=self._orchestration_depth,
+            orchestration_authorization_present=(
+                self._orchestration_authorization_present
+            ),
+            active_workers=Measurement.unavailable(),
+            revision_deduplication=Measurement.unavailable(),
             failure=self._failure,
         )
 
@@ -681,6 +762,9 @@ class SessionPerformance:
         "_outcomes",
         "_aggregates",
         "_peak_concurrency",
+        "_orchestration_requests",
+        "_orchestration_counts",
+        "_maximum_observed_depth",
     )
 
     def __init__(self, session_id: str, history_limit: int = 20) -> None:
@@ -694,6 +778,14 @@ class SessionPerformance:
         self._outcomes: dict[str, int] = {}
         self._aggregates = {name: _Aggregate() for name in _AGGREGATE_METRICS}
         self._peak_concurrency = 0
+        self._orchestration_requests: set[str] = set()
+        self._orchestration_counts = {
+            "nested_allowed": 0,
+            "nested_denied": 0,
+            "depth_limit_reached": 0,
+            "lineage_unavailable": 0,
+        }
+        self._maximum_observed_depth: int | None = None
 
     def start(self, request: RequestPerformance) -> int:
         if request.session_id != self._session_id:
@@ -716,6 +808,41 @@ class SessionPerformance:
     def request(self, request_id: str) -> RequestPerformance | None:
         """Return one exact reducer for registry coordination only."""
         return self._pending.get(request_id)
+
+    def record_orchestration_decision(
+        self, request: RequestPerformance
+    ) -> bool:
+        if self._pending.get(request.request_id) is not request:
+            return False
+        if request.request_id in self._orchestration_requests:
+            return False
+        snapshot = request.snapshot(request.started_monotonic)
+        code = snapshot.orchestration_decision
+        counts = dict(self._orchestration_counts)
+        aggregate_code = (
+            "nested_denied" if code == "authorization_expired" else code
+        )
+        if aggregate_code in {
+            "nested_allowed",
+            "nested_denied",
+            "depth_limit_reached",
+        }:
+            counts[aggregate_code] = _increment_control_integer(
+                aggregate_code, counts[aggregate_code]
+            )
+        if code in _LINEAGE_UNAVAILABLE_DECISIONS:
+            counts["lineage_unavailable"] = _increment_control_integer(
+                "lineage unavailable", counts["lineage_unavailable"]
+            )
+        maximum = self._maximum_observed_depth
+        if snapshot.orchestration_depth.status == "observed":
+            value = snapshot.orchestration_depth.value
+            assert isinstance(value, int)
+            maximum = value if maximum is None else max(maximum, value)
+        self._orchestration_requests.add(request.request_id)
+        self._orchestration_counts = counts
+        self._maximum_observed_depth = maximum
+        return True
 
     def add_finalized(
         self, request: RequestPerformance
@@ -786,6 +913,21 @@ class SessionPerformance:
             retries=aggregates["retries"],
             current_concurrency=len(active),
             peak_concurrency=self._peak_concurrency,
+            nested_allowed=self._orchestration_counts["nested_allowed"],
+            nested_denied=self._orchestration_counts["nested_denied"],
+            depth_limit_reached=self._orchestration_counts[
+                "depth_limit_reached"
+            ],
+            lineage_unavailable=self._orchestration_counts[
+                "lineage_unavailable"
+            ],
+            maximum_observed_depth=(
+                Measurement.unavailable()
+                if self._maximum_observed_depth is None
+                else Measurement.observed(self._maximum_observed_depth)
+            ),
+            active_workers=Measurement.unavailable(),
+            revision_deduplication=Measurement.unavailable(),
             latest_request=latest,
         )
 
@@ -808,6 +950,24 @@ def _is_meaningful_block(block: object) -> bool:
     if isinstance(block, TextBlock):
         return bool(block.text)
     return isinstance(block, (RedactedThinkingBlock, ToolUseBlock))
+
+
+def _orchestration_values(
+    decision: object,
+) -> tuple[str, str, Measurement, bool]:
+    mode = str(getattr(decision, "mode", ""))
+    code = str(getattr(decision, "code", ""))
+    depth = getattr(decision, "depth", None)
+    authorization_present = getattr(decision, "authorization_present", None)
+    if mode not in _ORCHESTRATION_MODES:
+        raise ValueError("invalid orchestration mode")
+    if code not in _ORCHESTRATION_DECISIONS:
+        raise ValueError("invalid orchestration decision")
+    if type(depth) is not Measurement:
+        raise ValueError("orchestration depth must be a measurement")
+    if type(authorization_present) is not bool:
+        raise ValueError("authorization presence must be a boolean")
+    return mode, code, depth, authorization_present
 
 
 def _usage_measurement(usage: TokenUsage, field: UsageField) -> Measurement:
