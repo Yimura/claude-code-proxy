@@ -1,7 +1,7 @@
 """Runtime configuration loading."""
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, StrEnum
 import json
 import logging
 import os
@@ -23,6 +23,12 @@ class PerformanceMode(str, Enum):
     OFF = "off"
     COLLECTOR = "collector"
     LOGGING = "logging"
+
+
+class CodexOrchestrationMode(StrEnum):
+    OFF = "off"
+    ADVISORY = "advisory"
+    ENFORCE = "enforce"
 
 
 class ModelDefinition(BaseModel):
@@ -88,6 +94,7 @@ class Settings:
     control_socket_path: Path | None = None
     session_retention_limit: int = 1000
     performance_mode: PerformanceMode = PerformanceMode.OFF
+    codex_orchestration: CodexOrchestrationMode = CodexOrchestrationMode.ADVISORY
 
     @property
     def performance_enabled(self) -> bool:
@@ -122,6 +129,7 @@ class Settings:
             control_socket_path=_control_socket_path_from_environment(),
             session_retention_limit=_session_retention_limit_from_environment(),
             performance_mode=PerformanceMode.OFF,
+            codex_orchestration=CodexOrchestrationMode.ADVISORY,
         )
 
 

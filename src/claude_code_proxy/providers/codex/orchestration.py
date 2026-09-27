@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 
+from ...config import CodexOrchestrationMode
 from ...domain.models import CompletionRequest, TextBlock, ToolDefinition
 
 AGENT_COMPLETION_POLICY = (
@@ -71,6 +72,27 @@ SUBAGENT_AGENT_GUIDANCE = (
     "This request belongs to a subagent. Do not launch another Agent unless the "
     "parent explicitly authorized nested delegation."
 )
+ORCHESTRATION_RATIONALE = (
+    "Codex orchestration rationale:\n"
+    "Prior sessions used excessive narrow forks, recursive delegation, duplicate "
+    "review workers, and repeated discovery, causing avoidable token use. Prefer "
+    "a few broad owners, direct work for focused tasks, reuse of existing workers "
+    "for fixes and rechecks, batched local discovery, and one review after a "
+    "meaningful implementation batch."
+)
+ENFORCED_SUBAGENT_POLICY = (
+    "Enforced subagent policy:\n"
+    "This nested request is not authorized to delegate further, so Agent is not "
+    "available. Complete the assigned scope directly, reuse an existing worker "
+    "through SendMessage when applicable, or return the exact missing context to "
+    "the parent."
+)
+AUTHORIZED_NESTING_POLICY = (
+    "Authorized nesting policy:\n"
+    "Nested delegation is explicitly authorized only within its expiring, "
+    "depth-bounded grant. Keep ownership broad, avoid recursive fan-out, and reuse "
+    "workers instead of creating duplicate implementers or reviewers."
+)
 SEND_MESSAGE_GUIDANCE = (
     "Reuse the original implementer for related fixes and the original reviewer "
     "for rechecks. Send missing context to an existing worker instead of creating "
@@ -93,43 +115,101 @@ def reconcile_codex_orchestration(
     system: tuple[TextBlock, ...],
     tools: tuple[ToolDefinition, ...],
     *,
+    mode: CodexOrchestrationMode = CodexOrchestrationMode.ADVISORY,
     is_subagent: bool = False,
+    agent_allowed: bool = True,
+    authorization_present: bool = False,
 ) -> tuple[tuple[TextBlock, ...], tuple[ToolDefinition, ...]]:
-    """Add Codex Agent guidance without changing tool capabilities."""
+    """Apply stable Codex guidance and optionally remove only Agent."""
+    if mode is CodexOrchestrationMode.OFF:
+        return system, tools
+
     has_agent = any(tool.name == "Agent" for tool in tools)
+    filtered_tools = _filter_agent_tool(
+        tools,
+        mode=mode,
+        is_subagent=is_subagent,
+        agent_allowed=agent_allowed,
+    )
     reconciled_tools = tuple(
         _reconcile_tool(
             tool,
             is_subagent=is_subagent,
             has_agent=has_agent,
         )
-        for tool in tools
+        for tool in filtered_tools
     )
     if reconciled_tools == tools:
         reconciled_tools = tools
+    elif reconciled_tools == filtered_tools:
+        reconciled_tools = filtered_tools
 
     if not has_agent:
         return system, reconciled_tools
 
-    policies = (
-        (*_ROOT_POLICIES, SUBAGENT_SCOPE_POLICY)
-        if is_subagent
-        else _ROOT_POLICIES
+    policies = _orchestration_policies(
+        mode=mode,
+        is_subagent=is_subagent,
+        agent_allowed=agent_allowed,
+        authorization_present=authorization_present,
     )
     return _append_policies(system, policies), reconciled_tools
 
 
-def reconcile_codex_request(request: CompletionRequest) -> CompletionRequest:
-    """Return a request with role-aware Codex Agent guidance applied once."""
+def reconcile_codex_request(
+    request: CompletionRequest,
+    *,
+    mode: CodexOrchestrationMode = CodexOrchestrationMode.ADVISORY,
+    agent_allowed: bool = True,
+    authorization_present: bool = False,
+) -> CompletionRequest:
+    """Return a request with one role-aware orchestration reconciliation."""
     agent_id = (request.client_identity.agent_id or "").strip()
     system, tools = reconcile_codex_orchestration(
         request.system,
         request.tools,
+        mode=mode,
         is_subagent=bool(agent_id),
+        agent_allowed=agent_allowed,
+        authorization_present=authorization_present,
     )
     if system is request.system and tools is request.tools:
         return request
     return replace(request, system=system, tools=tools)
+
+
+def _filter_agent_tool(
+    tools: tuple[ToolDefinition, ...],
+    *,
+    mode: CodexOrchestrationMode,
+    is_subagent: bool,
+    agent_allowed: bool,
+) -> tuple[ToolDefinition, ...]:
+    if mode is not CodexOrchestrationMode.ENFORCE:
+        return tools
+    if not is_subagent or agent_allowed:
+        return tools
+    return tuple(tool for tool in tools if tool.name != "Agent")
+
+
+def _orchestration_policies(
+    *,
+    mode: CodexOrchestrationMode,
+    is_subagent: bool,
+    agent_allowed: bool,
+    authorization_present: bool,
+) -> tuple[str, ...]:
+    policies = (*_ROOT_POLICIES, ORCHESTRATION_RATIONALE)
+    if not is_subagent:
+        return policies
+    policies = (*policies, SUBAGENT_SCOPE_POLICY)
+    if mode is not CodexOrchestrationMode.ENFORCE:
+        return policies
+    if agent_allowed and authorization_present:
+        return (*policies, AUTHORIZED_NESTING_POLICY)
+    if not agent_allowed:
+        return (*policies, ENFORCED_SUBAGENT_POLICY)
+    return policies
 
 
 def _append_policies(

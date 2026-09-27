@@ -1,5 +1,6 @@
 import pytest
 
+from claude_code_proxy.config import CodexOrchestrationMode
 from claude_code_proxy.domain.models import (
     ClientIdentity,
     CompletionRequest,
@@ -11,7 +12,10 @@ from claude_code_proxy.providers.codex.orchestration import (
     AGENT_COMPLETION_POLICY,
     AGENT_GUIDANCE,
     AGENT_SCOPE_POLICY,
+    AUTHORIZED_NESTING_POLICY,
     DISCOVERY_POLICY,
+    ENFORCED_SUBAGENT_POLICY,
+    ORCHESTRATION_RATIONALE,
     SEND_MESSAGE_GUIDANCE,
     SUBAGENT_AGENT_GUIDANCE,
     SUBAGENT_SCOPE_POLICY,
@@ -80,6 +84,7 @@ def test_root_agent_adds_stable_system_and_tool_policies():
         TextBlock(AGENT_COMPLETION_POLICY),
         TextBlock(AGENT_SCOPE_POLICY),
         TextBlock(DISCOVERY_POLICY),
+        TextBlock(ORCHESTRATION_RATIONALE),
     )
     assert reconciled.tools[0].description == (
         f"Launch a worker.\n\n{AGENT_GUIDANCE}"
@@ -182,3 +187,89 @@ def test_send_message_remains_unchanged_without_agent():
     assert system == ()
     assert tools == (send_message,)
     assert tools[0] is send_message
+
+
+def test_off_returns_original_objects_without_guidance():
+    request = _request(agent_id="worker-1")
+
+    reconciled = reconcile_codex_request(
+        request,
+        mode=CodexOrchestrationMode.OFF,
+        agent_allowed=False,
+        authorization_present=False,
+    )
+
+    assert reconciled is request
+    assert reconciled.system is request.system
+    assert reconciled.tools is request.tools
+
+
+def test_advisory_preserves_agent_and_adds_fixed_rationale():
+    request = _request(agent_id="worker-1")
+
+    reconciled = reconcile_codex_request(
+        request,
+        mode=CodexOrchestrationMode.ADVISORY,
+        agent_allowed=False,
+        authorization_present=False,
+    )
+
+    assert reconciled.tools[0].name == "Agent"
+    assert reconciled.system.count(TextBlock(ORCHESTRATION_RATIONALE)) == 1
+    assert "narrow" in ORCHESTRATION_RATIONALE
+    assert "recursive" in ORCHESTRATION_RATIONALE
+    assert "duplicate" in ORCHESTRATION_RATIONALE
+    assert "discovery" in ORCHESTRATION_RATIONALE
+    assert "token" in ORCHESTRATION_RATIONALE
+
+
+def test_enforce_removes_only_agent_for_unauthorized_subagent():
+    request = _request(agent_id="worker-1")
+
+    reconciled = reconcile_codex_request(
+        request,
+        mode=CodexOrchestrationMode.ENFORCE,
+        agent_allowed=False,
+        authorization_present=False,
+    )
+
+    assert tuple(tool.name for tool in reconciled.tools) == (
+        "SendMessage",
+        "TaskOutput",
+    )
+    assert reconciled.tools[0].input_schema is request.tools[1].input_schema
+    assert reconciled.tools[1].input_schema is request.tools[2].input_schema
+    assert TextBlock(ENFORCED_SUBAGENT_POLICY) in reconciled.system
+
+
+def test_enforce_retains_agent_for_root_and_authorized_nesting():
+    root = reconcile_codex_request(
+        _request(),
+        mode=CodexOrchestrationMode.ENFORCE,
+        agent_allowed=True,
+        authorization_present=False,
+    )
+    nested = reconcile_codex_request(
+        _request(agent_id="worker-1"),
+        mode=CodexOrchestrationMode.ENFORCE,
+        agent_allowed=True,
+        authorization_present=True,
+    )
+
+    assert any(tool.name == "Agent" for tool in root.tools)
+    assert any(tool.name == "Agent" for tool in nested.tools)
+    assert TextBlock(AUTHORIZED_NESTING_POLICY) in nested.system
+
+
+def test_enforced_reconciliation_is_idempotent():
+    request = _request(agent_id="worker-1")
+    kwargs = {
+        "mode": CodexOrchestrationMode.ENFORCE,
+        "agent_allowed": False,
+        "authorization_present": False,
+    }
+
+    first = reconcile_codex_request(request, **kwargs)
+    second = reconcile_codex_request(first, **kwargs)
+
+    assert second is first

@@ -32,7 +32,7 @@ from .cli_common import (
     validated_filter as _validated_filter,
     validated_filters as _validated_filters,
 )
-from .config import PerformanceMode, Settings
+from .config import CodexOrchestrationMode, PerformanceMode, Settings
 from .control.client import (
     ControlClient,
     ControlError,
@@ -175,6 +175,13 @@ def proxy(
             help="Performance mode: off, collector, or logging.",
         ),
     ] = PerformanceMode.OFF,
+    codex_orchestration: Annotated[
+        CodexOrchestrationMode,
+        typer.Option(
+            "--codex-orchestration",
+            help="Codex orchestration mode: off, advisory, or enforce.",
+        ),
+    ] = CodexOrchestrationMode.ADVISORY,
 ) -> None:
     """Run the public proxy and local control endpoint in the foreground."""
     try:
@@ -186,6 +193,7 @@ def proxy(
             socket=socket,
             session_limit=session_limit,
             performance=performance,
+            codex_orchestration=codex_orchestration,
         )
         socket_path = resolve_socket_path(effective.control_socket_path)
         _configure_proxy_logging()
@@ -266,6 +274,7 @@ def _apply_proxy_overrides(
     socket: Path | None,
     session_limit: int | None,
     performance: PerformanceMode,
+    codex_orchestration: CodexOrchestrationMode,
 ) -> Settings:
     overrides = {
         "proxy_host": host,
@@ -273,6 +282,7 @@ def _apply_proxy_overrides(
         "control_socket_path": socket,
         "session_retention_limit": session_limit,
         "performance_mode": performance,
+        "codex_orchestration": codex_orchestration,
     }
     supplied = {
         name: value

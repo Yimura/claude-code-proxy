@@ -6,6 +6,7 @@ import pytest
 
 from claude_code_proxy import config as config_module
 from claude_code_proxy.config import (
+    CodexOrchestrationMode,
     ModelConfig,
     ModelDefinition,
     Settings,
@@ -110,6 +111,15 @@ def test_settings_uses_runtime_defaults(monkeypatch):
     assert settings.proxy_port == 8082
     assert settings.control_socket_path is None
     assert settings.session_retention_limit == 1000
+    assert settings.codex_orchestration is CodexOrchestrationMode.ADVISORY
+
+
+def test_codex_orchestration_is_cli_only(monkeypatch):
+    monkeypatch.setenv("CODEX_ORCHESTRATION", "enforce")
+
+    settings = Settings.from_environment()
+
+    assert settings.codex_orchestration is CodexOrchestrationMode.ADVISORY
 
 
 def test_settings_reads_runtime_overrides(monkeypatch, tmp_path):

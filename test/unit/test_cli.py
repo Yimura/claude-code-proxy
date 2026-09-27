@@ -13,7 +13,7 @@ from click import unstyle
 from claude_code_proxy import cli as cli_module
 import claude_code_proxy.control.socket as socket_module
 from claude_code_proxy.cli import app
-from claude_code_proxy.config import Settings
+from claude_code_proxy.config import CodexOrchestrationMode, Settings
 from test.unit.cli_test_support import ROOT, runner, settings
 
 
@@ -130,6 +130,8 @@ def test_proxy_reports_non_linux_control_socket_guidance(
         (["--socket", "/cli/control.sock"], "control_socket_path", Path("/cli/control.sock")),
         (["--session-limit", "0"], "session_retention_limit", 0),
         (["--session-limit", str(2**63 - 1)], "session_retention_limit", 2**63 - 1),
+        (["--codex-orchestration", "off"], "codex_orchestration", CodexOrchestrationMode.OFF),
+        (["--codex-orchestration", "enforce"], "codex_orchestration", CodexOrchestrationMode.ENFORCE),
     ],
 )
 def test_proxy_cli_options_override_environment_settings(
@@ -166,6 +168,7 @@ def test_proxy_cli_options_override_environment_settings(
         "proxy_port": configured.proxy_port,
         "control_socket_path": configured.control_socket_path,
         "session_retention_limit": configured.session_retention_limit,
+        "codex_orchestration": configured.codex_orchestration,
     }
     unchanged.pop(field)
     for name, value in unchanged.items():
@@ -347,7 +350,13 @@ def test_command_help_lists_documented_options(command: str) -> None:
     assert result.exit_code == 0
     help_text = unstyle(result.stdout)
     if command == "proxy":
-        for option in ("--host", "--port", "--socket", "--session-limit"):
+        for option in (
+            "--host",
+            "--port",
+            "--socket",
+            "--session-limit",
+            "--codex-orchestration",
+        ):
             assert option in help_text
         return
     if command == "tui":
