@@ -144,6 +144,11 @@ SafeString = Annotated[
     Field(strict=True),
     AfterValidator(_require_safe_string),
 ]
+RawSessionId = Annotated[
+    str,
+    Field(strict=True, max_length=256),
+    AfterValidator(_require_safe_string),
+]
 TelemetryModelString = Annotated[
     str,
     Field(strict=True, max_length=TELEMETRY_MODEL_MAX_LENGTH),
@@ -191,13 +196,13 @@ AuthorizationDuration = Annotated[int, Field(strict=True, ge=1, le=86400)]
 
 
 class OrchestrationAuthorizationRequest(_StrictFrozenModel):
-    session_id: SafeString
+    session_id: RawSessionId
     max_depth: AuthorizationDepth
     duration_seconds: AuthorizationDuration
 
 
 class OrchestrationRevocationRequest(_StrictFrozenModel):
-    session_id: SafeString
+    session_id: RawSessionId
 
 
 class OrchestrationAuthorizationResponse(_StrictFrozenModel):

@@ -4,7 +4,7 @@ import json
 from fastapi import HTTPException
 import pytest
 
-from claude_code_proxy.control.app import create_control_app
+from test.unit.control.app_test_support import create_test_control_app as create_control_app
 from claude_code_proxy.domain.models import ClientIdentity
 from claude_code_proxy.event_journal import EventJournal
 from claude_code_proxy.observability import SessionMetadata, SessionRegistry

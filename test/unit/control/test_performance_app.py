@@ -6,7 +6,7 @@ from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 import pytest
 
-from claude_code_proxy.control.app import create_control_app
+from test.unit.control.app_test_support import create_test_control_app as create_control_app
 from claude_code_proxy.control.schemas import (
     PerformanceEventResponse,
     PerformanceListResponse,

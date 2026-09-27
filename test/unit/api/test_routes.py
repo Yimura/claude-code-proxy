@@ -9,7 +9,7 @@ from httpx import ASGITransport, AsyncClient
 
 import claude_code_proxy.api.routes as routes_module
 from claude_code_proxy import cli as cli_module
-from claude_code_proxy.control.app import create_control_app
+from test.unit.control.app_test_support import create_test_control_app as create_control_app
 from claude_code_proxy.control.schemas import SessionListResponse
 from claude_code_proxy.domain.models import (
     ClientIdentity,

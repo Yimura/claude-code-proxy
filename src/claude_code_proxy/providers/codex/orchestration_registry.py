@@ -11,6 +11,11 @@ from ...public_identity import PublicIdentity
 
 
 MAX_LINEAGE_RECORDS_PER_SESSION = 1024
+MAX_AUTHORIZATION_RECORDS = 4096
+
+
+class AuthorizationCapacityExceeded(ValueError):
+    """The process-local authorization registry is at its safe capacity."""
 
 
 class ParentState(StrEnum):
@@ -72,9 +77,13 @@ class OrchestrationRegistry:
         *,
         identity: PublicIdentity | None = None,
         monotonic_clock: Callable[[], float] | None = None,
+        authorization_capacity: int = MAX_AUTHORIZATION_RECORDS,
     ) -> None:
         self._identity = identity
         self._monotonic_clock = monotonic_clock or time.monotonic
+        self._authorization_capacity = _authorization_capacity(
+            authorization_capacity
+        )
         self._lineages: dict[str, dict[str, _LineageRecord]] = {}
         self._authorizations: dict[str, NestingAuthorization] = {}
         self._generations: dict[str, int] = {}
@@ -146,6 +155,12 @@ class OrchestrationRegistry:
             now + seconds,
         )
         with self._lock:
+            self._prune_expired_locked(now)
+            is_new = session not in self._authorizations
+            if is_new and len(self._authorizations) >= self._authorization_capacity:
+                raise AuthorizationCapacityExceeded(
+                    "orchestration authorization capacity reached"
+                )
             self._authorizations[session] = authorization
             self._bump_generation_locked(session)
         return authorization
@@ -168,21 +183,19 @@ class OrchestrationRegistry:
         """Return active authorizations with expiry relative to one clock sample."""
         now = _finite_time(self._monotonic_clock())
         with self._lock:
-            rows = []
-            for authorization in self._authorizations.values():
-                if authorization.status is not AuthorizationStatus.ACTIVE:
-                    continue
-                assert authorization.expires_at is not None
-                assert authorization.max_depth is not None
-                remaining = authorization.expires_at - now
-                if remaining <= 0:
-                    continue
-                rows.append(ActiveNestingAuthorization(
+            self._prune_expired_locked(now)
+            rows = tuple(
+                ActiveNestingAuthorization(
                     authorization.session_id,
                     authorization.max_depth,
-                    remaining,
-                ))
-            return tuple(sorted(rows, key=lambda row: row.session_id))
+                    authorization.expires_at - now,
+                )
+                for authorization in self._authorizations.values()
+                if authorization.status is AuthorizationStatus.ACTIVE
+                and authorization.max_depth is not None
+                and authorization.expires_at is not None
+            )
+        return tuple(sorted(rows, key=lambda row: row.session_id))
 
     def authorization(self, session_id: str) -> NestingAuthorization:
         session = _identifier("session_id", session_id)
@@ -193,8 +206,6 @@ class OrchestrationRegistry:
                 return NestingAuthorization(
                     session, AuthorizationStatus.ABSENT, None, None, None
                 )
-            if authorization.status is AuthorizationStatus.EXPIRED:
-                return authorization
             assert authorization.expires_at is not None
             if now < authorization.expires_at:
                 return authorization
@@ -205,16 +216,18 @@ class OrchestrationRegistry:
                 authorization.authorized_at,
                 authorization.expires_at,
             )
-            self._authorizations[session] = expired
-            self._bump_generation_locked(session)
+            self._authorizations.pop(session)
+            self._cleanup_generation_locked(session)
             return expired
 
     def revoke(self, session_id: str) -> bool:
         session = _identifier("session_id", session_id)
         with self._lock:
             removed = self._authorizations.pop(session, None) is not None
-            if removed:
+            if removed and session in self._lineages:
                 self._bump_generation_locked(session)
+            elif removed:
+                self._cleanup_generation_locked(session)
             return removed
 
     def revoke_raw_session(self, raw_session_id: str) -> bool:
@@ -248,6 +261,22 @@ class OrchestrationRegistry:
         session = _identifier("session_id", session_id)
         with self._lock:
             self._remove_session_locked(session)
+
+    def _prune_expired_locked(self, now: float) -> None:
+        expired = tuple(
+            session_id
+            for session_id, authorization in self._authorizations.items()
+            if authorization.expires_at is not None
+            and now >= authorization.expires_at
+        )
+        for session_id in expired:
+            self._authorizations.pop(session_id, None)
+            self._cleanup_generation_locked(session_id)
+
+    def _cleanup_generation_locked(self, session_id: str) -> None:
+        if session_id in self._lineages or session_id in self._authorizations:
+            return
+        self._generations.pop(session_id, None)
 
     def _remove_session_locked(self, session_id: str) -> None:
         self._lineages.pop(session_id, None)
@@ -359,6 +388,12 @@ def _optional_identifier(name: str, value: object) -> str | None:
     if value is None:
         return None
     return _identifier(name, value)
+
+
+def _authorization_capacity(value: object) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("authorization capacity must be a positive integer")
+    return value
 
 
 def _authorization_depth(value: object) -> int:

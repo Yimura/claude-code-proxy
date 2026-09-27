@@ -15,7 +15,7 @@ import pytest
 from claude_code_proxy.api.routes import build_router
 from claude_code_proxy.cli_common import OutputFormat
 from claude_code_proxy.config import ModelConfig, Settings
-from claude_code_proxy.control.app import create_control_app
+from test.unit.control.app_test_support import create_test_control_app as create_control_app
 from claude_code_proxy.control.schemas import (
     OrchestrationAuthorizationListResponse,
     PerformanceEventResponse,

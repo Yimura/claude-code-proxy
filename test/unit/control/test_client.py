@@ -1141,3 +1141,63 @@ def test_authorization_mutation_errors_never_expose_raw_session_or_peer_detail(
     assert str(raised.value) == expected
     assert raw_session not in str(raised.value)
     assert raised.value.__cause__ is None
+
+
+@pytest.mark.parametrize("operation", ["allow", "revoke"])
+def test_authorization_client_enforces_raw_session_length_before_health(
+    operation: str,
+) -> None:
+    transport = RecordingTransport(
+        lambda request: httpx.Response(
+            200,
+            json=orchestration_health_payload(),
+            request=request,
+        )
+    )
+    with ControlClient(SOCKET_PATH, transport=transport) as client:
+        with pytest.raises(ControlError, match="Invalid orchestration"):
+            if operation == "allow":
+                client.allow_nesting(
+                    "x" * 257,
+                    max_depth=2,
+                    duration_seconds=60,
+                )
+            else:
+                client.revoke_nesting("x" * 257)
+
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize("operation", ["allow", "revoke"])
+def test_authorization_client_accepts_256_character_raw_session(
+    operation: str,
+) -> None:
+    raw_session = "x" * 256
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/health":
+            return httpx.Response(
+                200,
+                json=orchestration_health_payload(),
+                request=request,
+            )
+        if operation == "allow":
+            return httpx.Response(
+                200,
+                json=authorization_payload(),
+                request=request,
+            )
+        return httpx.Response(204, request=request)
+
+    transport = RecordingTransport(handler)
+    with ControlClient(SOCKET_PATH, transport=transport) as client:
+        if operation == "allow":
+            client.allow_nesting(
+                raw_session,
+                max_depth=2,
+                duration_seconds=60,
+            )
+        else:
+            client.revoke_nesting(raw_session)
+
+    assert json.loads(transport.requests[1].content)["session_id"] == raw_session
