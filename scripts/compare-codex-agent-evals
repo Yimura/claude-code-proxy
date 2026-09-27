@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Compare two privacy-safe Codex Agent evaluation reports."""
+
+from dataclasses import dataclass
+import json
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from test.integration.codex_agent_eval_support import EvalReport
+
+
+@dataclass(frozen=True, slots=True)
+class ReportComparison:
+    passed: bool
+    code: str
+
+    def to_json_object(self) -> dict[str, object]:
+        return {"code": self.code, "passed": self.passed}
+
+
+def compare_reports(
+    baseline: EvalReport,
+    candidate: EvalReport,
+) -> ReportComparison:
+    if baseline.model != candidate.model:
+        raise ValueError("model does not match")
+    baseline_names = {row.name for row in baseline.scenarios}
+    candidate_names = {row.name for row in candidate.scenarios}
+    if baseline_names != candidate_names:
+        raise ValueError("scenario sets do not match")
+    if candidate.completeness_rate < baseline.completeness_rate:
+        return ReportComparison(False, "outcome_completeness_decreased")
+    if _prohibited_behavior_regressed(baseline, candidate):
+        return ReportComparison(False, "prohibited_behavior_regressed")
+    return ReportComparison(True, "accepted")
+
+
+def _prohibited_behavior_regressed(
+    baseline: EvalReport, candidate: EvalReport
+) -> bool:
+    baseline_by_name = {row.name: row for row in baseline.scenarios}
+    for row in candidate.scenarios:
+        prior = baseline_by_name[row.name]
+        if row.completeness_rate < prior.completeness_rate:
+            return True
+        if row.pass_rate < prior.pass_rate:
+            return True
+        if row.duplicate_launches > prior.duplicate_launches:
+            return True
+        if not set(row.failure_codes) <= set(prior.failure_codes):
+            return True
+    return False
+
+
+def _read_report(path: Path) -> EvalReport:
+    with path.open("r", encoding="utf-8") as stream:
+        payload = json.load(stream)
+    return EvalReport.from_json_object(payload)
+
+
+def _emit(comparison: ReportComparison) -> None:
+    print(json.dumps(comparison.to_json_object(), sort_keys=True, separators=(",", ":")))
+
+
+def main(arguments: list[str]) -> int:
+    if len(arguments) != 2:
+        _emit(ReportComparison(False, "invalid_arguments"))
+        return 2
+    try:
+        baseline = _read_report(Path(arguments[0]))
+        candidate = _read_report(Path(arguments[1]))
+        comparison = compare_reports(baseline, candidate)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        _emit(ReportComparison(False, "invalid_report"))
+        return 2
+    _emit(comparison)
+    return 0 if comparison.passed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
