@@ -49,12 +49,21 @@ def _assert_http_contract(running: _RunningProxy) -> None:
         assert _public_get(
             public_client, running.port, "/v1/sessions"
         ).status_code == 404
+        assert _public_get(
+            public_client,
+            running.port,
+            "/v1/orchestration/authorizations",
+        ).status_code == 404
 
     health = _control_get(running.socket_path, "/v1/health")
     sessions = _control_get(running.socket_path, "/v1/sessions")
     assert health.status_code == sessions.status_code == 200
     assert health.json()["protocol_version"] == 1
-    assert health.json()["capabilities"] == ["sessions", "agents"]
+    assert health.json()["capabilities"] == [
+        "sessions",
+        "agents",
+        "orchestration_authorizations",
+    ]
     assert health.json()["pid"] == running.process.pid
     assert health.json()["inactive_limit"] == 2
     assert health.json()["sessions"] == {"active": 0, "retained": 0}
@@ -497,7 +506,11 @@ def test_performance_snapshot_and_events_stream_over_control_uds(
     ) as running:
         health = _control_get(running.socket_path, "/v1/health")
         assert health.json()["capabilities"] == [
-            "sessions", "agents", "performance", "performance_events"
+            "sessions",
+            "agents",
+            "performance",
+            "performance_events",
+            "orchestration_authorizations",
         ]
         response = _control_get(running.socket_path, "/v1/performance")
         assert response.status_code == 200

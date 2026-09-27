@@ -17,6 +17,7 @@ from claude_code_proxy.cli_common import OutputFormat
 from claude_code_proxy.config import ModelConfig, Settings
 from claude_code_proxy.control.app import create_control_app
 from claude_code_proxy.control.schemas import (
+    OrchestrationAuthorizationListResponse,
     PerformanceEventResponse,
     PerformanceListResponse,
     PerformanceResetResponse,
@@ -38,6 +39,9 @@ from claude_code_proxy.failures import (
 from claude_code_proxy.logging import RequestLoggingMiddleware
 from claude_code_proxy.model_mapping import ModelResolver
 from claude_code_proxy.observability import SessionRegistry
+from claude_code_proxy.public_identity import PublicIdentity
+from claude_code_proxy.providers.codex.orchestration_registry import OrchestrationRegistry
+from claude_code_proxy.orchestration_cli import render_authorizations
 from claude_code_proxy.performance_cli import render_performance
 from claude_code_proxy.performance_watch_cli import render_watch_event
 from claude_code_proxy.providers.base import ProviderError
@@ -64,6 +68,8 @@ _MARKERS = {
     "provider_type": "PRIVACY_PROVIDER_TYPE_ec9271",
     "direct_diagnostic": "PRIVACY_DIRECT_DIAGNOSTIC_f7063a",
     "exception": "PRIVACY_EXCEPTION_29bcf8",
+    "response": "PRIVACY_RESPONSE_4f913c",
+    "evaluator": "PRIVACY_EVALUATOR_7a302e",
 }
 _RETAINED_PROVIDER_CODES = (
     "rate_limit_exceeded",
@@ -108,7 +114,7 @@ class _PrivacyProvider:
         return CompletionResponse(
             "provider-response-id",
             request.response_model,
-            (TextBlock("client-visible response"),),
+            (TextBlock(f"client-visible {_MARKERS['response']}"),),
             "end_turn",
             TokenUsage(13, 5, cache_read_input_tokens=2, thinking_tokens=1),
         )
@@ -130,7 +136,7 @@ def _request_payload(*, stream: bool = False) -> dict[str, object]:
     return {
         "model": "claude-sonnet",
         "max_tokens": 100,
-        "system": _MARKERS["system"],
+        "system": f"{_MARKERS['system']} {_MARKERS['evaluator']}",
         "messages": [
             {"role": "user", "content": _MARKERS["user"]},
             {
@@ -191,11 +197,18 @@ def _headers() -> dict[str, str]:
 
 def _apps() -> tuple[FastAPI, FastAPI, SessionRegistry, _PrivacyProvider]:
     provider = _PrivacyProvider()
+    identity = PublicIdentity(secret=b"privacy-regression-secret")
     sessions = SessionRegistry(
         20,
-        secret=b"privacy-regression-secret",
+        identity=identity,
         performance_enabled=True,
         performance_logging_enabled=True,
+    )
+    orchestration = OrchestrationRegistry(identity=identity)
+    orchestration.authorize_raw_session(
+        _MARKERS["session"],
+        max_depth=4,
+        duration_seconds=3600,
     )
     service = ProxyService(
         ModelResolver(ModelConfig({}, {}, {})),
@@ -211,6 +224,7 @@ def _apps() -> tuple[FastAPI, FastAPI, SessionRegistry, _PrivacyProvider]:
         started_at=datetime(2026, 1, 1, tzinfo=UTC),
         application_version="privacy-test",
         pid=4242,
+        orchestration_registry=orchestration,
     )
     return public, control, sessions, provider
 
@@ -254,6 +268,9 @@ def _litellm_settings() -> Settings:
 @dataclass(frozen=True)
 class _ControlEvidence:
     snapshot: PerformanceListResponse
+    authorizations: OrchestrationAuthorizationListResponse
+    health_text: str
+    authorization_text: str
     response_text: str
     reset_line: str
     reset: PerformanceResetResponse
@@ -313,8 +330,16 @@ async def _collect_control_evidence(
         transport=ASGITransport(app=control), base_url="http://control"
     ) as client:
         response = await client.get("/v1/performance")
-    assert response.status_code == 200
+        health = await client.get("/v1/health")
+        authorization_response = await client.get(
+            "/v1/orchestration/authorizations"
+        )
+    assert response.status_code == health.status_code == 200
+    assert authorization_response.status_code == 200
     snapshot = PerformanceListResponse.model_validate(response.json())
+    authorizations = OrchestrationAuthorizationListResponse.model_validate(
+        authorization_response.json()
+    )
 
     lines: list[str] = []
     events: list[PerformanceStreamEvent] = []
@@ -325,6 +350,9 @@ async def _collect_control_evidence(
     await stream.body_iterator.aclose()
     return _ControlEvidence(
         snapshot,
+        authorizations,
+        health.text,
+        authorization_response.text,
         response.text,
         reset_line,
         reset,
@@ -351,6 +379,7 @@ def _assert_provider_boundary(provider: _PrivacyProvider) -> None:
         "tool_input",
         "tool_result",
         "reasoning",
+        "evaluator",
     ):
         assert _MARKERS[name] in request_text
 
@@ -389,6 +418,11 @@ def _render_exposed_surfaces(
             repr(sessions.performance_snapshots()),
             repr(sessions.snapshots()),
             repr(provider.telemetry),
+            repr(evidence.authorizations),
+            evidence.health_text,
+            evidence.authorization_text,
+            render_authorizations(evidence.authorizations, OutputFormat.JSON),
+            render_authorizations(evidence.authorizations, OutputFormat.TABLE),
             evidence.response_text,
             evidence.reset_line,
             *evidence.journal_lines,
@@ -435,6 +469,10 @@ def _assert_nonempty_safe_evidence(
     public_id = evidence.snapshot.sessions[0].session.id
     assert re.fullmatch(r"[0-9a-f]{64}", public_id)
     assert public_id in exposed_surfaces
+    assert evidence.authorizations.authorizations
+    authorization = evidence.authorizations.authorizations[0]
+    assert re.fullmatch(r"[0-9a-f]{64}", authorization.session_id)
+    assert authorization.session_id in exposed_surfaces
     assert {event.type for event in evidence.journal_events} >= {
         "request_started",
         "completed",

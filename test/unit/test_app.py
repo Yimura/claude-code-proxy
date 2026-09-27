@@ -216,3 +216,29 @@ async def test_public_app_does_not_expose_control_routes(tmp_path, path):
         response = await client.get(path)
 
     assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/v1/orchestration/authorizations"),
+        ("PUT", "/v1/orchestration/authorizations/raw-session"),
+        ("DELETE", "/v1/orchestration/authorizations/raw-session"),
+    ],
+)
+async def test_public_app_does_not_expose_orchestration_routes(tmp_path, method, path):
+    from httpx import ASGITransport, AsyncClient
+
+    runtime = runtime_module.create_runtime(settings(tmp_path))
+    application = app_module.create_app(runtime)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://public"
+    ) as client:
+        response = await client.request(
+            method,
+            path,
+            json={"max_depth": 2, "duration_seconds": 60},
+        )
+
+    assert response.status_code == 404

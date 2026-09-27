@@ -38,7 +38,7 @@ def create_runtime(settings: Settings | None = None) -> RuntimeServices:
     litellm_provider = LiteLLMProvider(configured)
     codex_auth = CodexAuth(configured.opencode_data_dir)
     identity = PublicIdentity()
-    orchestration_registry = OrchestrationRegistry()
+    orchestration_registry = OrchestrationRegistry(identity=identity)
     orchestration = OrchestrationPolicyCoordinator(
         configured.codex_orchestration,
         identity,

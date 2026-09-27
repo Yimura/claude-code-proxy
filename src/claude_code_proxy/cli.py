@@ -42,6 +42,7 @@ from .control.client import (
 from .control.schemas import AgentResponse, SessionListResponse, SessionResponse
 from .control.socket import resolve_socket_path
 from .limits import MAX_CONTROL_INTEGER
+from .orchestration_cli import orchestration as _orchestration_commands
 from .performance_cli import perf as _performance_report
 from .ps_watch_cli import validate_watch_output, watch_sessions
 
@@ -69,6 +70,7 @@ app = typer.Typer(
 )
 
 app.command(name="perf", help="Show or watch performance telemetry.")(_performance_report)
+app.add_typer(_orchestration_commands)
 
 
 def _interactive_tty() -> bool:

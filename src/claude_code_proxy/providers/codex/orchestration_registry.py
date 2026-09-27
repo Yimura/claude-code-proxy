@@ -7,6 +7,8 @@ import math
 import threading
 import time
 
+from ...public_identity import PublicIdentity
+
 
 MAX_LINEAGE_RECORDS_PER_SESSION = 1024
 
@@ -35,6 +37,13 @@ class NestingAuthorization:
 
 
 @dataclass(frozen=True, slots=True)
+class ActiveNestingAuthorization:
+    session_id: str
+    max_depth: int
+    remaining_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
 class ObservedLineage:
     session_id: str
     agent_id: str
@@ -59,8 +68,12 @@ class OrchestrationRegistry:
     """Retain immutable observations keyed only by opaque public identities."""
 
     def __init__(
-        self, *, monotonic_clock: Callable[[], float] | None = None
+        self,
+        *,
+        identity: PublicIdentity | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
     ) -> None:
+        self._identity = identity
         self._monotonic_clock = monotonic_clock or time.monotonic
         self._lineages: dict[str, dict[str, _LineageRecord]] = {}
         self._authorizations: dict[str, NestingAuthorization] = {}
@@ -137,6 +150,40 @@ class OrchestrationRegistry:
             self._bump_generation_locked(session)
         return authorization
 
+    def authorize_raw_session(
+        self,
+        raw_session_id: str,
+        *,
+        max_depth: int,
+        duration_seconds: int,
+    ) -> NestingAuthorization:
+        """Authorize one raw session without retaining its source identifier."""
+        return self.authorize(
+            self._public_session_id(raw_session_id),
+            max_depth=max_depth,
+            duration=duration_seconds,
+        )
+
+    def authorizations(self) -> tuple[ActiveNestingAuthorization, ...]:
+        """Return active authorizations with expiry relative to one clock sample."""
+        now = _finite_time(self._monotonic_clock())
+        with self._lock:
+            rows = []
+            for authorization in self._authorizations.values():
+                if authorization.status is not AuthorizationStatus.ACTIVE:
+                    continue
+                assert authorization.expires_at is not None
+                assert authorization.max_depth is not None
+                remaining = authorization.expires_at - now
+                if remaining <= 0:
+                    continue
+                rows.append(ActiveNestingAuthorization(
+                    authorization.session_id,
+                    authorization.max_depth,
+                    remaining,
+                ))
+            return tuple(sorted(rows, key=lambda row: row.session_id))
+
     def authorization(self, session_id: str) -> NestingAuthorization:
         session = _identifier("session_id", session_id)
         now = _finite_time(self._monotonic_clock())
@@ -169,6 +216,16 @@ class OrchestrationRegistry:
             if removed:
                 self._bump_generation_locked(session)
             return removed
+
+    def revoke_raw_session(self, raw_session_id: str) -> bool:
+        """Revoke one raw session without retaining its source identifier."""
+        return self.revoke(self._public_session_id(raw_session_id))
+
+    def _public_session_id(self, raw_session_id: str) -> str:
+        raw = _identifier("session_id", raw_session_id)
+        if self._identity is None:
+            raise RuntimeError("raw session conversion requires a public identity")
+        return self._identity.public_id(raw)
 
     def session_generation(self, session_id: str) -> int:
         session = _identifier("session_id", session_id)

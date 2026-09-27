@@ -205,6 +205,8 @@ def _create_control_server(
     application = create_control_app(
         runtime.sessions,
         started_at=runtime.started_at,
+        orchestration_registry=runtime.orchestration_registry,
+        orchestration_mode=runtime.orchestration.mode,
     )
     config = _server_config(application, graceful_timeout)
     return server_factory(config)

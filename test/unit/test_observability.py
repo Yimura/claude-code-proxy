@@ -746,3 +746,91 @@ def test_last_seen_does_not_decrease_when_wall_clock_moves_backward() -> None:
     assert updated.first_seen == initial.first_seen
     assert updated.last_seen == initial.last_seen
     assert updated.first_seen <= updated.last_seen
+
+
+def test_active_session_protects_lineage_and_authorization_from_eviction() -> None:
+    identity = PublicIdentity(secret=b"shared-secret")
+    orchestration = OrchestrationRegistry(identity=identity)
+    sessions = SessionRegistry(
+        0,
+        identity=identity,
+        session_eviction_generation=orchestration.session_generation,
+        on_session_evicted=orchestration.remove_session_if_generation,
+    )
+    public_active = identity.public_id("active")
+    active_agent = identity.public_agent_id("active", "agent")
+    orchestration.observe_lineage(public_active, active_agent, None)
+    orchestration.authorize_raw_session("active", max_depth=2, duration_seconds=60)
+    active = sessions.begin(metadata("active", agent_id="agent"))
+    inactive = sessions.begin(metadata("inactive"))
+
+    sessions.finish(inactive, "completed")
+
+    assert active.public_id == public_active
+    assert orchestration.lineage(public_active, active_agent) is not None
+    assert orchestration.authorization(public_active).status == "active"
+
+
+async def test_orchestration_event_publishes_only_after_successful_mutation() -> None:
+    from claude_code_proxy.config import CodexOrchestrationMode
+    from claude_code_proxy.performance import Measurement
+    from claude_code_proxy.providers.codex.orchestration_policy import (
+        OrchestrationDecision,
+        OrchestrationDecisionCode,
+    )
+
+    clock = Clock()
+    sessions = registry(clock)
+    handle = sessions.begin(metadata("session", agent_id="agent"))
+    before = sessions.events.current_sequence
+
+    with pytest.raises(ValueError, match="orchestration mode"):
+        sessions.orchestration_decision(handle, object())
+    assert sessions.events.current_sequence == before
+
+    decision = OrchestrationDecision(
+        CodexOrchestrationMode.ENFORCE,
+        OrchestrationDecisionCode.NESTED_ALLOWED,
+        Measurement.observed(2),
+        True,
+        True,
+    )
+    sessions.orchestration_decision(handle, decision)
+    subscription = sessions.events.subscribe(before)
+    try:
+        [event] = subscription.replay
+    finally:
+        subscription.close()
+
+    assert event.type == "orchestration"
+    assert event.request.orchestration_decision == "nested_allowed"
+    assert event.request.orchestration_depth == Measurement.observed(2)
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["completed", "failed", "cancelled", "client_disconnected"],
+)
+def test_request_outcome_does_not_create_orchestration_lifecycle_state(outcome) -> None:
+    identity = PublicIdentity(secret=b"shared-secret")
+    orchestration = OrchestrationRegistry(identity=identity)
+    sessions = SessionRegistry(10, identity=identity)
+    public_session = identity.public_id("session")
+    public_agent = identity.public_agent_id("session", "agent")
+    lineage = orchestration.observe_lineage(public_session, public_agent, None)
+    orchestration.authorize_raw_session("session", max_depth=2, duration_seconds=60)
+    handle = sessions.begin(metadata("session", agent_id="agent"))
+
+    sessions.finish(handle, outcome)
+
+    assert orchestration.lineage(public_session, public_agent) == lineage
+    assert orchestration.authorization(public_session).status == "active"
+    assert not any(
+        term in name
+        for name in vars(orchestration)
+        for term in ("lifecycle", "worker", "revision")
+    )
+    snapshot = sessions.performance_snapshots().sessions[0].performance
+    assert snapshot.latest_request.outcome == outcome
+    assert snapshot.active_workers.status == "unavailable"
+    assert snapshot.revision_deduplication.status == "unavailable"

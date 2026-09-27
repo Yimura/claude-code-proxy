@@ -12,7 +12,9 @@ import pytest
 import uvicorn
 
 import claude_code_proxy.server as server_module
+from claude_code_proxy.config import CodexOrchestrationMode
 from claude_code_proxy.observability import SessionRegistry
+from claude_code_proxy.providers.codex.orchestration_registry import OrchestrationRegistry
 
 
 class FakeLease:
@@ -142,6 +144,8 @@ def runtime():
         service=object(),
         codex_auth=object(),
         sessions=SessionRegistry(7),
+        orchestration_registry=OrchestrationRegistry(),
+        orchestration=SimpleNamespace(mode=CodexOrchestrationMode.ENFORCE),
         started_at=datetime(2026, 1, 2, 3, 4, tzinfo=UTC),
     )
 
@@ -156,9 +160,17 @@ def fake_apps(monkeypatch):
         observed["runtime"] = received_runtime
         return public_app
 
-    def create_control(sessions, *, started_at):
+    def create_control(
+        sessions,
+        *,
+        started_at,
+        orchestration_registry,
+        orchestration_mode,
+    ):
         observed["sessions"] = sessions
         observed["started_at"] = started_at
+        observed["orchestration_registry"] = orchestration_registry
+        observed["orchestration_mode"] = orchestration_mode
         return control_app
 
     monkeypatch.setattr(server_module, "create_app", create_public)
@@ -433,6 +445,8 @@ async def test_app_constructors_receive_exact_shared_runtime_values(fake_apps):
     assert observed["runtime"] is shared_runtime
     assert observed["sessions"] is shared_runtime.sessions
     assert observed["started_at"] is shared_runtime.started_at
+    assert observed["orchestration_registry"] is shared_runtime.orchestration_registry
+    assert observed["orchestration_mode"] is shared_runtime.orchestration.mode
 
     stop.set()
     await task
@@ -855,9 +869,20 @@ async def test_apps_share_runtime_data_configs_are_explicit_and_routes_are_separ
     control_context = health_route.endpoint.__closure__[0].cell_contents
     assert control_context.sessions is shared_runtime.sessions
     assert control_context.started_at == shared_runtime.started_at
+    assert control_context.orchestration_registry is shared_runtime.orchestration_registry
+    assert control_context.orchestration_mode is shared_runtime.orchestration.mode
+    orchestration_path = "/v1/orchestration/authorizations"
+    orchestration_item_path = orchestration_path + "/{session_id}"
     assert "/v1/health" not in public_paths
     assert "/v1/sessions" not in public_paths
-    assert {"/v1/health", "/v1/sessions"} <= control_paths
+    assert orchestration_path not in public_paths
+    assert orchestration_item_path not in public_paths
+    assert {
+        "/v1/health",
+        "/v1/sessions",
+        orchestration_path,
+        orchestration_item_path,
+    } <= control_paths
 
     assert public_config.host == shared_runtime.settings.proxy_host
     assert public_config.port == shared_runtime.settings.proxy_port
@@ -911,7 +936,7 @@ async def test_real_uvicorn_drains_then_cancels_request_and_runs_lifespan(
     monkeypatch.setattr(
         server_module,
         "create_control_app",
-        lambda sessions, *, started_at: control_app,
+        lambda sessions, **kwargs: control_app,
     )
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1053,7 +1078,7 @@ async def test_real_uvicorn_force_cancels_requests_and_lifespans(monkeypatch):
     monkeypatch.setattr(
         server_module,
         "create_control_app",
-        lambda sessions, *, started_at: control_app,
+        lambda sessions, **kwargs: control_app,
     )
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1187,7 +1212,7 @@ async def test_force_during_uvicorn_startup_settles_created_lifespan_task(
     monkeypatch.setattr(
         server_module,
         "create_control_app",
-        lambda sessions, *, started_at: control_app,
+        lambda sessions, **kwargs: control_app,
     )
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

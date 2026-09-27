@@ -144,6 +144,9 @@ def test_create_runtime_shares_identity_and_wires_orchestration_eviction(tmp_pat
     runtime.orchestration_registry.observe_lineage(
         public_session, public_agent, None
     )
+    runtime.orchestration_registry.authorize_raw_session(
+        "session", max_depth=2, duration_seconds=60
+    )
     handle = runtime.sessions.begin(
         SessionMetadata(
             client_identity=ClientIdentity("session"),
@@ -160,3 +163,17 @@ def test_create_runtime_shares_identity_and_wires_orchestration_eviction(tmp_pat
     assert runtime.orchestration_registry.lineage(
         public_session, public_agent
     ) is None
+    assert runtime.orchestration_registry.authorization(public_session).status == "absent"
+    assert runtime.orchestration_registry.authorizations() == ()
+
+
+def test_fresh_runtime_has_no_orchestration_state(tmp_path):
+    first = runtime_module.create_runtime(settings(tmp_path / "first"))
+    first.orchestration_registry.authorize_raw_session(
+        "session", max_depth=2, duration_seconds=60
+    )
+
+    second = runtime_module.create_runtime(settings(tmp_path / "second"))
+
+    assert first.orchestration_registry.authorizations()
+    assert second.orchestration_registry.authorizations() == ()
