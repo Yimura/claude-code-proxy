@@ -6,6 +6,7 @@ import threading
 import pytest
 
 from claude_code_proxy.domain.models import ClientIdentity
+from claude_code_proxy.public_identity import PublicIdentity
 from claude_code_proxy.observability import (
     AmbiguousSessionId,
     InvalidSessionFilter,
@@ -27,6 +28,48 @@ def test_constructor_enforces_signed_64_inactive_limit() -> None:
 def test_constructor_rejects_negative_inactive_limit() -> None:
     with pytest.raises(ValueError, match="inactive_limit"):
         SessionRegistry(-1)
+
+
+def test_registry_accepts_shared_identity_and_rejects_secret_with_service() -> None:
+    identity = PublicIdentity(secret=b"shared-secret")
+    sessions = SessionRegistry(1, identity=identity)
+
+    assert sessions.public_id("session") == identity.public_id("session")
+    with pytest.raises(ValueError, match="secret.*identity"):
+        SessionRegistry(1, secret=b"secret", identity=identity)
+
+
+def test_inactive_eviction_callback_runs_outside_registry_lock() -> None:
+    evicted: list[str] = []
+    holder: dict[str, SessionRegistry] = {}
+
+    def on_evict(public_id: str) -> None:
+        evicted.append(public_id)
+        holder["sessions"].counts()
+
+    sessions = SessionRegistry(0, secret=b"secret", on_session_evicted=on_evict)
+    holder["sessions"] = sessions
+    handle = sessions.begin(metadata("evicted"))
+
+    sessions.finish(handle, "completed")
+
+    assert evicted == [handle.public_id]
+
+
+def test_eviction_callback_never_reports_active_rows() -> None:
+    evicted: list[str] = []
+    sessions = SessionRegistry(
+        0,
+        secret=b"secret",
+        on_session_evicted=evicted.append,
+    )
+    active = sessions.begin(metadata("active"))
+    inactive = sessions.begin(metadata("inactive"))
+
+    sessions.finish(inactive, "completed")
+
+    assert evicted == [inactive.public_id]
+    assert active.public_id not in evicted
 
 
 def test_agents_share_root_aggregate_but_keep_independent_counts() -> None:
