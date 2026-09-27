@@ -2,6 +2,7 @@ import pytest
 
 from claude_code_proxy.providers.codex.orchestration_registry import (
     AuthorizationStatus,
+    MAX_LINEAGE_RECORDS_PER_SESSION,
     OrchestrationRegistry,
     ParentState,
 )
@@ -98,6 +99,47 @@ def test_sessions_scope_equal_agent_ids_and_eviction_removes_only_one_session() 
 
     assert registry.lineage("one", "agent") is None
     assert registry.lineage("two", "agent") is not None
+
+
+def test_conditional_session_removal_requires_unchanged_generation() -> None:
+    registry = OrchestrationRegistry()
+    registry.observe_lineage("session", "old", None)
+    generation = registry.session_generation("session")
+    registry.observe_lineage("session", "new", None)
+
+    assert registry.remove_session_if_generation("session", generation) is False
+    assert registry.lineage("session", "new") is not None
+    current = registry.session_generation("session")
+    assert registry.remove_session_if_generation("session", current) is True
+    assert registry.lineage("session", "new") is None
+
+
+def test_reverse_order_deep_chain_resolves_iteratively() -> None:
+    registry = OrchestrationRegistry()
+    count = min(900, MAX_LINEAGE_RECORDS_PER_SESSION)
+
+    for index in reversed(range(count)):
+        parent = None if index == 0 else f"agent-{index - 1}"
+        registry.observe_lineage("session", f"agent-{index}", parent)
+
+    deepest = registry.lineage("session", f"agent-{count - 1}")
+    assert deepest is not None
+    assert deepest.parent_state is ParentState.OBSERVED
+    assert deepest.depth == count
+
+
+def test_lineage_cardinality_limit_fails_closed_without_retention() -> None:
+    registry = OrchestrationRegistry()
+    for index in range(MAX_LINEAGE_RECORDS_PER_SESSION):
+        registry.observe_lineage("session", f"agent-{index}", None)
+
+    overflow = registry.observe_lineage("session", "overflow-agent", None)
+
+    assert overflow is not None
+    assert overflow.parent_state is ParentState.UNKNOWN
+    assert overflow.depth is None
+    assert registry.lineage("session", "overflow-agent") is None
+    assert registry.lineage("session", "agent-0") is not None
 
 
 def test_authorization_before_lineage_is_supported_and_expires_atomically() -> None:

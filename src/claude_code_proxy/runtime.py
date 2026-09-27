@@ -59,7 +59,12 @@ def create_runtime(settings: Settings | None = None) -> RuntimeServices:
     sessions = SessionRegistry(
         configured.session_retention_limit,
         identity=identity,
-        on_session_evicted=orchestration_registry.remove_session,
+        on_session_evicted=(
+            orchestration_registry.remove_session_if_generation
+        ),
+        session_eviction_generation=(
+            orchestration_registry.session_generation
+        ),
         events=events,
         performance_enabled=configured.performance_enabled,
         performance_logging_enabled=(

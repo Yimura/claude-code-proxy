@@ -7,6 +7,9 @@ import pytest
 
 from claude_code_proxy.domain.models import ClientIdentity
 from claude_code_proxy.public_identity import PublicIdentity
+from claude_code_proxy.providers.codex.orchestration_registry import (
+    OrchestrationRegistry,
+)
 from claude_code_proxy.observability import (
     AmbiguousSessionId,
     InvalidSessionFilter,
@@ -54,6 +57,42 @@ def test_inactive_eviction_callback_runs_outside_registry_lock() -> None:
     sessions.finish(handle, "completed")
 
     assert evicted == [handle.public_id]
+
+
+def test_delayed_eviction_cannot_remove_reactivated_orchestration_state() -> None:
+    identity = PublicIdentity(secret=b"shared-secret")
+    orchestration = OrchestrationRegistry()
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+
+    def delayed_cleanup(public_id: str, generation: int) -> None:
+        callback_entered.set()
+        assert release_callback.wait(timeout=5)
+        orchestration.remove_session_if_generation(public_id, generation)
+
+    sessions = SessionRegistry(
+        0,
+        identity=identity,
+        session_eviction_generation=orchestration.session_generation,
+        on_session_evicted=delayed_cleanup,
+    )
+    public_session = identity.public_id("same-session")
+    old_agent = identity.public_agent_id("same-session", "old-agent")
+    orchestration.observe_lineage(public_session, old_agent, None)
+    old = sessions.begin(metadata("same-session"))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        finished = executor.submit(sessions.finish, old, "completed")
+        assert callback_entered.wait(timeout=5)
+        sessions.begin(metadata("same-session"))
+        new_agent = identity.public_agent_id("same-session", "new-agent")
+        orchestration.observe_lineage(public_session, new_agent, None)
+        orchestration.authorize(public_session, max_depth=2, duration=60)
+        release_callback.set()
+        assert finished.result(timeout=5) is not None
+
+    assert orchestration.lineage(public_session, new_agent) is not None
+    assert orchestration.authorization(public_session).status == "active"
 
 
 def test_eviction_callback_never_reports_active_rows() -> None:

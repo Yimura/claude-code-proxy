@@ -8,6 +8,9 @@ import threading
 import time
 
 
+MAX_LINEAGE_RECORDS_PER_SESSION = 1024
+
+
 class ParentState(StrEnum):
     OBSERVED = "observed"
     ABSENT = "absent"
@@ -61,6 +64,8 @@ class OrchestrationRegistry:
         self._monotonic_clock = monotonic_clock or time.monotonic
         self._lineages: dict[str, dict[str, _LineageRecord]] = {}
         self._authorizations: dict[str, NestingAuthorization] = {}
+        self._generations: dict[str, int] = {}
+        self._next_generation = 0
         self._lock = threading.Lock()
 
     def observe_lineage(
@@ -78,6 +83,17 @@ class OrchestrationRegistry:
         with self._lock:
             records = self._lineages.setdefault(session, {})
             record = records.get(agent)
+            if record is None and len(records) >= MAX_LINEAGE_RECORDS_PER_SESSION:
+                self._bump_generation_locked(session)
+                return ObservedLineage(
+                    session,
+                    agent,
+                    parent,
+                    ParentState.UNKNOWN,
+                    None,
+                    now,
+                    now,
+                )
             if record is None:
                 record = _LineageRecord(parent, now, now)
                 records[agent] = record
@@ -85,6 +101,7 @@ class OrchestrationRegistry:
                 record.last_observed_at = now
                 if record.parent_agent_id != parent:
                     record.conflicting_parent = True
+            self._bump_generation_locked(session)
             self._resolve_session(records, now)
             return _snapshot(session, agent, record)
 
@@ -117,6 +134,7 @@ class OrchestrationRegistry:
         )
         with self._lock:
             self._authorizations[session] = authorization
+            self._bump_generation_locked(session)
         return authorization
 
     def authorization(self, session_id: str) -> NestingAuthorization:
@@ -141,54 +159,110 @@ class OrchestrationRegistry:
                 authorization.expires_at,
             )
             self._authorizations[session] = expired
+            self._bump_generation_locked(session)
             return expired
 
     def revoke(self, session_id: str) -> bool:
         session = _identifier("session_id", session_id)
         with self._lock:
-            return self._authorizations.pop(session, None) is not None
+            removed = self._authorizations.pop(session, None) is not None
+            if removed:
+                self._bump_generation_locked(session)
+            return removed
+
+    def session_generation(self, session_id: str) -> int:
+        session = _identifier("session_id", session_id)
+        with self._lock:
+            return self._generations.get(session, 0)
+
+    def remove_session_if_generation(
+        self, session_id: str, generation: int
+    ) -> bool:
+        session = _identifier("session_id", session_id)
+        if type(generation) is not int or generation < 0:
+            raise ValueError("generation must be a non-negative integer")
+        with self._lock:
+            if self._generations.get(session) != generation:
+                return False
+            self._remove_session_locked(session)
+            return True
 
     def remove_session(self, session_id: str) -> None:
         session = _identifier("session_id", session_id)
         with self._lock:
-            self._lineages.pop(session, None)
-            self._authorizations.pop(session, None)
+            self._remove_session_locked(session)
+
+    def _remove_session_locked(self, session_id: str) -> None:
+        self._lineages.pop(session_id, None)
+        self._authorizations.pop(session_id, None)
+        self._generations.pop(session_id, None)
+
+    def _bump_generation_locked(self, session_id: str) -> int:
+        self._next_generation += 1
+        self._generations[session_id] = self._next_generation
+        return self._next_generation
 
     @staticmethod
     def _resolve_session(
         records: dict[str, _LineageRecord], now: float
     ) -> None:
-        memo: dict[str, tuple[ParentState, int | None]] = {}
+        resolved: dict[str, tuple[ParentState, int | None]] = {}
+        visit_state: dict[str, int] = {}
+        for start in records:
+            if start in resolved:
+                continue
+            path: list[str] = []
+            current = start
+            while current not in resolved:
+                if visit_state.get(current) == 1:
+                    for agent_id in path:
+                        resolved[agent_id] = (ParentState.CYCLIC, None)
+                        visit_state[agent_id] = 2
+                    path.clear()
+                    break
+                visit_state[current] = 1
+                path.append(current)
+                record = records[current]
+                terminal = _terminal_resolution(record, records)
+                if terminal is not None:
+                    resolved[current] = terminal
+                    visit_state[current] = 2
+                    path.pop()
+                    break
+                assert record.parent_agent_id is not None
+                current = record.parent_agent_id
 
-        def resolve(
-            agent_id: str, path: frozenset[str]
-        ) -> tuple[ParentState, int | None]:
-            cached = memo.get(agent_id)
-            if cached is not None:
-                return cached
-            record = records[agent_id]
-            if record.conflicting_parent:
-                result = (ParentState.AMBIGUOUS, None)
-            elif record.parent_agent_id is None:
-                result = (ParentState.ABSENT, 1)
-            elif agent_id in path:
-                result = (ParentState.CYCLIC, None)
-            elif record.parent_agent_id not in records:
-                result = (ParentState.UNKNOWN, None)
-            else:
-                parent_state, parent_depth = resolve(
-                    record.parent_agent_id, path | {agent_id}
+            while path:
+                agent_id = path.pop()
+                if agent_id in resolved:
+                    continue
+                parent_id = records[agent_id].parent_agent_id
+                assert parent_id is not None
+                parent_state, parent_depth = resolved[parent_id]
+                resolved[agent_id] = _child_resolution(
+                    parent_state, parent_depth
                 )
-                result = _child_resolution(parent_state, parent_depth)
-            memo[agent_id] = result
-            return result
+                visit_state[agent_id] = 2
 
         for agent_id, record in records.items():
-            state, depth = resolve(agent_id, frozenset())
+            state, depth = resolved[agent_id]
             if state != record.parent_state or depth != record.depth:
                 record.last_observed_at = now
             record.parent_state = state
             record.depth = depth
+
+
+def _terminal_resolution(
+    record: _LineageRecord,
+    records: dict[str, _LineageRecord],
+) -> tuple[ParentState, int | None] | None:
+    if record.conflicting_parent:
+        return ParentState.AMBIGUOUS, None
+    if record.parent_agent_id is None:
+        return ParentState.ABSENT, 1
+    if record.parent_agent_id not in records:
+        return ParentState.UNKNOWN, None
+    return None
 
 
 def _child_resolution(

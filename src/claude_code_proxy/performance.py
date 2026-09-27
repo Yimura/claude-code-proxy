@@ -1,6 +1,5 @@
 """Provider-neutral request performance measurements and reduction."""
 
-import asyncio
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -85,9 +84,7 @@ def notify_telemetry(
     try:
         callback = getattr(telemetry, method_name)
         callback(*args)
-    except asyncio.CancelledError:
-        raise
-    except BaseException:
+    except Exception:
         logger.warning("telemetry callback failed")
 
 
@@ -442,6 +439,7 @@ class RequestPerformance:
         "_orchestration_depth",
         "_orchestration_authorization_present",
         "_orchestration_recorded",
+        "_orchestration_aggregated",
         "_failure",
     )
 
@@ -478,6 +476,7 @@ class RequestPerformance:
         self._orchestration_depth = Measurement.not_applicable()
         self._orchestration_authorization_present = False
         self._orchestration_recorded = False
+        self._orchestration_aggregated = False
         self._failure: FailureDiagnostic | None = None
 
     @property
@@ -640,6 +639,12 @@ class RequestPerformance:
         self._orchestration_recorded = True
         return True
 
+    def claim_orchestration_aggregation(self) -> bool:
+        if not self._orchestration_recorded or self._orchestration_aggregated:
+            return False
+        self._orchestration_aggregated = True
+        return True
+
     def finish(
         self,
         outcome: RequestOutcome,
@@ -762,7 +767,6 @@ class SessionPerformance:
         "_outcomes",
         "_aggregates",
         "_peak_concurrency",
-        "_orchestration_requests",
         "_orchestration_counts",
         "_maximum_observed_depth",
     )
@@ -778,7 +782,6 @@ class SessionPerformance:
         self._outcomes: dict[str, int] = {}
         self._aggregates = {name: _Aggregate() for name in _AGGREGATE_METRICS}
         self._peak_concurrency = 0
-        self._orchestration_requests: set[str] = set()
         self._orchestration_counts = {
             "nested_allowed": 0,
             "nested_denied": 0,
@@ -814,7 +817,7 @@ class SessionPerformance:
     ) -> bool:
         if self._pending.get(request.request_id) is not request:
             return False
-        if request.request_id in self._orchestration_requests:
+        if not request.claim_orchestration_aggregation():
             return False
         snapshot = request.snapshot(request.started_monotonic)
         code = snapshot.orchestration_decision
@@ -839,7 +842,6 @@ class SessionPerformance:
             value = snapshot.orchestration_depth.value
             assert isinstance(value, int)
             maximum = value if maximum is None else max(maximum, value)
-        self._orchestration_requests.add(request.request_id)
         self._orchestration_counts = counts
         self._maximum_observed_depth = maximum
         return True

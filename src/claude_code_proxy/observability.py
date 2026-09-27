@@ -205,7 +205,8 @@ class SessionRegistry:
         inactive_limit: int,
         secret: bytes | None = None,
         identity: PublicIdentity | None = None,
-        on_session_evicted: Callable[[str], None] | None = None,
+        on_session_evicted: Callable[..., None] | None = None,
+        session_eviction_generation: Callable[[str], int] | None = None,
         wall_clock: Callable[[], datetime] | None = None,
         monotonic_clock: Callable[[], float] | None = None,
         events: EventJournal | None = None,
@@ -231,6 +232,7 @@ class SessionRegistry:
             raise ValueError("secret and identity cannot both be supplied")
         self._identity = identity or PublicIdentity(secret=secret)
         self._on_session_evicted = on_session_evicted
+        self._session_eviction_generation = session_eviction_generation
         self._wall_clock = wall_clock or (lambda: datetime.now(UTC))
         self._monotonic_clock = monotonic_clock or time.monotonic
         self._events = events or EventJournal(4096, 64)
@@ -713,20 +715,25 @@ class SessionRegistry:
 
     def _retain_finished_locked(
         self, handle: ObservationHandle, record: _SessionRecord
-    ) -> tuple[str, ...]:
+    ) -> tuple[tuple[str, int | None], ...]:
         if record.active:
             return ()
         self._inactive[handle.key] = None
         self._inactive.move_to_end(handle.key)
         return self._evict_inactive()
 
-    def _notify_evicted(self, public_ids: tuple[str, ...]) -> None:
+    def _notify_evicted(
+        self, evicted: tuple[tuple[str, int | None], ...]
+    ) -> None:
         callback = self._on_session_evicted
         if callback is None:
             return
-        for public_id in public_ids:
+        for public_id, generation in evicted:
             try:
-                callback(public_id)
+                if generation is None:
+                    callback(public_id)
+                else:
+                    callback(public_id, generation)
             except Exception:
                 continue
 
@@ -891,12 +898,19 @@ class SessionRegistry:
             session=_performance(record).snapshot(now),
         )
 
-    def _evict_inactive(self) -> tuple[str, ...]:
-        public_ids: list[str] = []
+    def _evict_inactive(self) -> tuple[tuple[str, int | None], ...]:
+        evicted: list[tuple[str, int | None]] = []
         while len(self._inactive) > self._inactive_limit:
             oldest_key, _ = self._inactive.popitem(last=False)
-            public_ids.append(self._records.pop(oldest_key).public_id)
-        return tuple(public_ids)
+            public_id = self._records[oldest_key].public_id
+            generation = None
+            if self._session_eviction_generation is not None:
+                # Lock order is SessionRegistry then the auxiliary registry.
+                # Cleanup runs after this lock is released and never reverses it.
+                generation = self._session_eviction_generation(public_id)
+            del self._records[oldest_key]
+            evicted.append((public_id, generation))
+        return tuple(evicted)
 
 
 def _validate_inactive_limit(inactive_limit: object) -> None:

@@ -75,10 +75,16 @@ async def test_orchestration_telemetry_runs_after_filtering_and_cannot_restore_a
     ]
 
 
-async def test_orchestration_telemetry_base_failure_cannot_change_output():
-    class TelemetryCrash(BaseException):
-        pass
-
+@pytest.mark.parametrize(
+    "failure",
+    [
+        asyncio.CancelledError(),
+        KeyboardInterrupt(),
+        SystemExit(),
+        GeneratorExit(),
+    ],
+)
+async def test_orchestration_telemetry_preserves_control_flow(failure):
     class FailingTelemetry:
         def mark_retries_supported(self):
             pass
@@ -87,18 +93,10 @@ async def test_orchestration_telemetry_base_failure_cannot_change_output():
             pass
 
         def orchestration_decision(self, decision):
-            raise TelemetryCrash("sensitive telemetry failure")
+            raise failure
 
-    Client.responses = [completed_response()]
-
-    events = await collect(
-        CodexProvider(Auth(), Client), telemetry=FailingTelemetry()
-    )
-
-    assert events == [
-        StreamStart(),
-        StreamComplete("end_turn", TokenUsage(0, 0)),
-    ]
+    with pytest.raises(type(failure)):
+        await collect(CodexProvider(Auth(), Client), telemetry=FailingTelemetry())
 
 
 async def test_codex_telemetry_callback_failure_is_isolated(caplog):
