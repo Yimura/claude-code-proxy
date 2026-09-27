@@ -872,17 +872,17 @@ async def test_apps_share_runtime_data_configs_are_explicit_and_routes_are_separ
     assert control_context.orchestration_registry is shared_runtime.orchestration_registry
     assert control_context.orchestration_mode is shared_runtime.orchestration.mode
     orchestration_path = "/v1/orchestration/authorizations"
-    orchestration_item_path = orchestration_path + "/{session_id}"
     assert "/v1/health" not in public_paths
     assert "/v1/sessions" not in public_paths
     assert orchestration_path not in public_paths
-    assert orchestration_item_path not in public_paths
-    assert {
-        "/v1/health",
-        "/v1/sessions",
-        orchestration_path,
-        orchestration_item_path,
-    } <= control_paths
+    assert {"/v1/health", "/v1/sessions", orchestration_path} <= control_paths
+    orchestration_methods = {
+        method
+        for route in control_app.routes
+        if getattr(route, "path", None) == orchestration_path
+        for method in route.methods
+    }
+    assert {"GET", "PUT", "DELETE"} <= orchestration_methods
 
     assert public_config.host == shared_runtime.settings.proxy_host
     assert public_config.port == shared_runtime.settings.proxy_port

@@ -32,6 +32,7 @@ from .schemas import (
     OrchestrationAuthorizationListResponse,
     OrchestrationAuthorizationRequest,
     OrchestrationAuthorizationResponse,
+    OrchestrationRevocationRequest,
     PerformanceCursorResponse,
     PerformanceEventResponse,
     PerformanceListResponse,
@@ -126,16 +127,15 @@ def _register_control_routes(
         return _session_list_response(context, filter)
 
     @application.put(
-        "/v1/orchestration/authorizations/{session_id}",
+        "/v1/orchestration/authorizations",
         response_model=OrchestrationAuthorizationResponse,
     )
     def allow_nesting(
-        session_id: str,
         request: OrchestrationAuthorizationRequest,
     ) -> OrchestrationAuthorizationResponse:
         try:
             authorization = context.orchestration_registry.authorize_raw_session(
-                session_id,
+                request.session_id,
                 max_depth=request.max_depth,
                 duration_seconds=request.duration_seconds,
             )
@@ -147,10 +147,10 @@ def _register_control_routes(
             remaining_seconds=float(request.duration_seconds),
         )
 
-    @application.delete("/v1/orchestration/authorizations/{session_id}")
-    def revoke_nesting(session_id: str) -> Response:
+    @application.delete("/v1/orchestration/authorizations")
+    def revoke_nesting(request: OrchestrationRevocationRequest) -> Response:
         try:
-            context.orchestration_registry.revoke_raw_session(session_id)
+            context.orchestration_registry.revoke_raw_session(request.session_id)
         except (TypeError, ValueError):
             raise HTTPException(422, "Invalid orchestration authorization") from None
         return Response(status_code=204)

@@ -9,7 +9,6 @@ import math
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
-from urllib.parse import quote
 
 import httpx
 from pydantic import TypeAdapter, ValidationError
@@ -21,6 +20,7 @@ from .schemas import (
     OrchestrationAuthorizationListResponse,
     OrchestrationAuthorizationRequest,
     OrchestrationAuthorizationResponse,
+    OrchestrationRevocationRequest,
     PerformanceListResponse,
     PerformanceResetResponse,
     PerformanceStreamEvent,
@@ -159,13 +159,20 @@ class ControlClient:
         duration_seconds: int,
     ) -> OrchestrationAuthorizationResponse:
         """Create or replace one bounded nesting authorization."""
-        request = _authorization_request(max_depth, duration_seconds)
+        request = _authorization_request(
+            session_id,
+            max_depth,
+            duration_seconds,
+        )
         self._require_orchestration_authorizations()
         payload = self._request_json(
-            _authorization_path(session_id),
+            "/v1/orchestration/authorizations",
             method="PUT",
             json_body=request.model_dump(mode="json"),
             missing_endpoint="orchestration authorizations",
+            failure_message=(
+                "Control API failed to create orchestration authorization"
+            ),
             invalid_json_message=(
                 "Control API returned an invalid orchestration authorization response"
             ),
@@ -180,12 +187,20 @@ class ControlClient:
 
     def revoke_nesting(self, session_id: str) -> None:
         """Idempotently revoke one nesting authorization."""
+        try:
+            request = OrchestrationRevocationRequest(session_id=session_id)
+        except ValidationError:
+            raise ControlError("Invalid orchestration revocation request") from None
         self._require_orchestration_authorizations()
         self._request_json(
-            _authorization_path(session_id),
+            "/v1/orchestration/authorizations",
             method="DELETE",
+            json_body=request.model_dump(mode="json"),
             empty_success_status=204,
             missing_endpoint="orchestration authorizations",
+            failure_message=(
+                "Control API failed to revoke orchestration authorization"
+            ),
         )
 
     def orchestration_authorizations(
@@ -308,6 +323,7 @@ class ControlClient:
         json_body: dict[str, Any] | None = None,
         empty_success_status: int | None = None,
         missing_endpoint: str | None = None,
+        failure_message: str | None = None,
         invalid_json_message: str = "Control API returned invalid JSON",
         suppress_invalid_json_cause: bool = False,
     ) -> dict[str, Any]:
@@ -320,6 +336,8 @@ class ControlClient:
                 json=json_body,
             )
         except httpx.RequestError as error:
+            if failure_message is not None:
+                raise ControlError(failure_message) from None
             raise ControlUnavailable(self.socket_path, str(error)) from error
         endpoint = "health" if path == "/v1/health" else missing_endpoint
         if endpoint is not None and response.status_code == 404:
@@ -327,6 +345,8 @@ class ControlClient:
                 f"Control API {endpoint} endpoint is missing (HTTP 404)"
             )
         if not response.is_success:
+            if failure_message is not None:
+                raise ControlError(failure_message)
             raise ControlError(_http_error_message(response))
         if empty_success_status is not None:
             if response.status_code != empty_success_status or response.content:
@@ -348,23 +368,18 @@ class ControlClient:
 
 
 def _authorization_request(
+    session_id: str,
     max_depth: int,
     duration_seconds: int,
 ) -> OrchestrationAuthorizationRequest:
     try:
         return OrchestrationAuthorizationRequest(
+            session_id=session_id,
             max_depth=max_depth,
             duration_seconds=duration_seconds,
         )
     except ValidationError:
         raise ControlError("Invalid orchestration authorization request") from None
-
-
-def _authorization_path(session_id: str) -> str:
-    if not isinstance(session_id, str) or not session_id.strip():
-        raise ControlError("Invalid orchestration session ID")
-    encoded = quote(session_id, safe="")
-    return f"/v1/orchestration/authorizations/{encoded}"
 
 
 def _validated_performance_events(

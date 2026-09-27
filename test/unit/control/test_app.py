@@ -623,9 +623,15 @@ def test_orchestration_control_schemas_are_strict_frozen_and_bounded() -> None:
     from claude_code_proxy.control.schemas import (
         OrchestrationAuthorizationRequest,
         OrchestrationAuthorizationResponse,
+        OrchestrationRevocationRequest,
     )
 
-    request = OrchestrationAuthorizationRequest(max_depth=2, duration_seconds=1)
+    request = OrchestrationAuthorizationRequest(
+        session_id="raw/session",
+        max_depth=2,
+        duration_seconds=1,
+    )
+    revocation = OrchestrationRevocationRequest(session_id="../raw-session")
     response = OrchestrationAuthorizationResponse(
         session_id="a" * 64,
         max_depth=8,
@@ -635,6 +641,8 @@ def test_orchestration_control_schemas_are_strict_frozen_and_bounded() -> None:
         request.max_depth = 3
     with pytest.raises(ValidationError, match="frozen"):
         response.max_depth = 3
+    with pytest.raises(ValidationError, match="frozen"):
+        revocation.session_id = "other"
     for field, value in (
         ("max_depth", True),
         ("max_depth", 2.0),
@@ -643,12 +651,26 @@ def test_orchestration_control_schemas_are_strict_frozen_and_bounded() -> None:
         ("duration_seconds", 1.0),
         ("duration_seconds", "1"),
     ):
-        payload = {"max_depth": 2, "duration_seconds": 1, field: value}
+        payload = {
+            "session_id": "raw-session",
+            "max_depth": 2,
+            "duration_seconds": 1,
+            field: value,
+        }
         with pytest.raises(ValidationError):
             OrchestrationAuthorizationRequest.model_validate(payload)
     with pytest.raises(ValidationError):
         OrchestrationAuthorizationRequest.model_validate(
-            {"max_depth": 2, "duration_seconds": 1, "extra": "rejected"}
+            {
+                "session_id": "raw-session",
+                "max_depth": 2,
+                "duration_seconds": 1,
+                "extra": "rejected",
+            }
+        )
+    with pytest.raises(ValidationError):
+        OrchestrationRevocationRequest.model_validate(
+            {"session_id": "raw-session", "extra": "rejected"}
         )
     for remaining in (-1, float("nan"), float("inf")):
         with pytest.raises(ValidationError):
@@ -673,27 +695,47 @@ async def test_private_orchestration_routes_hash_raw_session_and_list_active_row
         orchestration_registry=orchestration,
         orchestration_mode=CodexOrchestrationMode.ENFORCE,
     )
-    raw = "sensitive-raw-session"
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://control") as client:
-        allowed = await client.put(
-            f"/v1/orchestration/authorizations/{raw}",
-            json={"max_depth": 4, "duration_seconds": 60},
-        )
-        listed = await client.get("/v1/orchestration/authorizations")
-        revoked = await client.delete(f"/v1/orchestration/authorizations/{raw}")
-        revoked_again = await client.delete(f"/v1/orchestration/authorizations/{raw}")
+    raw_ids = (
+        "sensitive-raw-session",
+        "folder/child",
+        ".",
+        "..",
+        "./nested",
+        "../sibling",
+    )
+    endpoint = "/v1/orchestration/authorizations"
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://control",
+    ) as client:
+        for raw in raw_ids:
+            allowed = await client.put(
+                endpoint,
+                json={
+                    "session_id": raw,
+                    "max_depth": 4,
+                    "duration_seconds": 60,
+                },
+            )
+            listed = await client.get(endpoint)
+            revoked = await client.request(
+                "DELETE", endpoint, json={"session_id": raw}
+            )
+            revoked_again = await client.request(
+                "DELETE", endpoint, json={"session_id": raw}
+            )
 
-    public_id = identity.public_id(raw)
-    assert allowed.status_code == 200
-    assert allowed.json() == {
-        "session_id": public_id,
-        "max_depth": 4,
-        "remaining_seconds": 60.0,
-    }
-    assert listed.json() == {"authorizations": [allowed.json()]}
-    assert raw not in allowed.text + listed.text
-    assert revoked.status_code == revoked_again.status_code == 204
-    assert revoked.content == revoked_again.content == b""
+            public_id = identity.public_id(raw)
+            assert allowed.status_code == 200
+            assert allowed.json() == {
+                "session_id": public_id,
+                "max_depth": 4,
+                "remaining_seconds": 60.0,
+            }
+            assert listed.json() == {"authorizations": [allowed.json()]}
+            assert json.dumps(raw) not in allowed.text + listed.text
+            assert revoked.status_code == revoked_again.status_code == 204
+            assert revoked.content == revoked_again.content == b""
 
 
 async def test_private_health_reports_orchestration_mode_and_capability() -> None:
@@ -715,20 +757,25 @@ async def test_private_health_reports_orchestration_mode_and_capability() -> Non
 @pytest.mark.parametrize(
     "payload",
     [
-        {"max_depth": True, "duration_seconds": 60},
-        {"max_depth": 2.0, "duration_seconds": 60},
-        {"max_depth": "2", "duration_seconds": 60},
-        {"max_depth": 2, "duration_seconds": True},
-        {"max_depth": 2, "duration_seconds": 60.0},
-        {"max_depth": 2, "duration_seconds": "60"},
-        {"max_depth": 2, "duration_seconds": 60, "raw": "secret-marker"},
+        {"session_id": "raw-secret", "max_depth": True, "duration_seconds": 60},
+        {"session_id": "raw-secret", "max_depth": 2.0, "duration_seconds": 60},
+        {"session_id": "raw-secret", "max_depth": "2", "duration_seconds": 60},
+        {"session_id": "raw-secret", "max_depth": 2, "duration_seconds": True},
+        {"session_id": "raw-secret", "max_depth": 2, "duration_seconds": 60.0},
+        {"session_id": "raw-secret", "max_depth": 2, "duration_seconds": "60"},
+        {
+            "session_id": "raw-secret",
+            "max_depth": 2,
+            "duration_seconds": 60,
+            "raw": "secret-marker",
+        },
     ],
 )
 async def test_private_authorization_validation_error_is_generic(payload) -> None:
     app = create_control_app(registry(RegistryClock()), application_version="1.0", pid=1)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://control") as client:
         response = await client.put(
-            "/v1/orchestration/authorizations/raw-secret",
+            "/v1/orchestration/authorizations",
             json=payload,
         )
 

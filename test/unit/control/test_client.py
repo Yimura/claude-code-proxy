@@ -986,13 +986,19 @@ def test_allow_nesting_negotiates_capability_and_sends_strict_put_json() -> None
         return httpx.Response(200, json=authorization_payload(), request=request)
 
     transport = RecordingTransport(handler)
+    raw_session = "folder/../raw-session"
     with ControlClient(SOCKET_PATH, transport=transport) as client:
-        result = client.allow_nesting("raw-session", max_depth=4, duration_seconds=60)
+        result = client.allow_nesting(
+            raw_session,
+            max_depth=4,
+            duration_seconds=60,
+        )
 
     assert result.session_id == "a" * 64
     assert [request.method for request in transport.requests] == ["GET", "PUT"]
-    assert transport.requests[1].url.path.endswith("/raw-session")
+    assert transport.requests[1].url.path == "/v1/orchestration/authorizations"
     assert json.loads(transport.requests[1].content) == {
+        "session_id": raw_session,
         "max_depth": 4,
         "duration_seconds": 60,
     }
@@ -1005,10 +1011,15 @@ def test_revoke_nesting_uses_delete_and_accepts_only_204() -> None:
         return httpx.Response(204, request=request)
 
     transport = RecordingTransport(handler)
+    raw_session = "../raw/session"
     with ControlClient(SOCKET_PATH, transport=transport) as client:
-        assert client.revoke_nesting("raw-session") is None
+        assert client.revoke_nesting(raw_session) is None
 
     assert [request.method for request in transport.requests] == ["GET", "DELETE"]
+    assert transport.requests[1].url.path == "/v1/orchestration/authorizations"
+    assert json.loads(transport.requests[1].content) == {
+        "session_id": raw_session
+    }
 
 
 def test_orchestration_authorizations_validates_exact_list_rows() -> None:
@@ -1077,4 +1088,56 @@ def test_orchestration_invalid_json_is_bounded_and_suppresses_parser_detail() ->
     assert str(raised.value) == (
         "Control API returned an invalid orchestration authorizations response"
     )
+    assert raised.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [
+        ("allow", "Control API failed to create orchestration authorization"),
+        ("revoke", "Control API failed to revoke orchestration authorization"),
+    ],
+)
+@pytest.mark.parametrize("failure", ["transport", "http"])
+def test_authorization_mutation_errors_never_expose_raw_session_or_peer_detail(
+    operation: str,
+    expected: str,
+    failure: str,
+) -> None:
+    raw_session = "RAW_SESSION_PRIVACY/folder/../marker"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/health":
+            return httpx.Response(
+                200,
+                json=orchestration_health_payload(),
+                request=request,
+            )
+        if failure == "transport":
+            raise httpx.ConnectError(
+                f"transport leaked {raw_session}",
+                request=request,
+            )
+        return httpx.Response(
+            503,
+            json={"detail": f"peer leaked {raw_session}"},
+            request=request,
+        )
+
+    with ControlClient(
+        SOCKET_PATH,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(ControlError) as raised:
+            if operation == "allow":
+                client.allow_nesting(
+                    raw_session,
+                    max_depth=2,
+                    duration_seconds=60,
+                )
+            else:
+                client.revoke_nesting(raw_session)
+
+    assert str(raised.value) == expected
+    assert raw_session not in str(raised.value)
     assert raised.value.__cause__ is None

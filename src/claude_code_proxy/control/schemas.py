@@ -191,8 +191,13 @@ AuthorizationDuration = Annotated[int, Field(strict=True, ge=1, le=86400)]
 
 
 class OrchestrationAuthorizationRequest(_StrictFrozenModel):
+    session_id: SafeString
     max_depth: AuthorizationDepth
     duration_seconds: AuthorizationDuration
+
+
+class OrchestrationRevocationRequest(_StrictFrozenModel):
+    session_id: SafeString
 
 
 class OrchestrationAuthorizationResponse(_StrictFrozenModel):

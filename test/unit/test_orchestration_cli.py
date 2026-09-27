@@ -1,9 +1,11 @@
 from pathlib import Path
 
+import httpx
 import pytest
 
 from claude_code_proxy import orchestration_cli
 from claude_code_proxy.cli import app
+from claude_code_proxy.control.client import ControlClient
 from claude_code_proxy.control.schemas import (
     OrchestrationAuthorizationListResponse,
     OrchestrationAuthorizationResponse,
@@ -84,25 +86,39 @@ def test_duration_grammar_rejects_invalid_or_out_of_range_values(value):
 def test_allow_nesting_prints_warning_before_authorizing_and_defaults_to_60m():
     result = runner.invoke(
         app,
-        ["orchestration", "allow-nesting", "--session-id", "raw", "--max-depth", "3"],
+        [
+            "orchestration",
+            "allow-nesting",
+            "--session-id",
+            "folder/../raw",
+            "--max-depth",
+            "3",
+        ],
     )
 
     assert result.exit_code == 0
     assert "recursive Agent delegation can increase fan-out and token use" in result.stderr
-    assert FakeClient.instances[0].calls == [("allow", "raw", 3, 3600)]
-    assert "raw" not in result.stdout
+    assert FakeClient.instances[0].calls == [
+        ("allow", "folder/../raw", 3, 3600)
+    ]
+    assert "folder/../raw" not in result.stdout
     assert "a" * 64 in result.stdout
 
 
 def test_revoke_nesting_calls_private_client_without_rendering_raw_id():
     result = runner.invoke(
         app,
-        ["orchestration", "revoke-nesting", "--session-id", "raw-secret"],
+        [
+            "orchestration",
+            "revoke-nesting",
+            "--session-id",
+            "../raw/secret",
+        ],
     )
 
     assert result.exit_code == 0
-    assert FakeClient.instances[0].calls == [("revoke", "raw-secret")]
-    assert "raw-secret" not in result.stdout + result.stderr
+    assert FakeClient.instances[0].calls == [("revoke", "../raw/secret")]
+    assert "../raw/secret" not in result.stdout + result.stderr
 
 
 def test_authorizations_json_contains_only_safe_row_fields():
@@ -129,3 +145,73 @@ def test_orchestration_subgroup_is_registered_in_root_help():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     assert "orchestration" in result.stdout
+
+
+def _health_payload() -> dict[str, object]:
+    return {
+        "protocol_version": 1,
+        "application_version": "test",
+        "pid": 1,
+        "started_at": "2026-01-01T00:00:00Z",
+        "uptime_seconds": 1.0,
+        "capabilities": ["orchestration_authorizations"],
+        "orchestration_mode": "enforce",
+        "sessions": {"active": 0, "retained": 0},
+        "inactive_limit": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("command", "failure", "expected"),
+    [
+        (
+            ["allow-nesting", "--max-depth", "2"],
+            "transport",
+            "Control API failed to create orchestration authorization",
+        ),
+        (
+            ["revoke-nesting"],
+            "http",
+            "Control API failed to revoke orchestration authorization",
+        ),
+    ],
+)
+def test_mutation_failures_never_render_raw_session_or_peer_detail(
+    monkeypatch,
+    command,
+    failure,
+    expected,
+):
+    raw_session = "CLI_RAW_SESSION/folder/../marker"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/health":
+            return httpx.Response(200, json=_health_payload(), request=request)
+        if failure == "transport":
+            raise httpx.ConnectError(
+                f"transport leaked {raw_session}",
+                request=request,
+            )
+        return httpx.Response(
+            503,
+            json={"detail": f"peer leaked {raw_session}"},
+            request=request,
+        )
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        orchestration_cli,
+        "ControlClient",
+        lambda socket_path: ControlClient(socket_path, transport=transport),
+    )
+
+    result = runner.invoke(
+        app,
+        ["orchestration", *command, "--session-id", raw_session],
+    )
+
+    assert result.exit_code == 1
+    assert expected in result.stderr
+    assert raw_session not in result.stdout + result.stderr
+    assert "peer leaked" not in result.stderr
+    assert "transport leaked" not in result.stderr
