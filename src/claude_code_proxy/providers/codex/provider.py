@@ -429,8 +429,6 @@ class CodexProvider:
         request: CompletionRequest,
         telemetry: ProviderTelemetry | None = None,
     ) -> int:
-        if self._token_counter is None:
-            return 1000
         orchestration = self._orchestration.reconcile(request)
         reconciled = orchestration.request
         notify_telemetry(
@@ -439,6 +437,8 @@ class CodexProvider:
             orchestration.decision,
         )
         log_orchestration_decision(orchestration.decision)
+        if self._token_counter is None:
+            return 1000
         if telemetry is None:
             return await self._token_counter(reconciled)
         return await self._token_counter(reconciled, telemetry=telemetry)

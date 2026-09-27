@@ -47,6 +47,7 @@ from test.unit.providers.codex.provider_test_support import (
     ExitClient,
     RawBodyStream,
     RecordingOrchestration,
+    RecordingTelemetry,
     RealResponseContext,
     Response,
     collect,
@@ -1321,6 +1322,27 @@ async def test_stream_reconciles_exactly_once_before_translation():
 
     assert orchestration.calls == [orchestration_request()]
     assert Client.requests
+
+
+async def test_count_tokens_fallback_reconciles_and_reports_decision():
+    orchestration = RecordingOrchestration()
+    telemetry = RecordingTelemetry()
+    original = orchestration_request(agent_id="worker")
+    provider = CodexProvider(
+        Auth(),
+        Client,
+        orchestration=orchestration,
+    )
+
+    result = await provider.count_tokens(original, telemetry=telemetry)
+
+    assert result == 1000
+    assert orchestration.calls == [original]
+    assert len(telemetry.calls) == 1
+    name, decision = telemetry.calls[0]
+    assert name == "orchestration_decision"
+    assert decision.code == "advisory"
+    assert decision.authorization_present is False
 
 
 async def test_count_tokens_reconciles_exactly_once_before_local_counter():
