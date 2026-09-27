@@ -6,6 +6,7 @@ import json
 
 import httpx
 
+from ...config import CodexOrchestrationMode
 from ...domain.models import (
     CompletionRequest,
     StreamComplete,
@@ -13,6 +14,7 @@ from ...domain.models import (
     StreamStart,
 )
 from ...performance import ProviderTelemetry, notify_telemetry
+from ...public_identity import PublicIdentity
 from ...failures import (
     FailureCategory,
     FailureDiagnostic,
@@ -28,7 +30,8 @@ from ..base import (
 )
 from .auth import CodexAuth
 from .identity import CodexIdentity
-from .orchestration import reconcile_codex_request
+from .orchestration_policy import OrchestrationPolicyCoordinator
+from .orchestration_registry import OrchestrationRegistry
 from .translation import (
     CodexEventTranslator,
     build_request,
@@ -60,10 +63,19 @@ class CodexProvider:
         auth: CodexAuth,
         client_factory=httpx.AsyncClient,
         token_counter=None,
+        orchestration: OrchestrationPolicyCoordinator | None = None,
     ) -> None:
         self._auth = auth
         self._client_factory = client_factory
         self._token_counter = token_counter
+        if orchestration is None:
+            identity = PublicIdentity()
+            orchestration = OrchestrationPolicyCoordinator(
+                CodexOrchestrationMode.ADVISORY,
+                identity,
+                OrchestrationRegistry(),
+            )
+        self._orchestration = orchestration
 
     async def complete(
         self,
@@ -177,7 +189,8 @@ class CodexProvider:
                 reasoning_continuation_state(request),
             )
         try:
-            request = reconcile_codex_request(request)
+            orchestration = self._orchestration.reconcile(request)
+            request = orchestration.request
             identity = CodexIdentity.from_client(request.client_identity)
             return request, identity, build_request(request, identity)
         except Exception as error:
@@ -411,7 +424,7 @@ class CodexProvider:
     ) -> int:
         if self._token_counter is None:
             return 1000
-        reconciled = reconcile_codex_request(request)
+        reconciled = self._orchestration.reconcile(request).request
         if telemetry is None:
             return await self._token_counter(reconciled)
         return await self._token_counter(reconciled, telemetry=telemetry)

@@ -7,7 +7,10 @@ from .config import Settings, load_model_mapping
 from .event_journal import EventJournal
 from .model_mapping import ModelResolver
 from .observability import SessionRegistry
+from .public_identity import PublicIdentity
 from .providers.codex.auth import CodexAuth
+from .providers.codex.orchestration_policy import OrchestrationPolicyCoordinator
+from .providers.codex.orchestration_registry import OrchestrationRegistry
 from .providers.codex.provider import CodexProvider
 from .providers.litellm import LiteLLMProvider
 from .service import ProxyService
@@ -20,6 +23,9 @@ class RuntimeServices:
     settings: Settings
     service: ProxyService
     codex_auth: CodexAuth
+    identity: PublicIdentity
+    orchestration_registry: OrchestrationRegistry
+    orchestration: OrchestrationPolicyCoordinator
     sessions: SessionRegistry
     events: EventJournal
     started_at: datetime
@@ -31,9 +37,17 @@ def create_runtime(settings: Settings | None = None) -> RuntimeServices:
     resolver = ModelResolver(load_model_mapping(configured.model_mapping_path))
     litellm_provider = LiteLLMProvider(configured)
     codex_auth = CodexAuth(configured.opencode_data_dir)
+    identity = PublicIdentity()
+    orchestration_registry = OrchestrationRegistry()
+    orchestration = OrchestrationPolicyCoordinator(
+        configured.codex_orchestration,
+        identity,
+        orchestration_registry,
+    )
     codex_provider = CodexProvider(
         codex_auth,
         token_counter=litellm_provider.count_tokens,
+        orchestration=orchestration,
     )
     service = ProxyService(
         resolver,
@@ -44,6 +58,8 @@ def create_runtime(settings: Settings | None = None) -> RuntimeServices:
     events = EventJournal(4096, 64)
     sessions = SessionRegistry(
         configured.session_retention_limit,
+        identity=identity,
+        on_session_evicted=orchestration_registry.remove_session,
         events=events,
         performance_enabled=configured.performance_enabled,
         performance_logging_enabled=(
@@ -55,6 +71,9 @@ def create_runtime(settings: Settings | None = None) -> RuntimeServices:
         settings=configured,
         service=service,
         codex_auth=codex_auth,
+        identity=identity,
+        orchestration_registry=orchestration_registry,
+        orchestration=orchestration,
         sessions=sessions,
         events=events,
         started_at=started_at,

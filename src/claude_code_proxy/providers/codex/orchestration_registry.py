@@ -16,6 +16,21 @@ class ParentState(StrEnum):
     CYCLIC = "cyclic"
 
 
+class AuthorizationStatus(StrEnum):
+    ABSENT = "absent"
+    ACTIVE = "active"
+    EXPIRED = "expired"
+
+
+@dataclass(frozen=True, slots=True)
+class NestingAuthorization:
+    session_id: str
+    status: AuthorizationStatus
+    max_depth: int | None
+    authorized_at: float | None
+    expires_at: float | None
+
+
 @dataclass(frozen=True, slots=True)
 class ObservedLineage:
     session_id: str
@@ -45,6 +60,7 @@ class OrchestrationRegistry:
     ) -> None:
         self._monotonic_clock = monotonic_clock or time.monotonic
         self._lineages: dict[str, dict[str, _LineageRecord]] = {}
+        self._authorizations: dict[str, NestingAuthorization] = {}
         self._lock = threading.Lock()
 
     def observe_lineage(
@@ -85,10 +101,58 @@ class OrchestrationRegistry:
                 return None
             return _snapshot(session, agent, record)
 
+    def authorize(
+        self, session_id: str, *, max_depth: int, duration: int | float
+    ) -> NestingAuthorization:
+        session = _identifier("session_id", session_id)
+        depth = _authorization_depth(max_depth)
+        seconds = _authorization_duration(duration)
+        now = _finite_time(self._monotonic_clock())
+        authorization = NestingAuthorization(
+            session,
+            AuthorizationStatus.ACTIVE,
+            depth,
+            now,
+            now + seconds,
+        )
+        with self._lock:
+            self._authorizations[session] = authorization
+        return authorization
+
+    def authorization(self, session_id: str) -> NestingAuthorization:
+        session = _identifier("session_id", session_id)
+        now = _finite_time(self._monotonic_clock())
+        with self._lock:
+            authorization = self._authorizations.get(session)
+            if authorization is None:
+                return NestingAuthorization(
+                    session, AuthorizationStatus.ABSENT, None, None, None
+                )
+            if authorization.status is AuthorizationStatus.EXPIRED:
+                return authorization
+            assert authorization.expires_at is not None
+            if now < authorization.expires_at:
+                return authorization
+            expired = NestingAuthorization(
+                session,
+                AuthorizationStatus.EXPIRED,
+                authorization.max_depth,
+                authorization.authorized_at,
+                authorization.expires_at,
+            )
+            self._authorizations[session] = expired
+            return expired
+
+    def revoke(self, session_id: str) -> bool:
+        session = _identifier("session_id", session_id)
+        with self._lock:
+            return self._authorizations.pop(session, None) is not None
+
     def remove_session(self, session_id: str) -> None:
         session = _identifier("session_id", session_id)
         with self._lock:
             self._lineages.pop(session, None)
+            self._authorizations.pop(session, None)
 
     @staticmethod
     def _resolve_session(
@@ -164,6 +228,21 @@ def _optional_identifier(name: str, value: object) -> str | None:
     if value is None:
         return None
     return _identifier(name, value)
+
+
+def _authorization_depth(value: object) -> int:
+    if type(value) is not int or not 2 <= value <= 8:
+        raise ValueError("max_depth must be an integer between 2 and 8")
+    return value
+
+
+def _authorization_duration(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("duration must be finite and between 1 and 86400 seconds")
+    seconds = float(value)
+    if not math.isfinite(seconds) or not 1 <= seconds <= 86400:
+        raise ValueError("duration must be finite and between 1 and 86400 seconds")
+    return seconds
 
 
 def _finite_time(value: object) -> float:

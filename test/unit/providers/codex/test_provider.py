@@ -27,6 +27,7 @@ from claude_code_proxy.providers.codex.orchestration import (
     AGENT_GUIDANCE,
     AGENT_SCOPE_POLICY,
     DISCOVERY_POLICY,
+    ORCHESTRATION_RATIONALE,
     SEND_MESSAGE_GUIDANCE,
     SUBAGENT_AGENT_GUIDANCE,
     SUBAGENT_SCOPE_POLICY,
@@ -45,6 +46,7 @@ from test.unit.providers.codex.provider_test_support import (
     EnterFailureContext,
     ExitClient,
     RawBodyStream,
+    RecordingOrchestration,
     RealResponseContext,
     Response,
     collect,
@@ -806,20 +808,27 @@ async def test_transport_failures_are_safe_and_structured(
 
 @pytest.mark.parametrize(
     "target",
-    ["reconcile_codex_request", "build_request"],
+    ["orchestration", "build_request"],
 )
 async def test_request_preparation_failure_is_translation_error(
     monkeypatch, target
 ):
-    def fail_preparation(*args, **kwargs):
-        raise RuntimeError("secret request detail")
+    error = RuntimeError("secret request detail")
+    orchestration = None
+    if target == "orchestration":
+        orchestration = RecordingOrchestration(failure=error)
+    else:
+        def fail_preparation(*args, **kwargs):
+            raise error
 
-    monkeypatch.setattr(
-        f"claude_code_proxy.providers.codex.provider.{target}",
-        fail_preparation,
+        monkeypatch.setattr(
+            "claude_code_proxy.providers.codex.provider.build_request",
+            fail_preparation,
+        )
+
+    events = await collect(
+        CodexProvider(Auth(), Client, orchestration=orchestration)
     )
-
-    events = await collect(CodexProvider(Auth(), Client))
 
     assert len(events) == 1
     event = events[0]
@@ -1255,6 +1264,7 @@ async def test_stream_applies_codex_agent_orchestration_guidance():
         AGENT_COMPLETION_POLICY,
         AGENT_SCOPE_POLICY,
         DISCOVERY_POLICY,
+        ORCHESTRATION_RATIONALE,
     ))
     assert payload["instructions"] == expected
     assert payload["tools"][0]["description"].endswith(AGENT_GUIDANCE)
@@ -1290,10 +1300,45 @@ async def test_count_tokens_applies_codex_agent_orchestration_guidance():
     provider = CodexProvider(Auth(), Client, token_counter=count_tokens)
 
     assert await provider.count_tokens(orchestration_request()) == 17
-    assert captured[0].system[-2:] == (
+    assert captured[0].system[-3:] == (
         TextBlock(AGENT_SCOPE_POLICY),
         TextBlock(DISCOVERY_POLICY),
+        TextBlock(ORCHESTRATION_RATIONALE),
     )
     assert captured[0].tools[0].description.endswith(AGENT_GUIDANCE)
     assert captured[0].tools[1].description.endswith(SEND_MESSAGE_GUIDANCE)
     assert captured[0].tools[2].description.endswith(TASK_OUTPUT_GUIDANCE)
+
+
+async def test_stream_reconciles_exactly_once_before_translation():
+    orchestration = RecordingOrchestration()
+    Client.responses = [completed_response()]
+
+    await collect(
+        CodexProvider(Auth(), Client, orchestration=orchestration),
+        orchestration_request(),
+    )
+
+    assert orchestration.calls == [orchestration_request()]
+    assert Client.requests
+
+
+async def test_count_tokens_reconciles_exactly_once_before_local_counter():
+    orchestration = RecordingOrchestration()
+    captured = []
+
+    async def count_tokens(completion_request, telemetry=None):
+        captured.append(completion_request)
+        return 1
+
+    original = orchestration_request()
+    provider = CodexProvider(
+        Auth(),
+        Client,
+        token_counter=count_tokens,
+        orchestration=orchestration,
+    )
+
+    assert await provider.count_tokens(original) == 1
+    assert orchestration.calls == [original]
+    assert captured == [original]

@@ -5,8 +5,20 @@ import pytest
 
 import claude_code_proxy.runtime as runtime_module
 from claude_code_proxy.config import Settings
-from claude_code_proxy.domain.models import CompletionRequest, Message, TextBlock
-from claude_code_proxy.observability import SessionRegistry
+from claude_code_proxy.domain.models import (
+    ClientIdentity,
+    CompletionRequest,
+    Message,
+    TextBlock,
+)
+from claude_code_proxy.observability import SessionMetadata, SessionRegistry
+from claude_code_proxy.public_identity import PublicIdentity
+from claude_code_proxy.providers.codex.orchestration_policy import (
+    OrchestrationPolicyCoordinator,
+)
+from claude_code_proxy.providers.codex.orchestration_registry import (
+    OrchestrationRegistry,
+)
 from claude_code_proxy.providers.codex.auth import CodexAuth
 from claude_code_proxy.reasoning import ReasoningPolicy
 from claude_code_proxy.service import ProxyService
@@ -91,9 +103,10 @@ def test_create_runtime_shares_auth_with_codex_service(tmp_path, monkeypatch):
     class FakeCodexProvider:
         name = "codex"
 
-        def __init__(self, auth, *, token_counter):
+        def __init__(self, auth, *, token_counter, orchestration):
             self.auth = auth
             self.token_counter = token_counter
+            self.orchestration = orchestration
 
     monkeypatch.setattr(runtime_module, "LiteLLMProvider", FakeLiteLLMProvider)
     monkeypatch.setattr(runtime_module, "CodexAuth", FakeAuth)
@@ -107,9 +120,43 @@ def test_create_runtime_shares_auth_with_codex_service(tmp_path, monkeypatch):
     assert litellm_provider.settings is configured
     assert provider.auth is runtime.codex_auth
     assert provider.token_counter == litellm_provider.count_tokens
+    assert provider.orchestration is runtime.orchestration
 
 
 def test_create_runtime_shares_one_event_journal_with_registry(tmp_path):
     runtime = runtime_module.create_runtime(settings(tmp_path))
 
     assert runtime.events is runtime.sessions.events
+
+
+def test_create_runtime_shares_identity_and_wires_orchestration_eviction(tmp_path):
+    runtime = runtime_module.create_runtime(
+        settings(tmp_path, transport="codex", retention_limit=0)
+    )
+
+    assert isinstance(runtime.identity, PublicIdentity)
+    assert isinstance(runtime.orchestration_registry, OrchestrationRegistry)
+    assert isinstance(runtime.orchestration, OrchestrationPolicyCoordinator)
+    assert runtime.sessions.public_id("session") == runtime.identity.public_id("session")
+
+    public_session = runtime.identity.public_id("session")
+    public_agent = runtime.identity.public_agent_id("session", "agent")
+    runtime.orchestration_registry.observe_lineage(
+        public_session, public_agent, None
+    )
+    handle = runtime.sessions.begin(
+        SessionMetadata(
+            client_identity=ClientIdentity("session"),
+            client_model="claude",
+            upstream_model="openai/gpt",
+            provider="codex",
+            transport="codex",
+            effort="high",
+            context_window=None,
+        )
+    )
+    runtime.sessions.finish(handle, "completed")
+
+    assert runtime.orchestration_registry.lineage(
+        public_session, public_agent
+    ) is None

@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import replace
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -44,6 +45,22 @@ class Auth:
         if self.recovery_failure is not None:
             raise self.recovery_failure
         return self.recovered
+
+
+class RecordingOrchestration:
+    def __init__(self, transform=None, failure=None):
+        self.transform = transform or (lambda value: value)
+        self.failure = failure
+        self.calls = []
+
+    def reconcile(self, completion_request):
+        self.calls.append(completion_request)
+        if self.failure is not None:
+            raise self.failure
+        return SimpleNamespace(
+            request=self.transform(completion_request),
+            decision=object(),
+        )
 
 
 class RecordingTelemetry:

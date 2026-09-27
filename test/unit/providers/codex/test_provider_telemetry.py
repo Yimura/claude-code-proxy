@@ -27,6 +27,7 @@ from test.unit.providers.codex.provider_test_support import (
     Client,
     EnterFailureContext,
     ExitClient,
+    RecordingOrchestration,
     RecordingTelemetry,
     Response,
     collect,
@@ -116,14 +117,11 @@ async def test_stream_reports_original_request_before_reconciliation(
             reasoning=ReasoningPolicy(False, None),
         )
 
-    monkeypatch.setattr(
-        "claude_code_proxy.providers.codex.provider.reconcile_codex_request",
-        disable_reasoning,
-    )
+    orchestration = RecordingOrchestration(transform=disable_reasoning)
     Client.responses = [completed_response()]
 
     await collect(
-        CodexProvider(Auth(), Client),
+        CodexProvider(Auth(), Client, orchestration=orchestration),
         request(reasoning=ReasoningPolicy(True, "high")),
         telemetry=telemetry,
     )
@@ -395,23 +393,28 @@ async def test_recovery_failure_returns_safe_error_without_second_request():
 
 @pytest.mark.parametrize(
     "target",
-    ["reconcile_codex_request", "build_request"],
+    ["orchestration", "build_request"],
 )
 async def test_preparation_failure_still_reports_adapter_facts(
     monkeypatch, target
 ):
     telemetry = RecordingTelemetry()
+    error = RuntimeError("sensitive carrier must not leak")
+    orchestration = None
+    if target == "orchestration":
+        orchestration = RecordingOrchestration(failure=error)
+    else:
+        def fail_preparation(*args, **kwargs):
+            raise error
 
-    def fail_preparation(*args, **kwargs):
-        raise RuntimeError("sensitive carrier must not leak")
-
-    monkeypatch.setattr(
-        f"claude_code_proxy.providers.codex.provider.{target}",
-        fail_preparation,
-    )
+        monkeypatch.setattr(
+            "claude_code_proxy.providers.codex.provider.build_request",
+            fail_preparation,
+        )
 
     events = await collect(
-        CodexProvider(Auth(), Client), telemetry=telemetry
+        CodexProvider(Auth(), Client, orchestration=orchestration),
+        telemetry=telemetry,
     )
 
     assert telemetry.calls == [

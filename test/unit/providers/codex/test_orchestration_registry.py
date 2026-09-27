@@ -1,4 +1,7 @@
+import pytest
+
 from claude_code_proxy.providers.codex.orchestration_registry import (
+    AuthorizationStatus,
     OrchestrationRegistry,
     ParentState,
 )
@@ -95,3 +98,44 @@ def test_sessions_scope_equal_agent_ids_and_eviction_removes_only_one_session() 
 
     assert registry.lineage("one", "agent") is None
     assert registry.lineage("two", "agent") is not None
+
+
+def test_authorization_before_lineage_is_supported_and_expires_atomically() -> None:
+    clock = Clock()
+    registry = OrchestrationRegistry(monotonic_clock=clock)
+
+    authorization = registry.authorize("session", max_depth=4, duration=2.0)
+
+    assert authorization.session_id == "session"
+    assert authorization.max_depth == 4
+    assert registry.authorization("session").status is AuthorizationStatus.ACTIVE
+    clock.value = 12.0
+    expired = registry.authorization("session")
+    assert expired.status is AuthorizationStatus.EXPIRED
+    assert expired.max_depth == 4
+    assert registry.authorization("session").status is AuthorizationStatus.EXPIRED
+
+
+@pytest.mark.parametrize("max_depth", [True, 1, 9, 2.0])
+def test_authorization_rejects_invalid_exact_depth(max_depth) -> None:
+    with pytest.raises(ValueError, match="max_depth"):
+        OrchestrationRegistry().authorize(
+            "session", max_depth=max_depth, duration=60
+        )
+
+
+@pytest.mark.parametrize("duration", [True, 0, 86401, float("inf")])
+def test_authorization_rejects_invalid_duration(duration) -> None:
+    with pytest.raises(ValueError, match="duration"):
+        OrchestrationRegistry().authorize(
+            "session", max_depth=2, duration=duration
+        )
+
+
+def test_revoke_is_idempotent() -> None:
+    registry = OrchestrationRegistry()
+    registry.authorize("session", max_depth=2, duration=60)
+
+    assert registry.revoke("session") is True
+    assert registry.revoke("session") is False
+    assert registry.authorization("session").status is AuthorizationStatus.ABSENT
