@@ -155,7 +155,7 @@ def test_authorization_before_lineage_is_supported_and_expires_atomically() -> N
     expired = registry.authorization("session")
     assert expired.status is AuthorizationStatus.EXPIRED
     assert expired.max_depth == 4
-    assert registry.authorization("session").status is AuthorizationStatus.ABSENT
+    assert registry.authorization("session").status is AuthorizationStatus.EXPIRED
 
 
 @pytest.mark.parametrize("max_depth", [True, 1, 9, 2.0])
@@ -212,7 +212,7 @@ def test_authorization_rows_include_only_live_remaining_duration() -> None:
     assert [(row.session_id, row.max_depth, row.remaining_seconds) for row in rows] == [
         ("second", 4, 3.0)
     ]
-    assert registry.authorization("first").status is AuthorizationStatus.ABSENT
+    assert registry.authorization("first").status is AuthorizationStatus.EXPIRED
 
 
 def test_raw_revocation_is_idempotent() -> None:
@@ -308,18 +308,14 @@ def test_concurrent_expiry_reads_produce_closed_complete_snapshots() -> None:
         gate.wait()
         results = [future.result(timeout=5) for future in futures]
 
-    statuses = [result.status for result in results]
-    assert statuses.count(AuthorizationStatus.EXPIRED) == 1
-    assert statuses.count(AuthorizationStatus.ABSENT) == 7
-    for result in results:
-        if result.status is AuthorizationStatus.EXPIRED:
-            assert result.max_depth == 3
-        else:
-            assert result.max_depth is None
+    assert all(
+        result.status is AuthorizationStatus.EXPIRED for result in results
+    )
+    assert all(result.max_depth == 3 for result in results)
     assert registry.authorizations() == ()
 
 
-def test_authorization_capacity_prunes_expired_and_allows_existing_update() -> None:
+def test_authorization_capacity_retains_expired_and_allows_existing_update() -> None:
     from claude_code_proxy.providers.codex.orchestration_registry import (
         AuthorizationCapacityExceeded,
     )
@@ -341,29 +337,34 @@ def test_authorization_capacity_prunes_expired_and_allows_existing_update() -> N
         registry.authorize("overflow", max_depth=2, duration=60)
 
     clock.value = 12.0
-    added = registry.authorize("after-expiry", max_depth=3, duration=60)
-    assert added.session_id == "after-expiry"
-    assert {row.session_id for row in registry.authorizations()} == {
-        "session-0",
-        "after-expiry",
-    }
+    assert [row.session_id for row in registry.authorizations()] == [
+        "session-0"
+    ]
+    with pytest.raises(AuthorizationCapacityExceeded):
+        registry.authorize("after-expiry", max_depth=3, duration=60)
+    assert registry.revoke("session-1")
+    added = registry.authorize("after-revoke", max_depth=3, duration=60)
+    assert added.session_id == "after-revoke"
 
 
-def test_five_thousand_expired_authorizations_are_fully_reclaimed() -> None:
+def test_five_thousand_expired_authorizations_remain_bounded_tombstones() -> None:
     clock = Clock()
     registry = OrchestrationRegistry(
         monotonic_clock=clock,
-        authorization_capacity=4,
+        authorization_capacity=5000,
     )
 
     for index in range(5000):
         registry.authorize(f"expired-{index}", max_depth=2, duration=1)
-        clock.value += 1
 
     clock.value += 1
     assert registry.authorizations() == ()
-    assert registry._authorizations == {}
-    assert registry._generations == {}
+    assert len(registry._authorizations) == 5000
+    assert len(registry._generations) == 5000
+    assert all(
+        authorization.status is AuthorizationStatus.EXPIRED
+        for authorization in registry._authorizations.values()
+    )
 
 
 def test_five_thousand_revocations_are_fully_reclaimed() -> None:

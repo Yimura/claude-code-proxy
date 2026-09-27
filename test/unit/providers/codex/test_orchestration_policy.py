@@ -149,3 +149,46 @@ def test_depth_limit_is_checked_on_every_reconciliation() -> None:
     assert result.decision.code is OrchestrationDecisionCode.DEPTH_LIMIT_REACHED
     assert result.decision.depth.value == 2
     assert not has_agent(result)
+
+
+def test_listing_before_expired_request_preserves_expired_decision() -> None:
+    clock = Clock()
+    policy, registry, identity = coordinator(
+        CodexOrchestrationMode.ENFORCE,
+        clock,
+    )
+    session, _, _ = public_ids(identity, "worker")
+    registry.authorize(session, max_depth=2, duration=1)
+    clock.value = 11.0
+
+    assert registry.authorizations() == ()
+    result = policy.reconcile(request("worker"))
+
+    assert result.decision.code is OrchestrationDecisionCode.AUTHORIZATION_EXPIRED
+    assert not has_agent(result)
+
+
+def test_concurrent_repeated_requests_all_observe_expired_authorization() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    clock = Clock()
+    policy, registry, identity = coordinator(
+        CodexOrchestrationMode.ENFORCE,
+        clock,
+    )
+    session, _, _ = public_ids(identity, "worker")
+    registry.authorize(session, max_depth=2, duration=1)
+    clock.value = 11.0
+    gate = threading.Barrier(9)
+
+    def reconcile():
+        gate.wait()
+        return policy.reconcile(request("worker")).decision.code
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(reconcile) for _ in range(8)]
+        gate.wait()
+        decisions = [future.result(timeout=5) for future in futures]
+
+    assert decisions == [OrchestrationDecisionCode.AUTHORIZATION_EXPIRED] * 8

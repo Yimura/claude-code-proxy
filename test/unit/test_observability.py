@@ -834,3 +834,41 @@ def test_request_outcome_does_not_create_orchestration_lifecycle_state(outcome) 
     assert snapshot.latest_request.outcome == outcome
     assert snapshot.active_workers.status == "unavailable"
     assert snapshot.revision_deduplication.status == "unavailable"
+
+
+def test_delayed_eviction_still_removes_lineage_after_concurrent_revoke() -> None:
+    identity = PublicIdentity(secret=b"shared-secret")
+    orchestration = OrchestrationRegistry(identity=identity)
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+
+    def delayed_cleanup(public_id: str, generation: int) -> None:
+        callback_entered.set()
+        assert release_callback.wait(timeout=5)
+        orchestration.remove_session_if_generation(public_id, generation)
+
+    sessions = SessionRegistry(
+        0,
+        identity=identity,
+        session_eviction_generation=orchestration.session_generation,
+        on_session_evicted=delayed_cleanup,
+    )
+    public_session = identity.public_id("session")
+    public_agent = identity.public_agent_id("session", "agent")
+    orchestration.observe_lineage(public_session, public_agent, None)
+    orchestration.authorize_raw_session(
+        "session",
+        max_depth=2,
+        duration_seconds=60,
+    )
+    handle = sessions.begin(metadata("session", agent_id="agent"))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        finished = executor.submit(sessions.finish, handle, "completed")
+        assert callback_entered.wait(timeout=5)
+        assert orchestration.revoke_raw_session("session")
+        release_callback.set()
+        assert finished.result(timeout=5) is not None
+
+    assert orchestration.lineage(public_session, public_agent) is None
+    assert orchestration.session_generation(public_session) == 0
