@@ -456,7 +456,7 @@ def log_orchestration_decision(decision: object) -> None:
             if getattr(decision, "authorization_present") is True
             else "false"
         )
-        logger.info(
+        logger.debug(
             "orchestration mode=%s decision=%s depth_status=%s "
             "depth_value=%s authorization=%s",
             _structured_log_token(getattr(decision, "mode")),

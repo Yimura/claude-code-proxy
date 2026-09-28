@@ -101,7 +101,9 @@ def test_client_identity_from_headers_normalizes_blank_and_orphan_parent():
     assert orphan == ClientIdentity()
 
 
-def test_orchestration_log_contains_only_fixed_bounded_fields(caplog):
+def test_orchestration_log_is_debug_and_contains_only_fixed_bounded_fields(
+    caplog,
+):
     decision = OrchestrationDecision(
         CodexOrchestrationMode.ENFORCE,
         OrchestrationDecisionCode.LINEAGE_UNKNOWN,
@@ -110,9 +112,10 @@ def test_orchestration_log_contains_only_fixed_bounded_fields(caplog):
         False,
     )
 
-    with caplog.at_level(logging.INFO, logger="claude_code_proxy.logging"):
+    with caplog.at_level(logging.DEBUG, logger="claude_code_proxy.logging"):
         log_orchestration_decision(decision)
 
+    assert [record.levelno for record in caplog.records] == [logging.DEBUG]
     assert caplog.messages == [
         "orchestration mode=enforce decision=lineage_unknown "
         "depth_status=unavailable depth_value=unavailable authorization=true"
