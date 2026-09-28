@@ -3,7 +3,28 @@ from pathlib import Path
 
 import pytest
 
+from claude_code_proxy.config import CodexOrchestrationMode
+from claude_code_proxy.domain.models import (
+    ClientIdentity,
+    CompletionRequest,
+    Message,
+    TextBlock,
+    ToolDefinition,
+)
+from claude_code_proxy.public_identity import PublicIdentity
+from claude_code_proxy.providers.codex.orchestration_policy import (
+    OrchestrationDecisionCode,
+    OrchestrationPolicyCoordinator,
+)
+from claude_code_proxy.providers.codex.orchestration_registry import (
+    AuthorizationStatus,
+    OrchestrationRegistry,
+)
+from claude_code_proxy.reasoning import ReasoningPolicy
 from test.integration.codex_agent_eval_support import (
+    AUTHORIZED_RECURSION_STEPS,
+    DEPTH_DENIAL_STEPS,
+    EVAL_MAX_DEPTH,
     EvalConfig,
     EvalReport,
     MetricValue,
@@ -206,6 +227,83 @@ def test_aggregate_scores_completeness_before_efficiency():
         "input_tokens": 0,
         "output_tokens": 0,
     }
+
+
+def test_authorized_recursion_steps_allow_one_delegation_then_deny_deeper():
+    results, registry, public_session = _run_depth_steps(AUTHORIZED_RECURSION_STEPS)
+    decisions = [result.decision for result in results]
+
+    assert [decision.code for decision in decisions] == [
+        OrchestrationDecisionCode.NESTED_ALLOWED,
+        OrchestrationDecisionCode.DEPTH_LIMIT_REACHED,
+    ]
+    assert [decision.depth.value for decision in decisions] == [1, 2]
+    assert _has_agent(results[0])
+    assert not _has_agent(results[1])
+    assert registry.authorization(public_session).status is AuthorizationStatus.ABSENT
+
+
+def test_depth_denial_steps_observe_parent_then_deny_agent_bearing_child():
+    results, registry, public_session = _run_depth_steps(DEPTH_DENIAL_STEPS)
+    decisions = [result.decision for result in results]
+
+    assert [decision.code for decision in decisions] == [
+        OrchestrationDecisionCode.NESTED_ALLOWED,
+        OrchestrationDecisionCode.DEPTH_LIMIT_REACHED,
+    ]
+    assert [decision.depth.value for decision in decisions] == [1, 2]
+    assert not _has_agent(results[0])
+    assert not _has_agent(results[1])
+    assert registry.authorization(public_session).status is AuthorizationStatus.ABSENT
+
+
+def _run_depth_steps(steps):
+    identity = PublicIdentity(secret=b"eval-depth-test")
+    registry = OrchestrationRegistry(identity=identity)
+    policy = OrchestrationPolicyCoordinator(
+        CodexOrchestrationMode.ENFORCE,
+        identity,
+        registry,
+    )
+    raw_session = "eval-depth-session"
+    authorization = registry.authorize_raw_session(
+        raw_session,
+        max_depth=EVAL_MAX_DEPTH,
+        duration_seconds=60,
+    )
+    assert authorization.status is AuthorizationStatus.ACTIVE
+    try:
+        results = [
+            policy.reconcile(_depth_request(raw_session, step))
+            for step in steps
+        ]
+    finally:
+        registry.revoke_raw_session(raw_session)
+    return results, registry, identity.public_id(raw_session)
+
+
+def _has_agent(result):
+    return any(tool.name == "Agent" for tool in result.request.tools)
+
+
+def _depth_request(raw_session, step):
+    tools = (ToolDefinition("RecordDecision"),)
+    if step.agent_requested:
+        tools = (ToolDefinition("Agent", "Delegate."), *tools)
+    return CompletionRequest(
+        original_model="claude",
+        model="openai/gpt",
+        response_model="claude",
+        max_tokens=100,
+        messages=(Message("user", (TextBlock("work"),)),),
+        reasoning=ReasoningPolicy(None, None),
+        client_identity=ClientIdentity(
+            raw_session,
+            step.agent_id,
+            step.parent_agent_id,
+        ),
+        tools=tools,
+    )
 
 
 def _report() -> EvalReport:

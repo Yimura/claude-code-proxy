@@ -413,7 +413,7 @@ uv run claude-code-proxy orchestration revoke-nesting \
 uv run claude-code-proxy orchestration authorizations
 ```
 
-`--for` accepts plain integer seconds or an integer with an `s`, `m`, or `h` suffix. It defaults to `60m`; the maximum is 24 hours. An authorization is process-local, expiring, and depth-bounded. It is held in a bounded in-memory registry, is lost when the proxy exits, and never crosses proxy processes. Creating a new entry when capacity is full returns HTTP 409; replacing an existing session entry remains possible.
+`--for` accepts plain integer seconds or an integer with an `s`, `m`, or `h` suffix. It defaults to `60m`; the maximum is 24 hours. An authorization is process-local, expiring, and depth-bounded. The in-memory registry has a fixed capacity of 4,096 process-local authorization records, is lost when the proxy exits, and never crosses proxy processes. Expired tombstones count toward that capacity until reauthorization, explicit revocation, or session eviction. Creating a new entry when capacity is full returns HTTP 409; replacing an existing session entry remains possible.
 
 Lineage is inferred only from caller-supplied session, agent, and parent-agent headers. The first-observed parent for an agent is immutable: a later conflicting parent makes lineage ambiguous rather than rewriting history. Missing, ambiguous, cyclic, expired, and over-depth lineage fails closed in `enforce` mode. This is a caller-supplied first-observed lineage limitation, not a cryptographic statement about worker identity.
 

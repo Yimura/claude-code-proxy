@@ -49,6 +49,24 @@ _TRIAL_UNAVAILABLE_KEYS = (
     "output_tokens",
 )
 _TOOL_COUNT_KEYS = ("agent", "send_message")
+EVAL_MAX_DEPTH = 2
+
+
+@dataclass(frozen=True, slots=True)
+class EvalLineageStep:
+    agent_id: str
+    parent_agent_id: str | None
+    agent_requested: bool
+
+
+AUTHORIZED_RECURSION_STEPS = (
+    EvalLineageStep("authorized-parent", None, True),
+    EvalLineageStep("authorized-child", "authorized-parent", True),
+)
+DEPTH_DENIAL_STEPS = (
+    EvalLineageStep("depth-parent", None, False),
+    EvalLineageStep("depth-child", "depth-parent", True),
+)
 
 
 @dataclass(frozen=True, slots=True)

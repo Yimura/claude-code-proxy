@@ -73,6 +73,8 @@ def test_readme_documents_codex_orchestration_operator_contract() -> None:
         "defaults to `60m`",
         "maximum is 24 hours",
         "process-local, expiring, and depth-bounded",
+        "fixed capacity of 4,096 process-local authorization records",
+        "Expired tombstones count toward that capacity until reauthorization, explicit revocation, or session eviction",
         "HTTP 409",
         "first-observed",
         "caller-supplied",
