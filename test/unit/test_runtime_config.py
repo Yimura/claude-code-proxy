@@ -2,6 +2,8 @@ from pathlib import Path
 import tomllib
 import yaml
 
+from claude_code_proxy.config import CodexOrchestrationMode, Settings
+
 ROOT = Path(__file__).parents[2]
 PYTHON_SERIES = "3.14"
 
@@ -59,6 +61,17 @@ def test_docker_image_provisions_private_control_socket_runtime_directory():
         "ENV CONTROL_SOCKET_PATH=/run/claude-code-proxy/control.sock"
         in instructions
     )
+
+
+def test_codex_orchestration_defaults_to_advisory_and_is_not_environment_configurable(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CODEX_ORCHESTRATION", "enforce")
+
+    settings = Settings.from_environment()
+
+    assert settings.codex_orchestration is CodexOrchestrationMode.ADVISORY
 
 
 def test_example_environment_documents_runtime_defaults_and_credentials():

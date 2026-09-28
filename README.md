@@ -393,30 +393,65 @@ If the configured mapping file does not exist, the proxy warns and uses built-in
 
 ## Codex Agent orchestration
 
-For `OPENAI_TRANSPORT=codex`, the Codex provider reinforces Claude Code's Agent lifecycle and work discipline in upstream system and tool descriptions:
+For `OPENAI_TRANSPORT=codex`, `--codex-orchestration` accepts `off`, `advisory`, and `enforce` and defaults to `advisory`:
 
-- Agent completion is push-based and arrives through one automatic parent notification.
-- Parents continue independent work after dispatch instead of polling.
-- Related implementation, tests, fixes, and review stay under coherent owners.
-- Existing workers are reused for follow-ups and rechecks.
-- Subagents avoid recursive delegation unless the parent explicitly authorizes it.
-- Applicable skills still load, but their checklist steps do not become automatic Agent boundaries.
-- Discovery stops when current behavior, change location, constraints, and verification path are known.
-- User decisions escalate early; repository-answerable facts remain agent work.
-- Repeated optional web searches and unchanged rereads yield to implementation, an answer, or bounded escalation.
-- `TaskOutput` remains available only for non-Agent background work requiring explicit retrieval.
+- `off` leaves the request's orchestration instructions and tool set unchanged.
+- `advisory` adds role-aware orchestration guidance but does not remove tools.
+- `enforce` adds the same guidance and omits `Agent` from unauthorized subagent requests before model execution. Top-level useful delegation remains available, and authorized nesting is allowed only within its configured depth. `SendMessage` remains available so an existing worker can be resumed for related fixes or rechecks.
 
-This is provider-local, advisory guidance. It does not intercept tool calls, enforce worker counts, remove capabilities, or maintain Agent lifecycle state. Tool names, schemas, and capabilities remain unchanged. LiteLLM, Gemini, and direct Anthropic requests are unaffected.
+The guidance tells models why the limits exist: prior runs showed excessive narrow forks, recursive delegation, duplicate review, repeated discovery, and avoidable token use. It asks parents to continue independent work after dispatch rather than poll; group related implementation, tests, fixes, and review under a few broad owners; reuse workers; stop discovery once current behavior, change location, constraints, and verification are known; and escalate genuine user preferences early. `TaskOutput` remains available for non-Agent background work. `Workflow` and `Skill` remain advisory and do not become automatic worker boundaries or enforcement mechanisms.
 
-A billable opt-in evaluation exercises completion delivery, coherent ownership, worker reuse, subagent recursion, and discovery sufficiency against a running proxy and real Codex model. It is skipped during normal test runs:
+### Bounded nesting authorization
+
+Nesting authorization is managed only through the private Unix-socket control API. The commands use the same private socket selection as other control commands:
 
 ```bash
-RUN_CODEX_AGENT_EVAL=1 \
-ANTHROPIC_BASE_URL=http://127.0.0.1:8082 \
-uv run pytest -q test/integration/test_codex_agent_polling.py
+uv run claude-code-proxy orchestration allow-nesting \
+  --session-id SESSION --max-depth 2 --for 60m
+uv run claude-code-proxy orchestration revoke-nesting \
+  --session-id SESSION
+uv run claude-code-proxy orchestration authorizations
 ```
 
-The evaluation records safe aggregate behavior and fails when the model polls Agent completion, fragments related work, replaces reusable workers, recursively delegates without authorization, or continues discovery after sufficient local evidence. Because model behavior is nondeterministic, keep this evaluation outside required CI.
+`--for` accepts plain integer seconds or an integer with an `s`, `m`, or `h` suffix. It defaults to `60m`; the maximum is 24 hours. An authorization is process-local, expiring, and depth-bounded. It is held in a bounded in-memory registry, is lost when the proxy exits, and never crosses proxy processes. Creating a new entry when capacity is full returns HTTP 409; replacing an existing session entry remains possible.
+
+Lineage is inferred only from caller-supplied session, agent, and parent-agent headers. The first-observed parent for an agent is immutable: a later conflicting parent makes lineage ambiguous rather than rewriting history. Missing, ambiguous, cyclic, expired, and over-depth lineage fails closed in `enforce` mode. This is a caller-supplied first-observed lineage limitation, not a cryptographic statement about worker identity.
+
+Request activity is not worker lifecycle. The proxy sees requests, cancellations, disconnects, and failures, but no authoritative worker-completion event. Therefore active-worker count is explicitly unavailable, and retained or active request counts are not substitutes. The proxy also has no repository revision signal, so unchanged-revision review deduplication is explicitly unavailable. These unavailable values are reported as `{\"status\":\"unavailable\",\"value\":null}` rather than inferred.
+
+LiteLLM, Gemini, and direct Anthropic requests are unaffected by this Codex-local policy.
+
+### Billable live evaluation
+
+The live evaluator calls a real Codex model and is excluded from required CI. It is skipped unless `RUN_CODEX_AGENT_EVAL=1` is set. Run a separate proxy process for each `off`, `advisory`, and `enforce` mode, using separate ports and control sockets. For example:
+
+```bash
+uv run claude-code-proxy proxy \
+  --codex-orchestration advisory \
+  --socket /path/to/advisory.sock \
+  --port 8083
+
+RUN_CODEX_AGENT_EVAL=1 \
+CODEX_AGENT_EVAL_TRIALS=5 \
+CODEX_AGENT_EVAL_MODEL=claude-opus-5 \
+CODEX_AGENT_EVAL_REPORT=report-advisory.json \
+ANTHROPIC_BASE_URL=http://127.0.0.1:8083 \
+CONTROL_SOCKET_PATH=/path/to/advisory.sock \
+uv run pytest -q -s test/integration/test_codex_agent_polling.py
+```
+
+Repeat with separate proxy processes and report paths for `off` and `enforce`. `CODEX_AGENT_EVAL_TRIALS` defaults to five trials and accepts an exact positive integer up to 100. Each trial uses a unique raw session identifier in memory. The evaluator writes one privacy-safe aggregate report atomically after all scenarios finish; it never writes prompts, responses, transcripts, raw session IDs, or Agent input dictionaries. It reports only the allowlisted schema, health-reported mode, model, scenario rates and aggregate counters, closed failure codes, and explicit unavailable metrics.
+
+Compare reports with:
+
+```bash
+uv run scripts/compare-codex-agent-evals \
+  report-off.json report-advisory.json
+uv run scripts/compare-codex-agent-evals \
+  report-advisory.json report-enforce.json
+```
+
+The comparison requires matching models and scenario sets. It exits 1 if outcome completeness decreases or prohibited behavior regresses. Lower token use never compensates for lower completeness.
 
 ## How It Works
 

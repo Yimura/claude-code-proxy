@@ -56,6 +56,42 @@ def test_readme_documents_complete_performance_operator_contract() -> None:
         assert snippet in text
 
 
+def test_readme_documents_codex_orchestration_operator_contract() -> None:
+    text = README.read_text(encoding="utf-8")
+
+    required_snippets = (
+        "`off`, `advisory`, and `enforce`",
+        "defaults to `advisory`",
+        "excessive narrow forks, recursive delegation, duplicate review, repeated discovery, and avoidable token use",
+        "Top-level useful delegation remains available",
+        "before model execution",
+        "`SendMessage`",
+        "uv run claude-code-proxy orchestration allow-nesting",
+        "uv run claude-code-proxy orchestration revoke-nesting",
+        "uv run claude-code-proxy orchestration authorizations",
+        "plain integer seconds or an integer with an `s`, `m`, or `h` suffix",
+        "defaults to `60m`",
+        "maximum is 24 hours",
+        "process-local, expiring, and depth-bounded",
+        "HTTP 409",
+        "first-observed",
+        "caller-supplied",
+        "Request activity is not worker lifecycle",
+        "active-worker count",
+        "unchanged-revision review deduplication",
+        "`Workflow` and `Skill` remain advisory",
+        "RUN_CODEX_AGENT_EVAL=1",
+        "CODEX_AGENT_EVAL_TRIALS=5",
+        "CODEX_AGENT_EVAL_REPORT",
+        "separate proxy process",
+        "five trials",
+        "privacy-safe aggregate report",
+        "scripts/compare-codex-agent-evals",
+    )
+    for snippet in required_snippets:
+        assert snippet in text
+
+
 def test_readme_documents_ps_watch_output_contract() -> None:
     text = README.read_text(encoding="utf-8")
 
