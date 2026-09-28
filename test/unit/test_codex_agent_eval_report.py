@@ -21,10 +21,12 @@ from claude_code_proxy.providers.codex.orchestration_registry import (
     OrchestrationRegistry,
 )
 from claude_code_proxy.reasoning import ReasoningPolicy
+from test.integration import test_codex_agent_polling as live_eval
 from test.integration.codex_agent_eval_support import (
     AUTHORIZED_RECURSION_STEPS,
     DEPTH_DENIAL_STEPS,
     EVAL_MAX_DEPTH,
+    EVAL_SCENARIO_NAMES,
     EvalConfig,
     EvalReport,
     MetricValue,
@@ -32,6 +34,7 @@ from test.integration.codex_agent_eval_support import (
     TrialResult,
     aggregate_report,
     build_trial_result,
+    tool_calls,
     write_report_atomic,
 )
 
@@ -134,7 +137,7 @@ def test_report_serialization_is_allowlisted_and_discards_private_markers():
     report = aggregate_report(
         mode="enforce",
         model="model-safe",
-        results={"privacy": (result,)},
+        results={name: (result,) for name in EVAL_SCENARIO_NAMES},
     )
     encoded = json.dumps(report.to_json_object(), sort_keys=True)
 
@@ -215,7 +218,10 @@ def test_aggregate_scores_completeness_before_efficiency():
     report = aggregate_report(
         mode="advisory",
         model="model-safe",
-        results={"scenario": (complete_expensive, incomplete_cheap)},
+        results={
+            name: (complete_expensive, incomplete_cheap)
+            for name in EVAL_SCENARIO_NAMES
+        },
     )
 
     scenario = report.scenarios[0]
@@ -227,6 +233,61 @@ def test_aggregate_scores_completeness_before_efficiency():
         "input_tokens": 0,
         "output_tokens": 0,
     }
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "duplicate"])
+def test_report_requires_exact_scenario_allowlist(mutation):
+    payload = _report().to_json_object()
+    if mutation == "missing":
+        payload["scenarios"].pop()
+    elif mutation == "extra":
+        extra = dict(payload["scenarios"][0])
+        extra["name"] = "unexpected_scenario"
+        payload["scenarios"].append(extra)
+    else:
+        payload["scenarios"].append(dict(payload["scenarios"][0]))
+
+    with pytest.raises(ValueError, match="scenario names"):
+        EvalReport.from_json_object(payload)
+
+
+def test_reviewer_reuse_rejects_different_worker():
+    calls = [{
+        "name": "SendMessage",
+        "input": {"to": "review-2", "message": "recheck"},
+    }]
+
+    assert not live_eval._reviewer_reused(calls)
+    calls[0]["input"]["to"] = "review-1"
+    assert live_eval._reviewer_reused(calls)
+
+
+def test_user_escalation_rejects_self_selected_preference_text():
+    response = {
+        "content": [{
+            "type": "text",
+            "text": "I prefer JSON and selected it without asking.",
+        }]
+    }
+
+    assert not live_eval._requires_user_input(tool_calls(response))
+    assert live_eval._requires_user_input([{
+        "name": "RequestUserInput",
+        "input": {"requires_user_input": True},
+    }])
+
+
+def test_completion_unavailable_rejects_noted_as_successful():
+    false_positive = [{
+        "name": "RecordCompletionState",
+        "input": {"completion_state": "noted as successful"},
+    }]
+
+    assert not live_eval._completion_unavailable(false_positive)
+    assert live_eval._completion_unavailable([{
+        "name": "RecordCompletionState",
+        "input": {"completion_state": "unavailable"},
+    }])
 
 
 def test_authorized_recursion_steps_allow_one_delegation_then_deny_deeper():
@@ -307,26 +368,29 @@ def _depth_request(raw_session, step):
 
 
 def _report() -> EvalReport:
-    scenario = ScenarioAggregate(
-        name="scenario",
-        trial_count=1,
-        passed_trials=1,
-        complete_trials=1,
-        pass_rate=1.0,
-        completeness_rate=1.0,
-        tool_counts={"agent": 1, "send_message": 0},
-        input_tokens=MetricValue.observed(10),
-        output_tokens=MetricValue.observed(5),
-        maximum_observed_depth=MetricValue.observed(1),
-        maximum_discovery_streak=2,
-        reuse_calls=0,
-        duplicate_launches=0,
-        unavailable_counts={
-            "maximum_observed_depth": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-        },
-        failure_codes=(),
+    scenarios = tuple(
+        ScenarioAggregate(
+            name=name,
+            trial_count=1,
+            passed_trials=1,
+            complete_trials=1,
+            pass_rate=1.0,
+            completeness_rate=1.0,
+            tool_counts={"agent": 1, "send_message": 0},
+            input_tokens=MetricValue.observed(10),
+            output_tokens=MetricValue.observed(5),
+            maximum_observed_depth=MetricValue.observed(1),
+            maximum_discovery_streak=2,
+            reuse_calls=0,
+            duplicate_launches=0,
+            unavailable_counts={
+                "maximum_observed_depth": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+            },
+            failure_codes=(),
+        )
+        for name in EVAL_SCENARIO_NAMES
     )
     return EvalReport(
         schema_version=1,
@@ -335,7 +399,7 @@ def _report() -> EvalReport:
         trial_count=1,
         pass_rate=1.0,
         completeness_rate=1.0,
-        scenarios=(scenario,),
+        scenarios=scenarios,
         active_workers=MetricValue.unavailable(),
         revision_deduplication=MetricValue.unavailable(),
     )

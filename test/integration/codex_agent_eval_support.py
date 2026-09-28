@@ -22,6 +22,21 @@ MAX_TRIALS = 100
 DEFAULT_TRIALS = 5
 DEFAULT_MODEL = "claude-opus-5"
 DEFAULT_BASE_URL = "http://127.0.0.1:8082"
+MAX_REPORT_BYTES = 1024 * 1024
+EVAL_SCENARIO_NAMES = (
+    "authorized_recursion",
+    "cancellation_without_completion",
+    "conflicting_parent",
+    "consolidated_reviewer_reuse",
+    "depth_bound_denial",
+    "discovery_sufficiency",
+    "missing_completion_unavailable",
+    "push_completion",
+    "ten_task_broad_owners",
+    "unauthorized_recursion",
+    "user_preference_escalation",
+    "worker_ownership_and_reuse",
+)
 MetricStatus = Literal["observed", "unavailable"]
 _FAILURE_CODES = frozenset({
     "agent_completion_polled",
@@ -283,11 +298,9 @@ class EvalReport:
         _require_positive_integer(self.trial_count, "trial_count", MAX_TRIALS)
         _require_rate(self.pass_rate, "pass_rate")
         _require_rate(self.completeness_rate, "completeness_rate")
-        if not self.scenarios:
-            raise ValueError("scenarios must not be empty")
         names = tuple(item.name for item in self.scenarios)
-        if names != tuple(sorted(set(names))):
-            raise ValueError("scenario names must be unique and sorted")
+        if names != EVAL_SCENARIO_NAMES:
+            raise ValueError("scenario names must match the evaluation allowlist")
         if any(item.trial_count != self.trial_count for item in self.scenarios):
             raise ValueError("scenario trial counts must match report trial_count")
         expected_pass_rate = sum(item.passed_trials for item in self.scenarios) / (

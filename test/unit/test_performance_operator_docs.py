@@ -89,6 +89,7 @@ def test_readme_documents_codex_orchestration_operator_contract() -> None:
         "five trials",
         "privacy-safe aggregate report",
         "scripts/compare-codex-agent-evals",
+        "Each comparison input report is limited to 1 MiB",
     )
     for snippet in required_snippets:
         assert snippet in text

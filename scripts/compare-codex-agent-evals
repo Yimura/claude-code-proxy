@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from test.integration.codex_agent_eval_support import EvalReport
+from test.integration.codex_agent_eval_support import EvalReport, MAX_REPORT_BYTES
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,10 +28,8 @@ def compare_reports(
 ) -> ReportComparison:
     if baseline.model != candidate.model:
         raise ValueError("model does not match")
-    baseline_names = {row.name for row in baseline.scenarios}
-    candidate_names = {row.name for row in candidate.scenarios}
-    if baseline_names != candidate_names:
-        raise ValueError("scenario sets do not match")
+    if baseline.trial_count != candidate.trial_count:
+        return ReportComparison(False, "incompatible_trial_count")
     if candidate.completeness_rate < baseline.completeness_rate:
         return ReportComparison(False, "outcome_completeness_decreased")
     if _prohibited_behavior_regressed(baseline, candidate):
@@ -57,8 +55,13 @@ def _prohibited_behavior_regressed(
 
 
 def _read_report(path: Path) -> EvalReport:
-    with path.open("r", encoding="utf-8") as stream:
-        payload = json.load(stream)
+    if path.stat().st_size > MAX_REPORT_BYTES:
+        raise ValueError("report exceeds size limit")
+    with path.open("rb") as stream:
+        encoded = stream.read(MAX_REPORT_BYTES + 1)
+    if len(encoded) > MAX_REPORT_BYTES:
+        raise ValueError("report exceeds size limit")
+    payload = json.loads(encoded.decode("utf-8"))
     return EvalReport.from_json_object(payload)
 
 

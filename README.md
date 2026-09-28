@@ -451,7 +451,7 @@ uv run scripts/compare-codex-agent-evals \
   report-advisory.json report-enforce.json
 ```
 
-The comparison requires matching models and scenario sets. It exits 1 if outcome completeness decreases or prohibited behavior regresses. Lower token use never compensates for lower completeness.
+Each comparison input report is limited to 1 MiB and is rejected before JSON parsing when larger. The comparison requires matching models, trial counts, and the fixed scenario allowlist. It exits 1 if trial counts are incompatible, outcome completeness decreases, or prohibited behavior regresses. Lower token use never compensates for lower completeness.
 
 ## How It Works
 

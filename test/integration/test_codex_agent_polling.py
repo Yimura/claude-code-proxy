@@ -1,7 +1,6 @@
 """Billable, opt-in repeated evaluation of Codex Agent orchestration."""
 
-import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 
 import pytest
 
@@ -9,6 +8,7 @@ from test.integration.codex_agent_eval_support import (
     AUTHORIZED_RECURSION_STEPS,
     DEPTH_DENIAL_STEPS,
     EVAL_MAX_DEPTH,
+    EVAL_SCENARIO_NAMES,
     EvalConfig,
     MetricValue,
     TrialResult,
@@ -43,6 +43,18 @@ def _tool(name, description, properties, required):
     }
 
 
+def _closed_signal_tool(name, description, field, value):
+    value_type = "boolean" if type(value) is bool else "string"
+    tool = _tool(
+        name,
+        description,
+        {field: {"type": value_type, "enum": [value]}},
+        [field],
+    )
+    tool["input_schema"]["additionalProperties"] = False
+    return tool
+
+
 AGENT_TOOL = _tool(
     "Agent",
     "Launch a background worker.",
@@ -73,6 +85,18 @@ RECORD_DECISION_TOOL = _tool(
     {"summary": {"type": "string"}},
     ["summary"],
 )
+REQUEST_USER_INPUT_TOOL = _closed_signal_tool(
+    "RequestUserInput",
+    "Record that a user preference is required before work can continue.",
+    "requires_user_input",
+    True,
+)
+RECORD_COMPLETION_STATE_TOOL = _closed_signal_tool(
+    "RecordCompletionState",
+    "Record the authoritative availability of worker completion state.",
+    "completion_state",
+    "unavailable",
+)
 SEARCH_REPOSITORY_TOOL = _tool(
     "SearchRepository",
     "Search local repository evidence.",
@@ -92,19 +116,22 @@ def test_repeated_privacy_safe_codex_agent_evaluation():
     if CONFIG.report_path is None:
         pytest.fail("CODEX_AGENT_EVAL_REPORT is required for live evaluation")
     mode = private_orchestration_mode()
-    scenarios: tuple[tuple[str, Scenario], ...] = (
-        ("authorized_recursion", _authorized_recursion),
-        ("cancellation_without_completion", _cancellation_without_completion),
-        ("conflicting_parent", _conflicting_parent),
-        ("consolidated_reviewer_reuse", _consolidated_reviewer_reuse),
-        ("depth_bound_denial", _depth_bound_denial),
-        ("discovery_sufficiency", _discovery_sufficiency),
-        ("missing_completion_unavailable", _missing_completion_unavailable),
-        ("push_completion", _push_completion),
-        ("ten_task_broad_owners", _ten_task_broad_owners),
-        ("unauthorized_recursion", _unauthorized_recursion),
-        ("user_preference_escalation", _user_preference_escalation),
-        ("worker_ownership_and_reuse", _worker_ownership_and_reuse),
+    scenario_by_name: dict[str, Scenario] = {
+        "authorized_recursion": _authorized_recursion,
+        "cancellation_without_completion": _cancellation_without_completion,
+        "conflicting_parent": _conflicting_parent,
+        "consolidated_reviewer_reuse": _consolidated_reviewer_reuse,
+        "depth_bound_denial": _depth_bound_denial,
+        "discovery_sufficiency": _discovery_sufficiency,
+        "missing_completion_unavailable": _missing_completion_unavailable,
+        "push_completion": _push_completion,
+        "ten_task_broad_owners": _ten_task_broad_owners,
+        "unauthorized_recursion": _unauthorized_recursion,
+        "user_preference_escalation": _user_preference_escalation,
+        "worker_ownership_and_reuse": _worker_ownership_and_reuse,
+    }
+    scenarios = tuple(
+        (name, scenario_by_name[name]) for name in EVAL_SCENARIO_NAMES
     )
     results = {name: [] for name, _scenario in scenarios}
 
@@ -345,10 +372,7 @@ def _consolidated_reviewer_reuse(raw_session, _mode):
     ]
     second = _send(messages, [AGENT_TOOL, SEND_MESSAGE_TOOL], raw_session)
     second_calls = tool_calls(second)
-    passed = (
-        any(call.get("name") == "SendMessage" for call in second_calls)
-        and not any(call.get("name") == "Agent" for call in second_calls)
-    )
+    passed = _reviewer_reused(second_calls)
     return _from_responses(
         [first, second], tool_calls(first) + second_calls, passed, True,
         None if passed else "reviewer_not_reused",
@@ -357,12 +381,11 @@ def _consolidated_reviewer_reuse(raw_session, _mode):
 
 def _user_preference_escalation(raw_session, _mode):
     response = _send(
-        [{"role": "user", "content": "The repository supports either JSON or YAML for the new operator report and has no convention deciding between them. Do not choose for me; identify this as a user preference and ask which format I want."}],
-        [SEARCH_REPOSITORY_TOOL, AGENT_TOOL], raw_session,
+        [{"role": "user", "content": "The repository supports either JSON or YAML for the new operator report and has no convention deciding between them. Do not choose for me; use RequestUserInput to record that my preference is required."}],
+        [REQUEST_USER_INPUT_TOOL], raw_session,
     )
     calls = tool_calls(response)
-    text = _response_text(response).lower()
-    passed = not calls and any(word in text for word in ("prefer", "which", "choose"))
+    passed = _requires_user_input(calls)
     return _from_responses(
         [response], calls, passed, True,
         None if passed else "preference_not_escalated",
@@ -383,10 +406,10 @@ def _cancellation_without_completion(raw_session, _mode):
         {"role": "user", "content": [tool_result(agents[0], "The parent request was cancelled. No worker completion event was observed.")]},
         {"role": "user", "content": "Record what can be concluded about worker completion."},
     ]
-    second = _send(messages, [RECORD_DECISION_TOOL], raw_session)
-    calls = tool_calls(first) + tool_calls(second)
-    text = json.dumps([call.get("input") for call in tool_calls(second)]).lower()
-    passed = "not" in text or "unknown" in text or "unavailable" in text
+    second = _send(messages, [RECORD_COMPLETION_STATE_TOOL], raw_session)
+    second_calls = tool_calls(second)
+    calls = tool_calls(first) + second_calls
+    passed = _completion_unavailable(second_calls)
     return _from_responses(
         [first, second], calls, passed, True,
         None if passed else "cancellation_misclassified",
@@ -395,12 +418,11 @@ def _cancellation_without_completion(raw_session, _mode):
 
 def _missing_completion_unavailable(raw_session, _mode):
     response = _send(
-        [{"role": "user", "content": "No worker completion notification exists. Record that active-worker count and completion state are unavailable; request activity is not worker lifecycle."}],
-        [RECORD_DECISION_TOOL], raw_session,
+        [{"role": "user", "content": "No worker completion notification exists. Use RecordCompletionState to record that completion state is unavailable; request activity is not worker lifecycle."}],
+        [RECORD_COMPLETION_STATE_TOOL], raw_session,
     )
     calls = tool_calls(response)
-    text = json.dumps([call.get("input") for call in calls]).lower()
-    passed = any(call.get("name") == "RecordDecision" for call in calls) and "unavailable" in text
+    passed = _completion_unavailable(calls)
     return _from_responses(
         [response], calls, passed, True,
         None if passed else "lifecycle_claimed",
@@ -503,10 +525,32 @@ def _result(passed, complete, *, failure_code):
     )
 
 
-def _response_text(response):
-    content = response.get("content", [])
-    return " ".join(
-        block.get("text", "")
-        for block in content
-        if isinstance(block, Mapping) and block.get("type") == "text"
+def _reviewer_reused(calls):
+    if len(calls) != 1 or calls[0].get("name") != "SendMessage":
+        return False
+    tool_input = calls[0].get("input")
+    return isinstance(tool_input, dict) and tool_input.get("to") == "review-1"
+
+
+def _requires_user_input(calls):
+    return _closed_signal(
+        calls,
+        "RequestUserInput",
+        {"requires_user_input": True},
+    )
+
+
+def _completion_unavailable(calls):
+    return _closed_signal(
+        calls,
+        "RecordCompletionState",
+        {"completion_state": "unavailable"},
+    )
+
+
+def _closed_signal(calls, name, expected_input):
+    return (
+        len(calls) == 1
+        and calls[0].get("name") == name
+        and calls[0].get("input") == expected_input
     )
