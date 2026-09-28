@@ -6,11 +6,7 @@ import json
 from pathlib import Path
 import sys
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from test.integration.codex_agent_eval_support import EvalReport, MAX_REPORT_BYTES
+from claude_code_proxy.codex_agent_eval_report import EvalReport, MAX_REPORT_BYTES
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,15 +4,18 @@ from collections.abc import Callable, Sequence
 
 import pytest
 
+from claude_code_proxy.codex_agent_eval_report import (
+    EVAL_SCENARIO_NAMES,
+    MetricValue,
+    TrialResult,
+    aggregate_report,
+    write_report_atomic,
+)
 from test.integration.codex_agent_eval_support import (
     AUTHORIZED_RECURSION_STEPS,
     DEPTH_DENIAL_STEPS,
     EVAL_MAX_DEPTH,
-    EVAL_SCENARIO_NAMES,
     EvalConfig,
-    MetricValue,
-    TrialResult,
-    aggregate_report,
     authorize_nesting,
     build_trial_result,
     private_orchestration_mode,
@@ -21,7 +24,6 @@ from test.integration.codex_agent_eval_support import (
     tool_calls,
     tool_result,
     unique_raw_session,
-    write_report_atomic,
 )
 
 CONFIG = EvalConfig.from_environment()

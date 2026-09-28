@@ -1,13 +1,14 @@
 import importlib.util
 from importlib.machinery import SourceFileLoader
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 
 import pytest
 
-from test.integration.codex_agent_eval_support import (
+from claude_code_proxy.codex_agent_eval_report import (
     EVAL_SCENARIO_NAMES,
     MAX_REPORT_BYTES,
     EvalReport,
@@ -71,6 +72,31 @@ def test_comparison_requires_matching_models():
             _report(completeness=1.0, passed=1.0),
             _report(completeness=1.0, passed=1.0, model="other"),
         )
+
+
+def test_installed_command_runs_without_repository_test_namespace(tmp_path):
+    baseline = tmp_path / "baseline.json"
+    candidate = tmp_path / "candidate.json"
+    baseline.write_text(json.dumps(_report(1.0, 1.0).to_json_object()))
+    candidate.write_text(json.dumps(_report(1.0, 1.0).to_json_object()))
+    external = tmp_path / "external"
+    unrelated_test_package = external / "test"
+    unrelated_test_package.mkdir(parents=True)
+    (unrelated_test_package / "__init__.py").write_text("")
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(external)
+
+    completed = subprocess.run(
+        [sys.executable, SCRIPT, baseline, candidate],
+        cwd=external,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {"code": "accepted", "passed": True}
 
 
 def test_command_prints_safe_json_and_uses_exit_one_for_regression(tmp_path):

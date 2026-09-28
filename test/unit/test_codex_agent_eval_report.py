@@ -21,21 +21,23 @@ from claude_code_proxy.providers.codex.orchestration_registry import (
     OrchestrationRegistry,
 )
 from claude_code_proxy.reasoning import ReasoningPolicy
-from test.integration import test_codex_agent_polling as live_eval
-from test.integration.codex_agent_eval_support import (
-    AUTHORIZED_RECURSION_STEPS,
-    DEPTH_DENIAL_STEPS,
-    EVAL_MAX_DEPTH,
+from claude_code_proxy.codex_agent_eval_report import (
     EVAL_SCENARIO_NAMES,
-    EvalConfig,
     EvalReport,
     MetricValue,
     ScenarioAggregate,
     TrialResult,
     aggregate_report,
+    write_report_atomic,
+)
+from test.integration import test_codex_agent_polling as live_eval
+from test.integration.codex_agent_eval_support import (
+    AUTHORIZED_RECURSION_STEPS,
+    DEPTH_DENIAL_STEPS,
+    EVAL_MAX_DEPTH,
+    EvalConfig,
     build_trial_result,
     tool_calls,
-    write_report_atomic,
 )
 
 
