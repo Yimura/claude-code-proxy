@@ -1,0 +1,30 @@
+# Fails when .github/local-workflows/ has drifted from .github/workflows/.
+#
+# This file lives outside .github/workflows/, so GitHub never discovers it and it
+# can never start a billed run. It is run locally by local-ci-act like any other
+# job in this suite.
+#
+# `on:` is quoted deliberately. YAML 1.1 (which PyYAML's safe_load follows, and
+# so does any other reader of this file) parses a bare `on` key as the boolean
+# `True`, not the string "on" -- quoting is what keeps `body["on"]` finding
+# anything at all.
+#
+# No `container:` key: `runs-on: ubuntu-latest` is one of the three labels
+# local-ci-act supports, and the runner pins each of them to
+# catthehacker/ubuntu:act-24.04 itself by passing `-P`, so this job lands on the
+# same image every other job in this suite does. That image ships both git and
+# python3 -- nothing extra to install for either. Only PyYAML is missing from it,
+# so that's the one dependency the step installs before running the script.
+name: parity
+
+"on": workflow_dispatch
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check translations against git history
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends -qq python3-yaml
+          python3 .github/local-workflows/scripts/check-translations.py

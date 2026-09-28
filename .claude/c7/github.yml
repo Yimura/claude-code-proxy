@@ -1,0 +1,13 @@
+ci:
+  runner: act
+  billed: false # Public repository on standard GitHub-hosted runners.
+  local_workflows: .github/local-workflows
+  translations:
+    - local: tests.yml
+      sources:
+        - path: .github/workflows/test.yml
+          commit: a3c567f0626176737acf6df3dcd8a885417adcd1
+  uncovered:
+    - path: .github/workflows/publish.yml
+      why: "workflow_dispatch and push tags only"
+  coverage_gaps: []
