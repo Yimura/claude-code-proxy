@@ -95,6 +95,16 @@ def test_build_request_preserves_tools_reasoning_and_auth(settings):
     assert payload["api_key"] == "openai-key"
 
 
+def test_streaming_request_asks_upstream_for_usage(settings):
+    provider = LiteLLMProvider(settings, object())
+
+    streamed = provider.build_request(request(), stream=True)
+    unary = provider.build_request(request(), stream=False)
+
+    assert streamed["stream_options"] == {"include_usage": True}
+    assert "stream_options" not in unary
+
+
 def test_openai_token_cap_does_not_depend_on_transport(settings):
     codex_settings = replace(settings, openai_transport="codex")
 
@@ -961,6 +971,79 @@ async def test_stream_classifies_typed_invocation_errors(
     assert events[0].diagnostic.exception_type is None
     assert events[0].diagnostic.location is None
     assert "secret" not in repr(events)
+
+
+_LANE_REJECTION = (
+    "OpenAIException - keepalive-proxy: the prompt is too long for this lane. "
+    "This request is 300108 prompt tokens (counted by the engine); this lane "
+    "serves at most 250000 prompt tokens (KV pool 1029786 tokens, one-prompt "
+    "ceiling 250000) and the engine would hang instead of refusing it."
+)
+_VLLM_REJECTION = (
+    "secret detail: This model's maximum context length is 32768 tokens. "
+    "However, you requested 40000 tokens (39000 in the messages, 1000 in the "
+    "completion)."
+)
+
+
+async def _stream_failure(settings, error):
+    events = [
+        event
+        async for event in LiteLLMProvider(
+            settings, FailingClient(error)
+        ).stream(request())
+    ]
+    assert len(events) == 1
+    return events[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("upstream_text", "expected"),
+    [
+        (_LANE_REJECTION, "prompt is too long: 300108 tokens > 250000 maximum"),
+        (_VLLM_REJECTION, "prompt is too long: 40000 tokens > 32768 maximum"),
+        ("secret detail: context length exceeded", "prompt is too long"),
+    ],
+)
+async def test_context_length_rejection_uses_anthropic_wording(
+    settings, upstream_text, expected
+):
+    error = litellm.BadRequestError(upstream_text, "model", "openai")
+
+    event = await _stream_failure(settings, error)
+
+    assert event.status_code == 400
+    assert event.error_type == "invalid_request_error"
+    assert event.message == expected
+    assert event.diagnostic.provider_code == "context_length_exceeded"
+    assert "secret" not in repr(event)
+    assert "keepalive" not in repr(event)
+
+
+@pytest.mark.asyncio
+async def test_litellm_context_window_error_uses_anthropic_wording(settings):
+    error = litellm.ContextWindowExceededError(
+        "secret detail without counts", "model", "openai"
+    )
+
+    event = await _stream_failure(settings, error)
+
+    assert event.message == "prompt is too long"
+    assert "secret" not in repr(event)
+
+
+@pytest.mark.asyncio
+async def test_other_bad_request_stays_generic(settings):
+    error = litellm.BadRequestError(
+        "secret detail: unknown field", "model", "openai"
+    )
+
+    event = await _stream_failure(settings, error)
+
+    assert event.message == "Invalid request"
+    assert event.diagnostic.provider_code is None
+    assert "secret" not in repr(event)
 
 
 @pytest.mark.asyncio

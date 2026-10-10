@@ -38,6 +38,11 @@ from .base import (
     scalar_provider_code,
     stream_error_from_exception,
 )
+from .context_limit import (
+    CONTEXT_LENGTH_CODE,
+    is_context_length_error,
+    prompt_too_long_message,
+)
 from .usage import normalize_usage
 
 logger = logging.getLogger(__name__)
@@ -193,6 +198,10 @@ class LiteLLMProvider:
             "temperature": request.temperature,
             "stream": stream,
         }
+        if stream:
+            # Without this, OpenAI-protocol upstreams send no usage chunk, so
+            # Claude Code sees 0 tokens per turn and never auto-compacts.
+            payload["stream_options"] = {"include_usage": True}
         if request.model.startswith("anthropic/"):
             if request.thinking is not None:
                 payload["thinking"] = request.thinking.model_dump(exclude_none=True)
@@ -611,6 +620,12 @@ class LiteLLMProvider:
             status_code = 500
 
         _, message = public_error(status_code)
+        provider_code = scalar_provider_code(getattr(error, "code", None))
+        if category == FailureCategory.UPSTREAM_HTTP and is_context_length_error(
+            error, status_code
+        ):
+            message = prompt_too_long_message(error)
+            provider_code = CONTEXT_LENGTH_CODE
         if category == FailureCategory.INTERNAL:
             diagnostic = unexpected_failure_diagnostic(
                 error,
@@ -622,7 +637,7 @@ class LiteLLMProvider:
                 category,
                 stage,
                 local_code,
-                scalar_provider_code(getattr(error, "code", None)),
+                provider_code,
             )
         return ProviderError(
             message,
