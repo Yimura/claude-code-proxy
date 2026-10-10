@@ -105,6 +105,14 @@ def test_openai_token_cap_does_not_depend_on_transport(settings):
     assert payload["max_completion_tokens"] == 16_384
 
 
+def test_tool_choice_any_maps_to_required(settings):
+    payload = LiteLLMProvider(settings, object()).build_request(request(
+        tools=(ToolDefinition("lookup", input_schema={"type": "object"}),),
+        tool_choice=ToolChoice(type="any"),
+    ), stream=False)
+    assert payload["tool_choice"] == "required"
+
+
 def test_missing_selected_tool_falls_back_to_auto(settings):
     payload = LiteLLMProvider(settings, object()).build_request(request(
         tools=(ToolDefinition("lookup", input_schema={"type": "object"}), ToolDefinition("builtin")),
@@ -1195,6 +1203,15 @@ async def test_count_tokens_uses_local_counter(settings):
         == 17
     )
     assert client.counter_args["model"] == "openai/gpt-5.6-sol"
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_passes_only_supported_counter_arguments(settings):
+    # litellm.token_counter counts locally and takes no api_base; passing one
+    # raises TypeError and every /v1/messages/count_tokens call fails.
+    client = FakeClient(token_count=17)
+    await LiteLLMProvider(settings, client).count_tokens(request())
+    assert set(client.counter_args) == {"model", "messages"}
 
 
 @pytest.mark.asyncio

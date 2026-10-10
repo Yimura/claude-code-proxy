@@ -301,7 +301,10 @@ class LiteLLMProvider:
         if choice.type == "auto":
             payload["tool_choice"] = "auto"
         elif choice.type == "any":
-            payload["tool_choice"] = "any"
+            # Anthropic "any" forces tool use; OpenAI's equivalent is "required".
+            # The literal "any" is not a valid OpenAI tool_choice and upstream
+            # rejects the whole request with a 400.
+            payload["tool_choice"] = "required"
         elif choice.type == "tool" and choice.name in {tool["function"]["name"] for tool in tools}:
             payload["tool_choice"] = {"type": "function", "function": {"name": choice.name}}
         else:
@@ -546,8 +549,6 @@ class LiteLLMProvider:
         if counter is None:
             return 1000
         arguments = {"model": payload["model"], "messages": payload["messages"]}
-        if request.model.startswith("openai/") and self._settings.openai_base_url:
-            arguments["api_base"] = self._settings.openai_base_url
         try:
             return await asyncio.to_thread(counter, **arguments)
         except ProviderError:
