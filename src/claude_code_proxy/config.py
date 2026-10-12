@@ -31,7 +31,7 @@ class CodexOrchestrationMode(StrEnum):
     ENFORCE = "enforce"
 
 
-ModelBackend = Literal["openai", "vllm", "sglang"]
+ModelBackend = Literal["openai", "vllm", "zai", "sglang"]
 
 
 class ModelDefinition(BaseModel):
