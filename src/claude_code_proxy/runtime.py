@@ -1,5 +1,6 @@
 """Shared runtime service construction."""
 
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -12,6 +13,7 @@ from .providers.codex.auth import CodexAuth
 from .providers.codex.orchestration_policy import OrchestrationPolicyCoordinator
 from .providers.codex.orchestration_registry import OrchestrationRegistry
 from .providers.codex.provider import CodexProvider
+from .providers.ddg_search import DuckDuckGoSearch
 from .providers.litellm import LiteLLMProvider
 from .service import ProxyService
 
@@ -54,6 +56,9 @@ def create_runtime(settings: Settings | None = None) -> RuntimeServices:
         configured.openai_transport,
         litellm_provider,
         codex_provider,
+        web_search=(
+            DuckDuckGoSearch() if os.environ.get("WEB_SEARCH", "on") != "off" else None
+        ),
     )
     events = EventJournal(4096, 64)
     sessions = SessionRegistry(

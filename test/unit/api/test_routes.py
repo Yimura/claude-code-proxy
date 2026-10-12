@@ -390,7 +390,7 @@ def test_unexpected_provider_exception_logs_once_and_propagates(caplog):
     assert "stage=route" in caplog.text
     assert "code=unexpected_exception" in caplog.text
     assert "exception=RuntimeError" in caplog.text
-    assert "location=claude_code_proxy.service:complete_prepared:" in caplog.text
+    assert "location=claude_code_proxy.service:_complete_once:" in caplog.text
     assert "secret response body" not in caplog.text
     assert "/home/" not in caplog.text
 
