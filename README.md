@@ -373,13 +373,15 @@ Every model definition requires:
 Every model definition accepts two optional keys:
 
 - `max_output_tokens`: the largest `max_tokens` the proxy forwards to this target. The proxy sends the smaller of the client's `max_tokens` and this value. Omit it, and `openai/...` and `gemini/...` targets fall back to 16384 while `anthropic/...` targets forward the client's value unchanged. Keep it below `context_window` minus the largest prompt you expect, because an upstream rejects a request whose prompt and output ceiling together exceed its context length.
-- `backend`: the compatibility profile of the server behind this target, either `openai` (the default) or `vllm`. It changes nothing about routing or authentication; it only tells the proxy which payload quirks the server has.
+- `backend`: the compatibility profile of the server behind this target, one of `openai` (the default), `vllm`, or `sglang`. It changes nothing about routing or authentication; it only tells the proxy which payload quirks the server has.
 
 Set `backend: "vllm"` for a self-hosted server that renders a strict chat template, such as vLLM or llama.cpp. Those templates reject a payload whose `system` message is not the first one, and clients such as Claude Code inject a `system` message part-way through the conversation. With this profile the proxy carries each non-leading `system` message through as a `user` message, keeping its position in the transcript.
 
 The `vllm` profile also sends the conversation back using the OpenAI tool-call protocol: a past tool call travels in the assistant message's `tool_calls`, and its result travels as a `tool` message. The default profile flattens both into prose, which reads to a model as text it wrote itself, so it writes its next tool call as prose too and no parser recognises it as a call.
 
 The `vllm` profile also passes the server's reasoning on to the client. A server started with a reasoning parser, such as `--reasoning-parser qwen3` on vLLM or SGLang, returns the model's thinking in `reasoning_content`. When reasoning is enabled for the request, the proxy streams that field as an Anthropic `thinking` block, so the client sees progress during a long thinking phase. Other targets keep dropping the field. The proxy does not replay thinking blocks upstream, because they carry no signature a provider could verify; a client that sends them back has them ignored.
+
+The `sglang` profile does everything the `vllm` profile does, and also counts tokens on the server. For `/v1/messages/count_tokens`, the proxy sends the translated messages and tools to SGLang's `/tokenize`, which applies the served chat template, and returns that count. The local counter misses the template and the tool schemas, so it undercounts badly: 9 tokens for a request SGLang counts as 362. If the server gives no usable count, the proxy falls back to the local counter. The proxy derives the `/tokenize` URL from `OPENAI_BASE_URL` by dropping a trailing `/v1`.
 
 Leave `backend` at `openai` for the OpenAI API and for any server that accepts a `system` message anywhere. The proxy then sends the messages exactly as the client wrote them, so a mid-conversation `system` message keeps its system authority.
 

@@ -12,6 +12,7 @@ from typing import Any
 # LiteLLM loads model metadata during import; prefer its bundled map by default.
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
+import httpx
 import litellm
 
 from ..config import Settings
@@ -83,14 +84,24 @@ def parse_tool_result_content(content: Any) -> str:
     return str(content)
 
 
+# Backends that serve a strict chat template behind an OpenAI-protocol server.
+# They share the payload quirks below; `sglang` adds exact token counting.
+_TEMPLATE_BACKENDS = frozenset({"vllm", "sglang"})
+_TOKENIZE_TIMEOUT_S = 20.0
+
+
+def _serves_chat_template(request: CompletionRequest) -> bool:
+    return request.backend in _TEMPLATE_BACKENDS
+
+
 def _surfaces_reasoning(request: CompletionRequest) -> bool:
     """Whether to pass a backend's `reasoning_content` on to the client.
 
     LiteLLM reports reasoning for several providers under that one field, so
-    this is opt-in: only a `backend: "vllm"` target, and only when the request
+    this is opt-in: only a `vllm` or `sglang` target, and only when the request
     turned reasoning on. Every other target keeps dropping it, as before.
     """
-    return request.backend == "vllm" and request.reasoning.enabled is True
+    return _serves_chat_template(request) and request.reasoning.enabled is True
 
 
 @dataclass
@@ -181,7 +192,7 @@ class LiteLLMProvider:
         if request.system:
             messages.append({"role": "system", "content": "\n\n".join(block.text for block in request.system)})
         tool_protocol = (
-            request.model.startswith("openai/") and request.backend == "vllm"
+            request.model.startswith("openai/") and _serves_chat_template(request)
         )
         for message in request.messages:
             messages.extend(
@@ -219,7 +230,7 @@ class LiteLLMProvider:
         self._apply_auth(payload, request.model)
         if request.model.startswith("openai/"):
             self._normalize_openai_messages(payload["messages"])
-            if request.backend == "vllm":
+            if _serves_chat_template(request):
                 self._demote_trailing_system_messages(payload["messages"])
         return payload
 
@@ -342,7 +353,7 @@ class LiteLLMProvider:
         position in the transcript.
 
         This runs only for a target whose model definition sets
-        `backend: "vllm"`. The OpenAI API itself accepts a system message
+        `backend: "vllm"` or `"sglang"`. The OpenAI API itself accepts a system message
         anywhere, and demoting one there would weaken an instruction the client
         meant to carry system authority.
         """
@@ -554,6 +565,10 @@ class LiteLLMProvider:
                 error, "token_count_request_translation_failed"
             ) from error
 
+        if request.backend == "sglang":
+            exact = await self._count_with_server(payload)
+            if exact is not None:
+                return exact
         counter = getattr(self._client, "token_counter", None)
         if counter is None:
             return 1000
@@ -568,6 +583,44 @@ class LiteLLMProvider:
                 stage=FailureStage.REQUEST,
                 code="token_count_failed",
             ) from error
+
+    async def _count_with_server(self, payload: dict[str, Any]) -> int | None:
+        """Count the translated payload with the server's own tokenizer.
+
+        SGLang's `/tokenize` applies the served chat template to the messages
+        and tools, so the count matches what the request costs. The local
+        counter misses the template and the tool schemas: it reported 9 tokens
+        for a request SGLang counted as 362. None means the server gave no
+        usable count, and the caller falls back to the local counter.
+        """
+        base = (self._settings.openai_base_url or "").rstrip("/")
+        if not base:
+            return None
+        url = base.removesuffix("/v1") + "/tokenize"
+        body = {"model": payload["model"].removeprefix("openai/"), "messages": payload["messages"]}
+        if payload.get("tools"):
+            body["tools"] = payload["tools"]
+        if payload.get("reasoning_effort"):
+            # The served template renders a different prompt per effort level: on
+            # the reference box, 110 tokens without a level against 12 at `medium`.
+            body["chat_template_kwargs"] = {"reasoning_effort": payload["reasoning_effort"]}
+        headers = {}
+        if self._settings.openai_api_key:
+            headers["Authorization"] = f"Bearer {self._settings.openai_api_key}"
+        try:
+            async with httpx.AsyncClient(timeout=_TOKENIZE_TIMEOUT_S) as client:
+                response = await client.post(url, json=body, headers=headers)
+            response.raise_for_status()
+            count = response.json().get("count")
+        except (httpx.HTTPError, ValueError, AttributeError) as error:
+            logger.warning(
+                "sglang token count failed, using the local counter: %s",
+                type(error).__name__,
+            )
+            return None
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            return count
+        return None
 
     @staticmethod
     def _translation_error(error: Exception, code: str) -> ProviderError:
