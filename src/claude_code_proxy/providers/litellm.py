@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 # Output ceiling for OpenAI and Gemini targets whose model definition declares
 # no max_output_tokens.
 DEFAULT_MAX_OUTPUT_TOKENS = 16_384
+WEB_SEARCH_TOOL = "WebSearch"
 
 
 def clean_gemini_schema(schema: Any) -> Any:
@@ -180,9 +181,10 @@ class LiteLLMProvider:
         messages = []
         if request.system:
             messages.append({"role": "system", "content": "\n\n".join(block.text for block in request.system)})
-        tool_protocol = (
-            request.model.startswith("openai/") and request.backend == "vllm"
-        )
+        tool_protocol = request.model.startswith("openai/") and request.backend in {
+            "vllm",
+            "zai",
+        }
         for message in request.messages:
             messages.extend(
                 self._convert_message(
@@ -295,13 +297,26 @@ class LiteLLMProvider:
 
     def _add_tools(self, payload, request):
         tools = []
+        builtin_search = False
         for tool in request.tools:
             if tool.input_schema is None:
+                continue
+            if request.backend == "zai" and tool.name == WEB_SEARCH_TOOL:
+                # Claude Code's WebSearch has no server behind it on a custom
+                # base URL; z.ai runs its own search server-side when the
+                # built-in tool is declared, and the model never emits a
+                # WebSearch call back to the client.
+                builtin_search = True
                 continue
             schema = deepcopy(tool.input_schema)
             if request.model.startswith("gemini/"):
                 schema = clean_gemini_schema(schema)
             tools.append({"type": "function", "function": {"name": tool.name, "description": tool.description, "parameters": schema}})
+        if builtin_search:
+            tools.insert(0, {
+                "type": "web_search",
+                "web_search": {"enable": True, "search_engine": "search-prime"},
+            })
         if request.tools:
             payload["tools"] = tools
         choice = request.tool_choice
@@ -314,7 +329,9 @@ class LiteLLMProvider:
             # The literal "any" is not a valid OpenAI tool_choice and upstream
             # rejects the whole request with a 400.
             payload["tool_choice"] = "required"
-        elif choice.type == "tool" and choice.name in {tool["function"]["name"] for tool in tools}:
+        elif choice.type == "tool" and choice.name in {
+            tool["function"]["name"] for tool in tools if "function" in tool
+        }:
             payload["tool_choice"] = {"type": "function", "function": {"name": choice.name}}
         else:
             payload["tool_choice"] = "auto"

@@ -383,6 +383,10 @@ The `vllm` profile also passes the server's reasoning on to the client. A server
 
 Leave `backend` at `openai` for the OpenAI API and for any server that accepts a `system` message anywhere. The proxy then sends the messages exactly as the client wrote them, so a mid-conversation `system` message keeps its system authority.
 
+Set `backend: "zai"` for the hosted z.ai API. It uses the OpenAI tool-call protocol like `vllm` but keeps system-message handling from `openai`. It also swaps a client-declared `WebSearch` tool for z.ai's built-in one (`{"type": "web_search", "web_search": {...}}`): z.ai runs the search server-side and answers with live data, so the model never emits a `WebSearch` call back. That matters because Claude Code's `WebSearch` has no server behind it on a custom `ANTHROPIC_BASE_URL` — every call would return an empty stub result.
+
+For every other backend, the proxy runs the search itself. When a client declares a `WebSearch` tool and the model calls it, the proxy searches DuckDuckGo's free HTML endpoint (no API key), fetches the top two result pages, and feeds both back upstream as the tool result, up to four rounds per request. The client never sees the intercepted calls; it receives only the final answer. A search or fetch failure degrades to an error text in the tool result, never a failed request. Set `WEB_SEARCH=off` in a profile's `.env` to disable the loop.
+
 Tier values reference model-definition names. Each mapping selects exactly one model definition:
 
 - `"tier": "big"` resolves through `tiers.big`.
